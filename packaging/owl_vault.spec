@@ -1,8 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
 # Spec do PyInstaller para OwlVault.exe (onefile, janela, sem console, asInvoker, sem UPX).
-# Uso: packaging\build.ps1  (ou: python -m PyInstaller --noconfirm --clean packaging\owl_vault.spec)
+# Uso: packaging\build.ps1 (recomendado: roda os testes e regenera packaging\owl.ico).
+# Manual: python packaging\make_icon.py  e depois  python -m PyInstaller --noconfirm --clean packaging\owl_vault.spec
+# (sem o make_icon, o ícone do .exe no Explorer pode ficar desatualizado)
 
 from pathlib import Path
+
+import PySide6
 
 HERE = Path(SPECPATH)
 ROOT = HERE.parent
@@ -41,7 +45,12 @@ a = Analysis(
     [str(HERE / "owlvault_entry.py")],
     pathex=[str(ROOT / "src")],
     binaries=[],
-    datas=[],
+    # logo (escudo da coruja) usado no ícone da janela, cabeçalho e "Sobre";
+    # tradução pt-BR dos botões/menus do próprio Qt ("Sim"/"Não", "Copiar"...)
+    datas=[
+        (str(ROOT / "src" / "owl_vault" / "ui" / "assets" / "owl-shield.png"), "owl_vault/ui/assets"),
+        (str(Path(PySide6.__file__).parent / "translations" / "qtbase_pt_BR.qm"), "PySide6/translations"),
+    ],
     hiddenimports=["argon2._utils", "_cffi_backend"],
     hookspath=[],
     hooksconfig={},

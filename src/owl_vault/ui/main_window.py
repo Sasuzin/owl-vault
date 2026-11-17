@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import datetime as _dt
 import os
+from collections.abc import Callable
 from typing import Any
 
 from PySide6.QtCore import QSettings, Qt, Slot
-from PySide6.QtGui import QAction, QCloseEvent
+from PySide6.QtGui import QAction, QCloseEvent, QGuiApplication, QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -43,7 +44,7 @@ from owl_vault.domain.limits import MIB, MIN_PASSWORD_LENGTH
 from owl_vault.storage import winfs
 from owl_vault.ui import strings as S
 from owl_vault.ui.dialogs import PreflightDialog, ReportDialog
-from owl_vault.ui.icon import owl_icon
+from owl_vault.ui.icon import WORD_PURPLE, logo_image, owl_icon, owl_image
 from owl_vault.ui.theme import apply_theme, save_theme, saved_theme
 from owl_vault.ui.workers import JobRunner, QtProgress
 
@@ -83,6 +84,40 @@ class PathRow(QWidget):
         self.edit.setText(value)
 
 
+def _hidpi(render: Callable[[int], QImage], logical: int) -> QPixmap:
+    """Gera a imagem na densidade real da tela (nitida em escala de 125%/150%)."""
+    screen = QGuiApplication.primaryScreen()
+    dpr = screen.devicePixelRatio() if screen is not None else 1.0
+    pixmap = QPixmap.fromImage(render(max(1, round(logical * dpr))))
+    pixmap.setDevicePixelRatio(dpr)
+    return pixmap
+
+
+def _brand_header() -> QWidget:
+    """Cabeçalho com a coruja e o nome "Owl Vault" (Vault em roxo), como no logo."""
+    header = QWidget()
+    header.setObjectName("header")
+    lay = QHBoxLayout(header)
+    lay.setContentsMargins(2, 0, 2, 0)
+    lay.setSpacing(12)
+    owl = QLabel()
+    owl.setPixmap(_hidpi(lambda px: owl_image(px), 56))
+    owl.setFixedSize(56, 56)
+    lay.addWidget(owl)
+    texts = QVBoxLayout()
+    texts.setSpacing(0)
+    title = QLabel(f'Owl <span style="color:{WORD_PURPLE.name()}">Vault</span>')
+    title.setObjectName("brandTitle")
+    title.setTextFormat(Qt.TextFormat.RichText)
+    subtitle = QLabel("Cópias criptografadas e verificáveis de pastas")
+    subtitle.setObjectName("brandSubtitle")
+    texts.addWidget(title)
+    texts.addWidget(subtitle)
+    lay.addLayout(texts)
+    lay.addStretch(1)
+    return header
+
+
 def _wipe(edit: QLineEdit) -> None:
     """``setText("")`` também descarta o histórico de desfazer (``clear()`` o manteria)."""
     edit.setText("")
@@ -116,6 +151,9 @@ class MainWindow(QMainWindow):
 
         central = QWidget()
         root = QVBoxLayout(central)
+        root.setContentsMargins(14, 10, 14, 12)
+        root.setSpacing(10)
+        root.addWidget(_brand_header())
         banner = QLabel(S.BANNER)
         banner.setObjectName("banner")
         banner.setWordWrap(True)
@@ -132,6 +170,9 @@ class MainWindow(QMainWindow):
         self.progress = QProgressBar()
         self.progress.setRange(0, 1000)
         self.progress.setValue(0)
+        # o percentual fica no rótulo ao lado (texto sobre o roxo da barra ficaria ilegível)
+        self.progress.setTextVisible(False)
+        self._stage_name = "Pronto."
         self.cancel_button = QPushButton("Cancelar")
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self._cancel)
@@ -175,16 +216,21 @@ class MainWindow(QMainWindow):
         )
         help_menu.addAction(limits)
         about = QAction("Sobre o Owl Vault", self)
-        about.triggered.connect(
-            lambda: QMessageBox.about(
-                self,
-                "Sobre o Owl Vault",
-                f"<b>Owl Vault</b> {__version__}<br>Cópias criptografadas e verificáveis de pastas."
-                "<br>AES-256-GCM, Argon2id. Sem nuvem, sem telemetria.<br>"
-                "Não houve auditoria independente.",
-            )
-        )
+        about.triggered.connect(self._show_about)
         help_menu.addAction(about)
+
+    def _show_about(self) -> None:
+        box = QMessageBox(self)
+        box.setWindowTitle("Sobre o Owl Vault")
+        box.setIconPixmap(_hidpi(lambda px: logo_image(px), 132))
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setText(
+            f'<b>Owl <span style="color:{WORD_PURPLE.name()}">Vault</span></b> {__version__}'
+            "<br>Cópias criptografadas e verificáveis de pastas.<br>"
+            "AES-256-GCM, Argon2id. Sem nuvem, sem telemetria.<br>"
+            "Não houve auditoria independente."
+        )
+        box.exec()
 
     def _build_create_tab(self) -> QWidget:
         w = QWidget()
@@ -331,6 +377,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ progresso
     @Slot(str, object, object)
     def _on_stage(self, name: str, total_bytes: object, total_items: object) -> None:
+        self._stage_name = name
         self.stage_label.setText(name)
         self._log(name)
         tb = int(total_bytes) if isinstance(total_bytes, int) else 0
@@ -352,6 +399,9 @@ class MainWindow(QMainWindow):
             self.progress.setValue(min(1000, int(self._done[0] * 1000 / tb)))
         elif ti:
             self.progress.setValue(min(1000, int(self._done[1] * 1000 / ti)))
+        else:
+            return
+        self.stage_label.setText(f"{self._stage_name} — {self.progress.value() // 10}%")
 
     def _cancel(self) -> None:
         self.runner.cancel()

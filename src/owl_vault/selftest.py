@@ -66,9 +66,12 @@ def run() -> int:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         from PySide6.QtWidgets import QApplication
 
+        from owl_vault.ui.icon import asset_available, owl_image
         from owl_vault.ui.main_window import MainWindow
 
         app = QApplication.instance() or QApplication(sys.argv[:1])
+        if not asset_available() or owl_image(64).isNull():
+            return 6  # logo não empacotada no executável
         window = MainWindow()
         window.close()
         del window, app

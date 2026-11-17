@@ -97,5 +97,20 @@ src/owl_vault/
   ui/           PySide6
 tests/          pytest
 packaging/      PyInstaller
+  brand/        logo original + extract_logo.py (gera src/owl_vault/ui/assets/owl-shield.png)
 docs/           arquitetura, formato, ameaças, testes, recuperação, Windows
 ```
+
+### Identidade visual
+
+O ícone do executável, o cabeçalho e a janela "Sobre" usam o escudo da coruja extraído da
+logo oficial (`packaging/brand/owl-vault-logo-original.webp`). A imagem original não tem
+transparência (o xadrez está pintado nos pixels); para regenerar o recorte depois de trocar a
+logo:
+
+```powershell
+.\.venv\Scripts\python.exe packaging\brand\extract_logo.py
+```
+
+A interface usa um tema roxo derivado das cores da logo (escuro por padrão; o claro fica em
+Exibir → Tema escuro).
