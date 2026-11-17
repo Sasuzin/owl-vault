@@ -141,6 +141,18 @@ _CreateFileW.restype = wintypes.HANDLE
 _CloseHandle = _kernel32.CloseHandle
 _CloseHandle.argtypes = [wintypes.HANDLE]
 _CloseHandle.restype = wintypes.BOOL
+_DeviceIoControl = _kernel32.DeviceIoControl
+_DeviceIoControl.argtypes = [
+    wintypes.HANDLE,
+    wintypes.DWORD,
+    wintypes.LPVOID,
+    wintypes.DWORD,
+    wintypes.LPVOID,
+    wintypes.DWORD,
+    ctypes.POINTER(wintypes.DWORD),
+    wintypes.LPVOID,
+]
+_DeviceIoControl.restype = wintypes.BOOL
 
 _ReadFile = _kernel32.ReadFile
 _ReadFile.argtypes = [
@@ -947,6 +959,81 @@ def is_elevated() -> bool:
 
 def is_fat(fs_name: str) -> bool:
     return fs_name.upper() in ("FAT", "FAT12", "FAT16", "FAT32", "EXFAT")
+
+
+DRIVE_REMOVABLE = 2
+_IOCTL_STORAGE_QUERY_PROPERTY = 0x002D1400
+#: barramentos de unidades que a pessoa costuma desconectar (USB, 1394, SD, MMC)
+_REMOVABLE_BUSES = frozenset({4, 7, 12, 13})
+
+
+class _STORAGE_PROPERTY_QUERY(ctypes.Structure):
+    _fields_ = [
+        ("PropertyId", wintypes.DWORD),
+        ("QueryType", wintypes.DWORD),
+        ("AdditionalParameters", ctypes.c_ubyte * 1),
+    ]
+
+
+class _STORAGE_DEVICE_DESCRIPTOR(ctypes.Structure):
+    _fields_ = [
+        ("Version", wintypes.DWORD),
+        ("Size", wintypes.DWORD),
+        ("DeviceType", ctypes.c_ubyte),
+        ("DeviceTypeModifier", ctypes.c_ubyte),
+        ("RemovableMedia", ctypes.c_ubyte),
+        ("CommandQueueing", ctypes.c_ubyte),
+        ("VendorIdOffset", wintypes.DWORD),
+        ("ProductIdOffset", wintypes.DWORD),
+        ("ProductRevisionOffset", wintypes.DWORD),
+        ("SerialNumberOffset", wintypes.DWORD),
+        ("BusType", wintypes.DWORD),
+        ("RawPropertiesLength", wintypes.DWORD),
+        ("RawDeviceProperties", ctypes.c_ubyte * 1),
+    ]
+
+
+def is_removable_drive(path: str) -> bool:
+    """A pasta está numa unidade que se desconecta (pendrive, HD externo USB, cartão SD)?
+
+    HDs externos USB costumam aparecer como "fixos" para o Windows; por isso também se
+    consulta o barramento (IOCTL_STORAGE_QUERY_PROPERTY). Erros → False.
+    """
+    try:
+        vbuf = ctypes.create_unicode_buffer(1024)
+        if not _GetVolumePathNameW(to_extended(path), vbuf, 1024):
+            return False
+        root = vbuf.value
+        if _GetDriveTypeW(root) == DRIVE_REMOVABLE:
+            return True
+        # \\?\C:\ ou C:\ ou \\?\Volume{…}\  →  \\.\C: / \\.\Volume{…}
+        device = "\\\\.\\" + strip_extended(root).rstrip("\\")
+        handle = _CreateFileW(
+            device, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, None, OPEN_EXISTING, 0, None
+        )
+        if handle == INVALID_HANDLE_VALUE:
+            return False
+        try:
+            query = _STORAGE_PROPERTY_QUERY(0, 0)
+            desc = _STORAGE_DEVICE_DESCRIPTOR()
+            returned = wintypes.DWORD()
+            ok = _DeviceIoControl(
+                handle,
+                _IOCTL_STORAGE_QUERY_PROPERTY,
+                ctypes.byref(query),
+                ctypes.sizeof(query),
+                ctypes.byref(desc),
+                ctypes.sizeof(desc),
+                ctypes.byref(returned),
+                None,
+            )
+            if not ok:
+                return False
+            return bool(desc.RemovableMedia) or int(desc.BusType) in _REMOVABLE_BUSES
+        finally:
+            _CloseHandle(handle)
+    except (OSError, OwlVaultError, ValueError):
+        return False
 
 
 def is_fat32_limited(fs_name: str) -> bool:

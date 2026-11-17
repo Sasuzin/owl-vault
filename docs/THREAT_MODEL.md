@@ -1,4 +1,4 @@
-# Owl Vault — Modelo de ameaças (v1)
+# Owl Vault — Modelo de ameaças (v1 + pastas protegidas v2)
 
 > Este documento descreve o que o Owl Vault tenta garantir e, principalmente, o que ele
 > **não** garante. Revisado após revisão adversarial de design. **Não houve auditoria
@@ -149,3 +149,47 @@ Não aprende nomes, estrutura, conteúdo, hashes nem datas originais.
   `<file_id>.chk`), arquivo a arquivo, numa pasta do **volume da origem**, e o apaga em
   seguida sem garantia de apagamento seguro — mesma classe de rastro de §4.
 * **Elevação:** rodar como administrador amplia o que um erro poderia afetar; o app avisa.
+
+
+## 9. Pastas protegidas (v2 — "trancar no lugar")
+
+A v2 muda o objetivo S1: o Owl Vault **apaga** as cópias legíveis da pasta escolhida depois de
+guardá-las cifradas dentro dela (`P\.owlvault`, um cofre v1). Detalhes normativos em
+[PASTAS_PROTEGIDAS.md](PASTAS_PROTEGIDAS.md).
+
+### Objetivos
+
+* **C2 — Pasta trancada:** quem lê o disco, copia a pasta ou usa outra conta do Windows vê só
+  dados cifrados, o ícone, o atalho "Abrir com Owl Vault", "Como abrir esta pasta.txt" e o
+  **nome da pasta**. Conteúdo, nomes internos e estrutura ficam no cofre (C1).
+* **S2 — Nunca perder dados:** um original só é apagado depois de o cofre novo terminar com
+  sucesso (verificação + teste de restauração + nova varredura) e de ser conferido no próprio
+  handle (identidade, tamanho, datas); um cofre só é apagado quando tudo o que ele contém está
+  num cofre mais novo e concluído da mesma pasta ou o usuário confirmou a lista exata do que
+  falta (regra de ouro). Todo estado intermediário é gravado no perfil e pode ser retomado
+  ("Continuar trancando", "Desfazer", "Continuar abrindo").
+* **A1′ — Perfil:** o índice (nomes e caminhos das pastas, estados, KEKs) só existe cifrado
+  com a chave do perfil (PK); a PK é aberta pela senha mestra (Argon2id) ou pelo PIN
+  (Argon2id + DPAPI da conta).
+
+### Adversários adicionais
+
+| ID | Adversário | Resultado esperado |
+|----|-----------|--------------------|
+| B1 | Outra conta / outro computador / disco removido | C2 vale; o PIN não funciona fora da conta (DPAPI); só a senha mestra abre |
+| B2 | Alguém com acesso à **sua conta** com o app travado | Não abre pastas trancadas sem PIN/senha mestra. Pode tentar PINs: 5 tentativas por cópia do perfil, cada uma custa um Argon2id; quem copia/restaura o arquivo do perfil consegue mais tentativas — o PIN é fraco por natureza (6–12 dígitos) e isso está escrito na tela de limites |
+| B3 | Alguém com acesso à sua conta com o app **destravado** ou pasta **aberta** | Fora do escopo: lê tudo o que estiver aberto. Mitigação: travamento automático (5 min, Win+L, suspensão) e "Trancar e sair" |
+| B4 | Malware na sua conta | Fora do escopo (§4) |
+| B5 | Itens colocados numa pasta trancada | Não são apagados nem cifrados; a pasta vai para "Precisa de atenção" e a abertura espera o usuário movê-los |
+
+### Limites conhecidos
+
+* O nome da pasta trancada é visível; "Esconder do Explorer" usa atributos oculto+sistema e
+  não é criptografia.
+* Trancar não apaga rastros do Windows nem sobrescreve setores do SSD (§4, §5).
+* Enquanto aberta, a pasta ocupa o dobro do espaço (cópia cifrada guardada na pasta oculta
+  `.owlvault-<código>` ao lado) e é legível.
+* Na abertura, data de criação, atributos, permissões e fluxos alternativos não voltam
+  (como na restauração v1); a marca "baixado da internet" é regravada nos arquivos que a
+  tinham.
+* Quem apagar a pasta trancada apaga os dados cifrados. Backup = copiar a pasta inteira.

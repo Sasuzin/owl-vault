@@ -49,6 +49,14 @@ PRACTICE_EVERY_DAYS = 30
 _MAX_PROFILE_BYTES = 256 * 1024 * 1024
 
 
+class ProfileCorruptError(FormatError):
+    """O arquivo do perfil (principal e cópia de segurança) está ilegível ou não autentica.
+
+    Diferente de "senha incorreta": a interface oferece recuperar as pastas com a senha mestra
+    num perfil novo (o arquivo danificado é guardado ao lado, nunca apagado).
+    """
+
+
 class PinError(AuthenticationError):
     """PIN incorreto (com tentativas restantes)."""
 
@@ -315,7 +323,7 @@ class ProfileStore:
         except (FileNotFoundError, FormatError, ValueError, UnicodeDecodeError):
             backup = None
         if primary is None and backup is None:
-            raise FormatError("perfil ausente ou ilegível")
+            raise ProfileCorruptError("perfil ausente ou ilegível")
         if primary is None:
             assert backup is not None
             return backup, None

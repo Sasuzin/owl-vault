@@ -3,6 +3,24 @@
 Regra de ouro: **antes de qualquer tentativa de reparo, copie a pasta do cofre inteira** para
 outro lugar. Nunca trabalhe na única cópia.
 
+## 0. Pastas protegidas (v2)
+
+| Situação | O que fazer |
+|----------|-------------|
+| "Trancamento interrompido" | Seus arquivos já estão guardados. Feche os arquivos listados e clique **Continuar trancando**, ou **Desfazer** para devolver tudo e deixar a pasta aberta. |
+| "Não abriu por completo" | **Tentar de novo**. Se insistir, **Continuar sem eles**: a versão guardada desses arquivos é mantida e aparece em "Versão anterior". |
+| "Versão anterior mantida" | **Recuperar esses arquivos em outra pasta…** cria uma pasta nova com eles. Só use **Apagar a versão anterior…** depois de conferir a lista. |
+| "Há itens novos na pasta trancada" | Mova para fora da pasta o que foi colocado nela depois de trancar e clique **Tentar de novo**. Nada é apagado. |
+| "A pasta não foi encontrada" | Ela foi movida ou renomeada: **Procurar a pasta…** e escolha-a no novo lugar (o Owl Vault confere que é a mesma). **Tirar da lista** não apaga nada. |
+| Esqueci o PIN | Na tela do PIN, **Esqueci o PIN** → senha mestra; depois ☰ → Alterar PIN. |
+| Windows reinstalado / senha do Windows redefinida | O PIN deixa de funcionar (DPAPI). Entre com a senha mestra e crie um PIN novo. |
+| Computador novo ou Owl Vault reinstalado | Instale, crie o acesso com a **mesma senha mestra** e use ☰ → **Recuperar uma pasta protegida** escolhendo a pasta com o ícone da coruja (ou a pasta onde ela ficava, se estava escondida). |
+| Esqueci a senha mestra | Enquanto o PIN funcionar, abra as pastas normalmente e crie uma senha mestra nova (aparece depois de 3 erros na prática da senha mestra); abra e tranque cada pasta de novo. Sem PIN e sem senha mestra não há recuperação. |
+
+Os dados cifrados de uma pasta trancada ficam em `<pasta>\.owlvault` (oculta) e são um cofre
+v1 comum: em último caso, copie essa pasta para outro lugar e use ☰ → Cópia criptografada →
+Abrir uma cópia, com a senha mestra.
+
 ## 1. A criação foi interrompida (queda de energia, cancelamento, disco cheio)
 
 * Abra o Owl Vault → **Criar cofre** → preencha a **mesma origem** e o **mesmo local/nome do

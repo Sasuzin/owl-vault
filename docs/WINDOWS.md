@@ -2,15 +2,38 @@
 
 ## Instalação
 
-O `OwlVault.exe` é portátil (não precisa instalar). Na primeira execução o Windows SmartScreen
-pode mostrar "O Windows protegeu o computador" porque o executável não é assinado. Confira o
-SHA-256 (`Get-FileHash .\OwlVault.exe -Algorithm SHA256`) antes de clicar em "Executar assim
-mesmo". Não rode como administrador — não é necessário.
+Na primeira execução, o `OwlVault.exe` se copia para `%LOCALAPPDATA%\Programs\Owl Vault\`
+e cria o atalho **Owl Vault** no Menu Iniciar — só para o seu usuário, sem administrador. Os
+atalhos "Abrir com Owl Vault" das pastas trancadas apontam para essa cópia; não a apague.
+Ao rodar uma versão nova do `OwlVault.exe`, a cópia instalada é atualizada (se estiver aberta,
+a atualização acontece na próxima vez).
+
+O Windows SmartScreen pode mostrar "O Windows protegeu o computador" porque o executável não
+é assinado. Confira o SHA-256 (`Get-FileHash .\OwlVault.exe -Algorithm SHA256`) antes de clicar
+em "Executar assim mesmo". Não rode como administrador — não é necessário.
 
 O executável é *onefile*: a cada abertura ele se descompacta numa pasta temporária, o que leva
 alguns segundos. Alguns antivírus podem desconfiar de executáveis PyInstaller (falso positivo).
 
-## Onde guardar o cofre
+## Pastas protegidas (v2)
+
+* Só em unidades **NTFS** (ou ReFS). Pendrives FAT/exFAT: use ☰ → Cópia criptografada.
+* Não dá para proteger pastas do Windows inteiras (Área de Trabalho, Documentos, Downloads,
+  Imagens, Músicas, Vídeos, a pasta do usuário) nem pastas que as contenham: crie uma pasta
+  dentro delas (ex.: `Documentos\Particular`) e proteja essa.
+* Pastas do OneDrive são recusadas (a nuvem guarda cópias que o Owl Vault não apaga).
+* Ao lado da pasta (na pasta-mãe) o Owl Vault cria, durante as operações, uma pasta oculta
+  `.owlvault-<código>` com os dados cifrados temporários e a versão anterior; ela some
+  quando não é mais necessária. Não a apague.
+* A pasta trancada recebe o ícone da coruja por um `desktop.ini` oculto. Se o Explorer
+  demorar a mostrar o ícone, aperte F5.
+* "Esconder do Explorer" usa os atributos *oculto* + *sistema*: some do Explorer mesmo com
+  "Mostrar itens ocultos" ligado, mas aparece para quem ativar "Mostrar arquivos protegidos do
+  sistema operacional".
+* Copie a pasta trancada **inteira** (inclusive os itens ocultos) para ter backup; em outro
+  computador use ☰ → Recuperar uma pasta protegida.
+
+## Onde guardar uma cópia criptografada (modo v1)
 
 * **HD externo NTFS**: recomendado (journaling, renomeação atômica, sem limite de 4 GiB).
 * **Pendrive FAT32**: arquivos de até 4 GiB − 1; sem journaling; o app bloqueia arquivos grandes
@@ -21,7 +44,7 @@ alguns segundos. Alguns antivírus podem desconfiar de executáveis PyInstaller 
 * **Dentro do OneDrive/Dropbox**: funciona como destino, mas o serviço enviará o cofre à nuvem
   (cifrado). Como origem, pastas do OneDrive com Arquivos sob Demanda são recusadas.
 
-## Pastas recusadas como origem
+## Pastas recusadas como origem (cópia criptografada)
 
 Raiz de unidade; Windows; Program Files; ProgramData; AppData; a pasta do perfil inteira (ou
 `C:\Users`) — escolha uma subpasta, como `Documentos\Projeto`; Lixeira e System Volume

@@ -179,6 +179,12 @@ def unmake_system_folder(path: str) -> None:
 _CLSID_ShellLink = "00021401-0000-0000-C000-000000000046"
 _IID_IShellLinkW = "000214F9-0000-0000-C000-000000000046"
 _IID_IPersistFile = "0000010B-0000-0000-C000-000000000046"
+_IID_IShellLinkDataList = "45E2B4AE-B1C3-11D0-B92F-00A0C90312E1"
+#: sem LinkInfo (série do volume, caminho-base) e sem TrackerDataBlock (nome da máquina, MAC):
+#: o atalho copiado junto com a pasta (backup) não carrega esses rastros.
+SLDF_FORCE_NO_LINKINFO = 0x100
+SLDF_FORCE_NO_LINKTRACK = 0x40000
+_STGM_READ = 0
 _CoInitializeEx = _ole32.CoInitializeEx
 _CoInitializeEx.argtypes = [wintypes.LPVOID, wintypes.DWORD]
 _CoInitializeEx.restype = ctypes.c_long
@@ -213,57 +219,196 @@ def _check(hr: int, what: str) -> None:
         )
 
 
+class _Com:
+    """CoInitializeEx/CoUninitialize + IShellLinkW e IPersistFile (liberados ao sair)."""
+
+    def __enter__(self) -> _Com:
+        hr = _CoInitializeEx(None, _COINIT_APARTMENTTHREADED)
+        self._initialized = hr in (0, 1)
+        if hr < 0 and hr != _RPC_E_CHANGED_MODE:
+            _check(hr, "COM")
+        self.link = ctypes.c_void_p()
+        self.persist = ctypes.c_void_p()
+        clsid = _GUID.parse(_CLSID_ShellLink)
+        iid = _GUID.parse(_IID_IShellLinkW)
+        try:
+            _check(
+                _CoCreateInstance(
+                    ctypes.byref(clsid),
+                    None,
+                    _CLSCTX_INPROC_SERVER,
+                    ctypes.byref(iid),
+                    ctypes.byref(self.link),
+                ),
+                "CoCreateInstance",
+            )
+            self.persist = self.query(_IID_IPersistFile)
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+        return self
+
+    def query(self, iid_text: str) -> ctypes.c_void_p:
+        out = ctypes.c_void_p()
+        iid = _GUID.parse(iid_text)
+        _check(
+            _vcall(
+                self.link,
+                0,
+                ctypes.byref(iid),
+                ctypes.byref(out),
+                argtypes=(ctypes.POINTER(_GUID), ctypes.POINTER(ctypes.c_void_p)),
+            ),
+            "QueryInterface",
+        )
+        return out
+
+    def __exit__(self, *_exc: object) -> None:
+        if self.persist:
+            _vcall(self.persist, 2, argtypes=())
+            self.persist = ctypes.c_void_p()
+        if self.link:
+            _vcall(self.link, 2, argtypes=())
+            self.link = ctypes.c_void_p()
+        if self._initialized:
+            _CoUninitialize()
+            self._initialized = False
+
+
 def create_shortcut(
     lnk_path: str, target: str, arguments: str, icon: str, description: str, workdir: str
 ) -> None:
     """Cria um atalho .lnk pela API do Windows (IShellLinkW). Nada é passado por linha de
-    comando: não há risco de injeção por nomes de pasta."""
-    hr_init = _CoInitializeEx(None, _COINIT_APARTMENTTHREADED)
-    initialized = hr_init in (0, 1)
-    if hr_init < 0 and hr_init != _RPC_E_CHANGED_MODE:
-        _check(hr_init, "COM")
-    link = ctypes.c_void_p()
-    persist = ctypes.c_void_p()
-    try:
-        clsid = _GUID.parse(_CLSID_ShellLink)
-        iid = _GUID.parse(_IID_IShellLinkW)
-        _check(
-            _CoCreateInstance(
-                ctypes.byref(clsid),
-                None,
-                _CLSCTX_INPROC_SERVER,
-                ctypes.byref(iid),
-                ctypes.byref(link),
-            ),
-            "CoCreateInstance",
-        )
-        w = wintypes.LPCWSTR
+    comando: não há risco de injeção por nomes de pasta. O atalho sai sem LinkInfo e sem
+    TrackerDataBlock (não leva série do volume, nome da máquina nem MAC)."""
+    w = wintypes.LPCWSTR
+    with _Com() as com:
+        link = com.link
         _check(_vcall(link, 20, _plain(target), argtypes=(w,)), "SetPath")
         _check(_vcall(link, 11, arguments, argtypes=(w,)), "SetArguments")
         _check(_vcall(link, 9, _plain(workdir), argtypes=(w,)), "SetWorkingDirectory")
         _check(_vcall(link, 7, description, argtypes=(w,)), "SetDescription")
         _check(_vcall(link, 17, _plain(icon), 0, argtypes=(w, ctypes.c_int)), "SetIconLocation")
-        iid_pf = _GUID.parse(_IID_IPersistFile)
-        _check(
-            _vcall(
-                link,
-                0,
-                ctypes.byref(iid_pf),
-                ctypes.byref(persist),
-                argtypes=(ctypes.POINTER(_GUID), ctypes.POINTER(ctypes.c_void_p)),
-            ),
-            "QueryInterface",
-        )
-        _check(_vcall(persist, 6, _plain(lnk_path), 1, argtypes=(w, wintypes.BOOL)), "Save")
-    finally:
-        if persist:
-            _vcall(persist, 2, argtypes=())
-        if link:
-            _vcall(link, 2, argtypes=())
-        if initialized:
-            _CoUninitialize()
+        data = com.query(_IID_IShellLinkDataList)
+        try:
+            flags = wintypes.DWORD()
+            _check(
+                _vcall(data, 6, ctypes.byref(flags), argtypes=(ctypes.POINTER(wintypes.DWORD),)),
+                "GetFlags",
+            )
+            new = flags.value | SLDF_FORCE_NO_LINKINFO | SLDF_FORCE_NO_LINKTRACK
+            _check(_vcall(data, 7, new, argtypes=(wintypes.DWORD,)), "SetFlags")
+        finally:
+            _vcall(data, 2, argtypes=())
+        _check(_vcall(com.persist, 6, _plain(lnk_path), 1, argtypes=(w, wintypes.BOOL)), "Save")
     if not os.path.exists(lnk_path):
         raise OwlVaultError("não foi possível criar o atalho da pasta")
+    _scrub_lnk(lnk_path, target, arguments)
+
+
+# --- limpeza do .lnk (MS-SHLLINK) -----------------------------------------------------------
+_HAS_ID_LIST = 0x1
+_HAS_LINK_INFO = 0x2
+_STRING_FLAGS = (0x4, 0x8, 0x10, 0x20, 0x40)  # nome, caminho relativo, pasta, argumentos, ícone
+_IS_UNICODE = 0x80
+_TRACKER_SIG = 0xA0000003  # nome NetBIOS + droids (podem conter o MAC)
+_PROPERTY_STORE_SIG = 0xA0000009  # propriedades do alvo (pode repetir dados da máquina)
+
+
+def _scrubbed_lnk(data: bytes) -> bytes | None:
+    """Remove LinkInfo (série do volume, caminho-base) e os blocos de rastreio do .lnk.
+
+    Devolve ``None`` se o arquivo não tiver o formato esperado (aí ele fica como está).
+    """
+    import struct  # noqa: PLC0415
+
+    if len(data) < 0x4C or struct.unpack_from("<I", data, 0)[0] != 0x4C:
+        return None
+    flags = struct.unpack_from("<I", data, 0x14)[0]
+    pos = 0x4C
+    if flags & _HAS_ID_LIST:
+        pos += 2 + struct.unpack_from("<H", data, pos)[0]
+    id_end = pos
+    link_info_end = pos
+    if flags & _HAS_LINK_INFO:
+        link_info_end = pos + struct.unpack_from("<I", data, pos)[0]
+    pos = link_info_end
+    unit = 2 if flags & _IS_UNICODE else 1
+    for bit in _STRING_FLAGS:
+        if flags & bit:
+            pos += 2 + unit * struct.unpack_from("<H", data, pos)[0]
+    strings = data[link_info_end:pos]
+    blocks = b""
+    while pos + 4 <= len(data):
+        size = struct.unpack_from("<I", data, pos)[0]
+        if size < 4:
+            break
+        if size < 8 or pos + size > len(data):
+            return None
+        sig = struct.unpack_from("<I", data, pos + 4)[0]
+        if sig not in (_TRACKER_SIG, _PROPERTY_STORE_SIG):
+            blocks += data[pos : pos + size]
+        pos += size
+    header = bytearray(data[:0x4C])
+    struct.pack_into("<I", header, 0x14, flags & ~_HAS_LINK_INFO)
+    return bytes(header) + data[0x4C:id_end] + strings + blocks + b"\x00\x00\x00\x00"
+
+
+def _scrub_lnk(lnk_path: str, target: str, arguments: str) -> None:
+    """Melhor esforço: grava a versão limpa e confere que o atalho continua igual."""
+    try:
+        with open(lnk_path, "rb") as fh:
+            original = fh.read()
+        clean = _scrubbed_lnk(original)
+        if clean is None or clean == original:
+            return
+        with open(lnk_path, "wb") as fh:
+            fh.write(clean)
+        if not shortcut_matches(lnk_path, target, arguments):
+            with open(lnk_path, "wb") as fh:
+                fh.write(original)
+    except OSError:
+        return
+
+
+def read_shortcut(lnk_path: str) -> tuple[str, str]:
+    """``(alvo, argumentos)`` de um .lnk, lidos pela API do Windows (sem resolver o alvo)."""
+    w = wintypes
+    with _Com() as com:
+        _check(
+            _vcall(com.persist, 5, _plain(lnk_path), _STGM_READ, argtypes=(w.LPCWSTR, w.DWORD)),
+            "Load",
+        )
+        buf = ctypes.create_unicode_buffer(4096)
+        _check(
+            _vcall(
+                com.link,
+                3,  # GetPath, SLGP_RAWPATH
+                buf,
+                len(buf),
+                None,
+                0x4,
+                argtypes=(w.LPWSTR, ctypes.c_int, ctypes.c_void_p, w.DWORD),
+            ),
+            "GetPath",
+        )
+        target = buf.value
+        args = ctypes.create_unicode_buffer(4096)
+        _check(
+            _vcall(com.link, 10, args, len(args), argtypes=(w.LPWSTR, ctypes.c_int)), "GetArguments"
+        )
+        return target, args.value
+
+
+def shortcut_matches(lnk_path: str, target: str, arguments: str) -> bool:
+    """O atalho existe e aponta exatamente para ``target`` com ``arguments``?"""
+    try:
+        got_target, got_args = read_shortcut(lnk_path)
+    except (OSError, OwlVaultError):
+        return False
+    return (
+        os.path.normcase(got_target) == os.path.normcase(_plain(target)) and got_args == arguments
+    )
 
 
 def current_executable() -> tuple[str, str]:

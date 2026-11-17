@@ -2,20 +2,37 @@
 
 ## Resumo honesto
 
-* O Owl Vault cifra uma **cópia** de uma pasta. Ele **não** torna a pasta original segura e
-  **não** a apaga. Enquanto existir, a origem continua legível; mesmo depois de removida,
-  podem restar cópias (Lixeira, Versões anteriores/VSS, OneDrive, backups, índice do Windows,
-  cache de miniaturas, SSD).
-* Protege os arquivos **do cofre** contra quem tem acesso a eles mas não tem a senha
-  (pendrive perdido, cópia em outro disco). Detecta adulteração dos arquivos do cofre
-  (cabeçalho, manifesto, blocos); a substituição do cofre inteiro por outra versão válida dele
-  mesmo **não** é detectada (THREAT_MODEL §4).
-* **Não** protege contra malware, administradores ou qualquer pessoa observando o computador
-  enquanto o Owl Vault está em uso. Python não garante apagar senha/chaves da memória.
-* **Perda da senha = perda dos dados.** Não existe recuperação.
+* **Pastas protegidas (v2)**: a pasta trancada fica no mesmo lugar, mas o conteúdo está
+  criptografado dentro dela (`.owlvault`). Quem copiar a pasta, tirar o disco ou usar outra
+  conta do Windows vê só dados cifrados, o ícone e os itens "Abrir com Owl Vault" e "Como abrir
+  esta pasta.txt". O **nome** da pasta trancada continua visível (use "Esconder do Explorer"
+  se ele for sensível — esconder não é criptografia).
+* Enquanto a pasta está **aberta**, ela é uma pasta comum: qualquer pessoa ou programa com
+  acesso à sua conta lê os arquivos. Trancar não apaga rastros do Windows (Recentes, índice
+  de pesquisa, miniaturas, Lixeira, Versões anteriores/VSS, OneDrive, backups) nem garante que
+  os setores antigos do disco/SSD sejam sobrescritos. Use BitLocker para o disco inteiro.
+* **Cópia criptografada (modo v1)**: cifra uma *cópia* de uma pasta e **não** altera a
+  original, que continua legível.
+* Detecta adulteração dos arquivos cifrados (cabeçalho, manifesto, blocos); a substituição do
+  cofre inteiro por outra versão válida dele mesmo **não** é detectada (THREAT_MODEL §4).
+* **Não** protege contra malware, administradores ou qualquer pessoa usando sua conta
+  enquanto o Owl Vault está destravado. Python não garante apagar senha/chaves da memória.
+* **Perda da senha mestra = perda dos dados** quando o PIN deste computador também não
+  estiver disponível. Não existe recuperação.
 * **Não houve auditoria independente.** O projeto usa apenas primitivas de bibliotecas
   estabelecidas e foi revisado internamente (revisão adversarial de design e de código,
   suíte de testes adversariais), o que não substitui uma auditoria.
+
+## PIN e senha mestra (v2)
+
+| Item | Como é protegido |
+|------|------------------|
+| Senha mestra → KEK | Argon2id calibrado (mesmos limites da v1); a KEK abre a chave do perfil (PK) e é a KEK dos cofres das pastas |
+| Perfil (`%LOCALAPPDATA%\Owl Vault\perfil.owlp` + `.bak`) | PK aleatória de 256 bits; índice (nomes, caminhos, estados, KEKs) cifrado com AES-256-GCM sob a PK; AAD liga cada caixa ao perfil e ao rótulo |
+| PIN | Argon2id(PIN) cifra a PK; o resultado ainda é protegido pelo DPAPI da sua conta do Windows (o PIN só funciona neste computador e nesta conta) |
+| Tentativas do PIN | contadas nas duas cópias do perfil **antes** de derivar a chave; 5 erros desativam o PIN (só a senha mestra volta a funcionar). Quem consegue copiar e restaurar arquivos da sua conta pode tentar mais vezes: o PIN é mais fraco que a senha mestra |
+| Prática | a senha mestra é pedida no primeiro desbloqueio depois de 1 dia e a cada 30 dias |
+| Sessão | o perfil destravado só existe em memória; é descartado ao bloquear (☰ → Bloquear agora, 5 min sem uso, Win+L, suspensão) |
 
 ## Criptografia (v1)
 
@@ -33,8 +50,13 @@ arquivos do cofre, tamanho aproximado do manifesto, parâmetros do Argon2id. Det
 
 ## Garantias operacionais
 
-* A origem é aberta somente para leitura, negando escrita a outros processos durante a
-  leitura; nenhum código escreve, renomeia ou remove na origem.
+* Cópia criptografada (v1): a origem é aberta somente para leitura, negando escrita a outros
+  processos durante a leitura; nenhum código escreve, renomeia ou remove na origem.
+* Pasta protegida (v2): cada original só é apagado depois que o cofre novo terminou com
+  sucesso (verificação + teste de restauração + nova varredura), pelo próprio handle, conferindo
+  identidade, tamanho e datas; se o arquivo mudou ou está em uso, ele fica na pasta e a pasta vai
+  para "Precisa de atenção". Um cofre só é apagado quando tudo o que ele tem está num cofre mais
+  novo e concluído (ou o usuário confirmou a lista exata do que falta).
 * Links, junctions, pontos de montagem, itens de nuvem e outros pontos de reparse são
   recusados e nunca seguidos; caminhos são comparados pelo caminho final resolvido.
 * "Sucesso" só depois de verificação completa (leitura sem cache), teste de restauração
@@ -42,7 +64,8 @@ arquivos do cofre, tamanho aproximado do manifesto, parâmetros do Argon2id. Det
 * Restauração só em pasta nova/vazia, com validação completa antes de gravar, criação
   exclusiva e renomeação sem substituição.
 * Sem logs persistentes, sem telemetria, sem rede, sem SQLite; nenhum nome original é gravado
-  fora do cofre pelo próprio Owl Vault.
+  fora do cofre pelo próprio Owl Vault, exceto dentro do índice cifrado do perfil. O nome da
+  pasta protegida em si continua no sistema de arquivos (é a pasta do usuário).
 
 ## Verificar o executável
 

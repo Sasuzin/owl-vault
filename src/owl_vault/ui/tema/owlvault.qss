@@ -1,0 +1,393 @@
+/* ============================================================
+   Owl Vault — folha de estilo do tema "Cofre" (Estilo 5)
+
+   Os nomes entre chaves são trocados por theme_cofre.montar_qss().
+   Chaves de CSS aparecem dobradas ({{ }}) porque o arquivo passa
+   por str.format — é assim mesmo, não "conserte".
+
+   Base: visual/owlvault.qss (Claude Design). Acréscimos da v2
+   (pastas protegidas) ficam no fim, marcados "v2".
+   ============================================================ */
+
+/* ---------- base ---------- */
+
+QWidget {{
+    background: {app-bg};
+    color: {ink};
+    font-family: "{font-ui}";
+    font-size: 14px;
+}}
+
+QMainWindow, QDialog {{ background: {app-bg}; }}
+
+/* Rótulo nunca pinta fundo próprio — quem pinta é o cartão atrás dele.
+   As exceções (contador de passo, ponto de estado) vêm mais abaixo e ganham
+   por serem mais específicas. */
+QLabel {{ background: transparent; }}
+
+QToolTip {{
+    background: {panel-alt};
+    color: {ink};
+    border: 1px solid {border-strong};
+    border-radius: {radius-sm};
+    padding: 6px 10px;
+}}
+
+/* ---------- cabeçalho de passos ---------- */
+
+QLabel#passoNumero {{
+    min-width: 26px; max-width: 26px;
+    min-height: 26px; max-height: 26px;
+    border-radius: 13px;
+    background: {panel-alt};
+    color: {ink-muted};
+    border: 1px solid {border-strong};
+    font-size: 12px;
+    font-weight: 700;
+    qproperty-alignment: AlignCenter;
+}}
+QLabel#passoNumero[estado="feito"] {{
+    background: {accent-soft};
+    color: {accent-text};
+    border: 1px solid {accent-text};
+}}
+QLabel#passoNumero[estado="atual"] {{
+    background: {accent};
+    color: {accent-ink};
+    border: 1px solid {accent};
+}}
+
+QLabel#passoTexto {{ color: {ink-muted}; font-size: 13px; background: transparent; }}
+QLabel#passoTexto[estado="atual"] {{ color: {ink}; font-weight: 600; }}
+
+QFrame#ligacao {{
+    min-height: 2px; max-height: 2px;
+    background: {border};
+    border: 0;
+    border-radius: 1px;
+}}
+QFrame#ligacao[estado="feito"] {{ background: {accent-text}; }}
+
+/* ---------- cartões ---------- */
+
+QFrame#cartao {{
+    background: {panel};
+    border: 0;
+    border-radius: {radius-xl};
+}}
+QFrame#cartaoLateral {{
+    background: {panel};
+    border: 0;
+    border-radius: {radius-xl};
+}}
+QFrame#dica {{
+    background: {accent-soft};
+    border: 0;
+    border-radius: {radius-lg};
+}}
+QFrame#aviso {{
+    background: {notice-bg};
+    border: 0;
+    border-radius: {radius-lg};
+}}
+QFrame#aviso QLabel {{ color: {notice-ink}; font-size: 13px; }}
+
+/* ---------- textos ---------- */
+
+QLabel#titulo {{ font-size: 22px; font-weight: 600; color: {ink}; }}
+QLabel#subtitulo {{ font-size: 14px; color: {ink-muted}; }}
+QLabel#rotulo {{ font-size: 13px; font-weight: 600; color: {ink}; }}
+QLabel#nota {{ font-size: 12px; color: {ink-muted}; }}
+QLabel#secaoLateral {{
+    font-size: 12px; font-weight: 700;
+    letter-spacing: 1px;
+    color: {ink-muted};
+}}
+QLabel#resumoChave {{ font-size: 12px; color: {ink-muted}; }}
+QLabel#resumoValor {{
+    font-family: "{font-mono}";
+    font-size: 12px;
+    color: {ink};
+}}
+QLabel#linkAlterar {{ font-size: 12px; font-weight: 600; color: {accent-text}; }}
+
+/* ---------- campos ---------- */
+
+QLineEdit {{
+    background: {field};
+    color: {ink};
+    border: 1px solid {border-strong};
+    border-radius: {radius-md};
+    padding: 0 {space-4};
+    min-height: 48px;
+    font-size: 15px;
+    selection-background-color: {accent};
+    selection-color: {accent-ink};
+}}
+QLineEdit:focus {{ border: 2px solid {focus}; padding: 0 15px; }}
+QLineEdit:disabled {{ color: {ink-muted}; border-color: {border}; }}
+QLineEdit[caminho="sim"] {{ font-family: "{font-mono}"; font-size: 13px; }}
+
+/* ---------- botões ---------- */
+
+QPushButton {{
+    background: transparent;
+    color: {ink};
+    border: 1px solid {border-strong};
+    border-radius: 24px;
+    padding: 0 {space-6};
+    min-height: 48px;
+    font-size: 15px;
+    font-weight: 600;
+}}
+QPushButton:hover {{ background: {panel-alt}; }}
+QPushButton:pressed {{ background: {panel}; }}
+QPushButton:disabled {{ color: {ink-muted}; border-color: {border}; background: transparent; }}
+/* v2: foco de teclado sempre visível (checklist de aceite) */
+QPushButton:focus {{ border: 2px solid {focus}; padding: 0 23px; }}
+
+QPushButton#primario {{
+    background: {accent};
+    color: {accent-ink};
+    border: 1px solid {accent};
+}}
+QPushButton#primario:hover {{ background: {accent-hover}; border-color: {accent-hover}; }}
+QPushButton#primario:pressed {{ background: {accent}; }}
+QPushButton#primario:focus {{ border: 2px solid {ink}; padding: 0 23px; }}
+QPushButton#primario:disabled {{
+    background: {panel-alt};
+    color: {ink-muted};
+    border-color: {border};
+}}
+
+/* botão de texto, sem moldura: "Mostrar", "alterar", "Escolher" */
+QPushButton#discreto {{
+    background: transparent;
+    color: {accent-text};
+    border: 0;
+    border-radius: {radius-sm};
+    padding: 0 {space-2};
+    min-height: 24px;
+    font-size: 12px;
+    font-weight: 600;
+}}
+QPushButton#discreto:hover {{ color: {ink}; }}
+QPushButton#discreto:focus {{ border: 0; padding: 0 {space-2}; color: {ink}; text-decoration: underline; }}
+QPushButton#discreto:disabled {{ color: {ink-muted}; }}
+
+/* ---------- medidor de força da senha ---------- */
+/* 4 QFrame lado a lado; radius-pill num bloco de 5px fica estranho no Qt,
+   por isso 3px aqui — é a única exceção de raio do tema. */
+
+QFrame#forca {{
+    min-height: 5px; max-height: 5px;
+    background: {panel-alt};
+    border: 0;
+    border-radius: 3px;
+}}
+QFrame#forca[ativo="sim"] {{ background: {ok}; }}
+QLabel#forcaTexto {{ font-size: 12px; color: {ok}; font-weight: 600; }}
+
+/* ---------- rodapé ---------- */
+
+QFrame#rodape {{
+    background: {panel};
+    border: 0;
+    border-top: 1px solid {border};
+}}
+QLabel#estadoPonto {{
+    min-width: 8px; max-width: 8px;
+    min-height: 8px; max-height: 8px;
+    border-radius: 4px;
+    background: {ok};
+}}
+QLabel#estadoPonto[estado="erro"] {{ background: {danger}; }}
+QLabel#estadoPonto[estado="trabalhando"] {{ background: {warn}; }}
+QLabel#estadoTexto {{ font-size: 12px; color: {ink-muted}; }}
+
+/* ---------- progresso ---------- */
+
+QProgressBar {{
+    background: {panel-alt};
+    border: 0;
+    border-radius: {radius-sm};
+    min-height: 6px; max-height: 6px;
+    text-align: center;
+    color: transparent;
+}}
+QProgressBar::chunk {{ background: {ok}; border-radius: {radius-sm}; }}
+
+/* ---------- log (passo 4) ---------- */
+
+QPlainTextEdit#log, QTextEdit#log {{
+    background: {log-bg};
+    color: {log-ink};
+    border: 1px solid {border};
+    border-radius: {radius-lg};
+    font-family: "{font-mono}";
+    font-size: 13px;
+    padding: {space-4};
+}}
+
+/* ---------- caixas de seleção ---------- */
+/* O quadradinho é desenhado em Python (ui/theme.py, OwlStyle) com os mesmos tokens:
+   estilizar QCheckBox::indicator por QSS faz o Qt esconder o ✓. */
+
+QCheckBox {{ spacing: {space-2}; font-size: 14px; background: transparent; }}
+
+/* ---------- barras de rolagem ---------- */
+
+QScrollArea {{ background: transparent; border: 0; }}
+QScrollBar:vertical {{
+    background: transparent;
+    width: 10px;
+    margin: 0;
+}}
+QScrollBar::handle:vertical {{
+    background: {border-strong};
+    border-radius: 5px;
+    min-height: 32px;
+}}
+QScrollBar::handle:vertical:hover {{ background: {accent-text}; }}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}
+
+QScrollBar:horizontal {{ background: transparent; height: 10px; margin: 0; }}
+QScrollBar::handle:horizontal {{ background: {border-strong}; border-radius: 5px; min-width: 32px; }}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{ background: transparent; }}
+
+/* ---------- menu e diálogos ---------- */
+
+QMenuBar {{ background: {app-bg}; color: {ink}; }}
+QMenuBar::item {{ padding: 6px {space-3}; background: transparent; border-radius: {radius-sm}; }}
+QMenuBar::item:selected {{ background: {panel-alt}; }}
+QMenu {{
+    background: {panel};
+    color: {ink};
+    border: 1px solid {border};
+    border-radius: {radius-md};
+    padding: {space-1};
+}}
+QMenu::item {{ padding: 8px {space-4}; border-radius: {radius-sm}; background: transparent; }}
+QMenu::item:selected {{ background: {accent-soft}; color: {ink}; }}
+QMenu::item:disabled {{ color: {ink-muted}; }}
+QMenu::separator {{ height: 1px; background: {border}; margin: {space-1} 0; }}
+QMenu::indicator {{ width: 0; }}
+
+QMessageBox {{ background: {panel}; }}
+QMessageBox QLabel {{ background: transparent; color: {ink}; }}
+
+/* ============================================================
+   v2 — pastas protegidas (mesmos tokens; nada de cor literal)
+   ============================================================ */
+
+/* contêineres transparentes dentro de cartões (layouts aninhados) */
+QWidget#transparente {{ background: transparent; }}
+QFrame#cartao QWidget, QFrame#cartaoLateral QWidget, QFrame#dica QWidget, QFrame#aviso QWidget,
+QFrame#rodape QWidget {{ background: transparent; }}
+/* ...mas campos, listas e linhas continuam com o próprio fundo */
+QFrame#cartao QLineEdit, QFrame#cartao QPlainTextEdit {{ background: {field}; }}
+QFrame#cartao QPlainTextEdit#log {{ background: {log-bg}; }}
+
+/* marca no topo da janela */
+QLabel#marca {{ font-size: 15px; font-weight: 700; color: {ink}; }}
+QLabel#marcaRoxo {{ font-size: 15px; font-weight: 700; color: {accent-text}; }}
+
+/* erro de validação abaixo de um campo */
+QLabel#erro {{ font-size: 13px; font-weight: 600; color: {danger}; }}
+
+/* botão perigoso (Remover proteção, Apagar a versão anterior) */
+QPushButton#perigo {{ color: {danger}; border: 1px solid {danger}; }}
+QPushButton#perigo:hover {{ background: {panel-alt}; }}
+QPushButton#perigo:focus {{ border: 2px solid {danger}; padding: 0 23px; }}
+
+/* botões redondos de ícone: ⋯ da linha e ☰ do topo */
+QToolButton#mais {{
+    background: transparent;
+    color: {ink};
+    border: 1px solid {border-strong};
+    border-radius: 24px;
+    min-width: 46px; max-width: 46px;
+    min-height: 46px; max-height: 46px;
+    font-size: 16px;
+    font-weight: 700;
+}}
+QToolButton#mais:hover {{ background: {panel-alt}; }}
+QToolButton#mais:focus {{ border: 2px solid {focus}; }}
+QToolButton#mais::menu-indicator {{ image: none; width: 0; }}
+
+/* linha da lista "Pastas protegidas" */
+QFrame#linhaPasta {{
+    background: {panel-alt};
+    border: 1px solid {panel-alt};
+    border-radius: {radius-lg};
+}}
+QFrame#linhaPasta:hover {{ border: 1px solid {border-strong}; }}
+QFrame#linhaPasta QWidget {{ background: transparent; }}
+QLabel#linhaNome {{ font-size: 15px; font-weight: 600; color: {ink}; }}
+QLabel#linhaLocal {{ font-family: "{font-mono}"; font-size: 12px; color: {ink-muted}; }}
+QLabel#linhaEstado {{ font-size: 13px; font-weight: 600; color: {accent-text}; }}
+QLabel#linhaEstado[estado="aberta"] {{ color: {warn}; }}
+QLabel#linhaEstado[estado="atencao"] {{ color: {danger}; }}
+QLabel#linhaEstado[estado="indisponivel"] {{ color: {ink-muted}; }}
+QLabel#linhaDetalhe {{ font-size: 12px; color: {ink-muted}; }}
+
+/* conferência (passo "Conferência"): ícone + título + nota */
+QLabel#checagemIcone {{
+    min-width: 22px; max-width: 22px;
+    min-height: 22px; max-height: 22px;
+    border-radius: 11px;
+    font-size: 12px; font-weight: 700;
+    qproperty-alignment: AlignCenter;
+    color: {ink-muted};
+    border: 1px solid {border-strong};
+    background: transparent;
+}}
+QLabel#checagemIcone[estado="ok"] {{ color: {ok}; border: 1px solid {ok}; }}
+QLabel#checagemIcone[estado="falhou"] {{ color: {danger}; border: 1px solid {danger}; }}
+QLabel#checagemIcone[estado="aviso"] {{ color: {warn}; border: 1px solid {warn}; }}
+QLabel#checagemTitulo {{ font-size: 14px; font-weight: 600; color: {ink}; }}
+
+/* listas de detalhes (nomes de arquivos) e listas para marcar */
+QPlainTextEdit {{
+    background: {field};
+    color: {ink};
+    border: 1px solid {border};
+    border-radius: {radius-md};
+    font-family: "{font-mono}";
+    font-size: 12px;
+    padding: {space-2};
+    selection-background-color: {accent};
+    selection-color: {accent-ink};
+}}
+QListWidget {{
+    background: {field};
+    color: {ink};
+    border: 1px solid {border-strong};
+    border-radius: {radius-md};
+    padding: {space-1};
+}}
+QListWidget::item {{ min-height: 32px; border-radius: {radius-sm}; padding: 0 {space-2}; }}
+QListWidget::item:selected {{ background: {accent-soft}; color: {ink}; }}
+
+/* abas (só se alguma tela ainda usar) */
+QTabWidget::pane {{ background: {panel}; border: 0; border-radius: {radius-xl}; padding: {space-4}; }}
+QTabBar::tab {{
+    background: transparent; color: {ink-muted}; padding: 10px {space-4};
+    border: 0; border-bottom: 2px solid transparent; font-weight: 600;
+}}
+QTabBar::tab:selected {{ color: {ink}; border-bottom: 2px solid {accent-text}; }}
+QTabBar::tab:hover:!selected {{ color: {ink}; }}
+
+/* rótulos genéricos herdados da v1 */
+QLabel#hint {{ font-size: 12px; color: {ink-muted}; }}
+QWidget:disabled {{ color: {ink-muted}; }}
+
+/* v2: veredito/blocos de senha fraca em amarelo de alerta */
+QFrame#forca[ativo="sim"][nivel="fraca"] {{ background: {warn}; }}
+QLabel#forcaTexto[nivel="fraca"] {{ color: {warn}; }}
+
+/* v2: textos dentro da dica e do aviso */
+QLabel#dicaTexto {{ font-size: 13px; color: {ink}; }}
+QLabel#avisoIcone {{ font-size: 16px; font-weight: 700; color: {notice-ink}; }}

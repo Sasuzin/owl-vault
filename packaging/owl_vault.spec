@@ -27,7 +27,6 @@ EXCLUDES = [
     "PySide6.Qt3DRender",
     "PySide6.QtMultimedia",
     "PySide6.QtMultimediaWidgets",
-    "PySide6.QtNetwork",
     "PySide6.QtPdf",
     "PySide6.QtPdfWidgets",
     "PySide6.QtSql",
@@ -49,9 +48,12 @@ a = Analysis(
     # tradução pt-BR dos botões/menus do próprio Qt ("Sim"/"Não", "Copiar"...)
     datas=[
         (str(ROOT / "src" / "owl_vault" / "ui" / "assets" / "owl-shield.png"), "owl_vault/ui/assets"),
+        # tema "Cofre" (Claude Design): folha de estilo com os tokens
+        (str(ROOT / "src" / "owl_vault" / "ui" / "tema" / "owlvault.qss"), "owl_vault/ui/tema"),
         (str(Path(PySide6.__file__).parent / "translations" / "qtbase_pt_BR.qm"), "PySide6/translations"),
     ],
-    hiddenimports=["argon2._utils", "_cffi_backend"],
+    # QtNetwork: canal local da instância única (atalho "Abrir com Owl Vault")
+    hiddenimports=["argon2._utils", "_cffi_backend", "PySide6.QtNetwork", "owl_vault._build"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

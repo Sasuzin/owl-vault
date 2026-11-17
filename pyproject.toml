@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "owl-vault"
-version = "0.1.0"
-description = "Owl Vault — cópias criptografadas e verificáveis de pastas no Windows"
+dynamic = ["version"]
+description = "Owl Vault — pastas protegidas por criptografia no Windows"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "Proprietary" }
@@ -27,8 +27,11 @@ owl-vault-gui = "owl_vault.ui.app:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.dynamic]
+version = { attr = "owl_vault.__version__" }
+
 [tool.setuptools.package-data]
-owl_vault = ["ui/assets/*.png"]
+owl_vault = ["ui/assets/*.png", "ui/tema/*.qss"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

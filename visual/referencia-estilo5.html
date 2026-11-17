@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<style>
+    :root {
+      --app-bg: #241834;
+      --panel: #2f2245;
+      --panel-alt: #3a2b53;
+      --field: #271b3b;
+      --border: #4a3866;
+      --border-strong: #8873b0;
+      --ink: #f7f1ff;
+      --ink-muted: #c6b7dd;
+      --accent: #a479ff;
+      --accent-hover: #bb99ff;
+      --accent-ink: #1b1028;
+      --accent-text: #d6bbff;
+      --accent-soft: #3d2c5e;
+      --focus: #d6bbff;
+      --ok: #7ee2b0;
+      --warn: #f3c489;
+      --danger: #ff93a6;
+      --notice-bg: #40301f;
+      --notice-ink: #ffd5ab;
+      --log-bg: #1c1328;
+      --log-ink: #cfc2e4;
+      --brand-violet: #7c3aed;
+      --brand-lilac: #c4a7ff;
+      --brand-deep: #2b1b4d;
+      --brand-ink: #120d1f;
+      --brand-mint: #5fe3a3;
+      --space-1: 4px;
+      --space-2: 8px;
+      --space-3: 12px;
+      --space-4: 16px;
+      --space-5: 20px;
+      --space-6: 24px;
+      --space-8: 32px;
+      --space-10: 40px;
+      --radius-0: 0px;
+      --radius-sm: 4px;
+      --radius-md: 8px;
+      --radius-lg: 12px;
+      --radius-xl: 18px;
+      --radius-pill: 24px;
+      --font-ui: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+      --font-mono: "Cascadia Code", Consolas, ui-monospace, monospace;
+      --shadow-panel: 0 1px 2px rgba(0,0,0,0.4);
+      --shadow-pop: 0 12px 28px rgba(0,0,0,0.45);
+    }
+    body { background:#1a1226; display:grid; place-items:center; min-height:100vh; padding:32px 0; }
+
+  html,body { margin:0; padding:0; background:transparent; }
+  .win { width:920px; box-sizing:border-box; font-family:var(--font-ui);
+         background:var(--app-bg); color:var(--ink); border:1px solid var(--border);
+         border-radius:var(--radius-xl); overflow:hidden; box-shadow:var(--shadow-pop); }
+
+  .chrome { display:flex; align-items:center; gap:var(--space-3); height:40px; padding:0 var(--space-2) 0 var(--space-5); }
+  .chrome b { font-size:13px; font-weight:600; }
+  .chrome .spacer { flex:1; }
+  .ctl { width:34px; height:28px; display:grid; place-items:center; color:var(--ink-muted); font-size:12px; }
+
+  .steps { display:flex; align-items:center; gap:var(--space-3); padding:var(--space-2) var(--space-8) var(--space-5); }
+  .step { display:flex; align-items:center; gap:var(--space-2); font-size:13px; color:var(--ink-muted); }
+  .step .n { width:26px; height:26px; border-radius:var(--radius-pill); display:grid; place-items:center;
+             font-size:12px; font-weight:700; background:var(--panel-alt); color:var(--ink-muted);
+             border:1px solid var(--border-strong); }
+  .step.done .n { background:var(--accent-soft); color:var(--accent-text); border-color:var(--accent-text); }
+  .step.on .n { background:var(--accent); color:var(--accent-ink); border-color:var(--accent); }
+  .step.on { color:var(--ink); font-weight:600; }
+  .link { flex:1; height:2px; background:var(--border); border-radius:2px; }
+  .link.done { background:var(--accent-text); }
+
+  .stage { padding:0 var(--space-8) var(--space-6); display:flex; gap:var(--space-5); align-items:flex-start; }
+  .card { background:var(--panel); border-radius:var(--radius-xl); padding:var(--space-6);
+          box-shadow:var(--shadow-panel); }
+  .main { flex:1; min-width:0; }
+  h1 { font-size:22px; line-height:28px; font-weight:600; margin:0; letter-spacing:-0.01em; }
+  .sub { font-size:14px; line-height:20px; color:var(--ink-muted); margin:var(--space-2) 0 var(--space-6); }
+
+  .f { display:flex; flex-direction:column; gap:var(--space-2); margin-bottom:var(--space-5); }
+  label { font-size:13px; font-weight:600; }
+  .input { display:flex; align-items:center; height:48px; box-sizing:border-box; background:var(--field);
+           border:1px solid var(--border-strong); border-radius:var(--radius-md); padding:0 var(--space-4);
+           font-size:15px; gap:var(--space-3); }
+  .input .val { color:var(--ink-muted); }
+  .input .eye { margin-left:auto; color:var(--accent-text); font-size:12px; font-weight:600; }
+  .input.focus { border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-soft); }
+  .meter { display:flex; gap:5px; }
+  .meter i { height:5px; flex:1; border-radius:var(--radius-pill); background:var(--panel-alt); }
+  .meter i.on { background:var(--ok); }
+  .mrow { display:flex; align-items:center; justify-content:space-between; font-size:12px; color:var(--ink-muted); }
+  .mrow b { color:var(--ok); }
+
+  .warnbox { display:flex; gap:var(--space-3); background:var(--notice-bg); color:var(--notice-ink);
+             border-radius:var(--radius-lg); padding:var(--space-4); font-size:13px; line-height:19px;
+             margin-top:var(--space-5); }
+  .warnbox svg { width:18px; height:18px; flex:none; fill:var(--notice-ink); margin-top:1px; }
+
+  .side { width:268px; flex:none; display:flex; flex-direction:column; gap:var(--space-4); }
+  .side .card { padding:var(--space-5); }
+  .side h2 { font-size:12px; font-weight:700; letter-spacing:0.06em; color:var(--ink-muted); margin:0 0 var(--space-3); }
+  .kv { display:flex; flex-direction:column; gap:4px; padding:var(--space-3) 0; border-top:1px solid var(--border); }
+  .kv:first-of-type { border-top:0; padding-top:0; }
+  .kv span { font-size:12px; color:var(--ink-muted); }
+  .kv code { font-family:var(--font-mono); font-size:12px; color:var(--ink); word-break:break-all; }
+  .kv .edit { color:var(--accent-text); font-weight:600; }
+
+  .tip { background:var(--accent-soft); border-radius:var(--radius-lg); padding:var(--space-4);
+         font-size:13px; line-height:19px; color:var(--ink); }
+  .tip b { display:block; margin-bottom:4px; }
+
+  .foot { display:flex; align-items:center; gap:var(--space-3); padding:var(--space-5) var(--space-8);
+          border-top:1px solid var(--border); background:var(--panel); }
+  .btn { height:48px; box-sizing:border-box; display:inline-flex; align-items:center; padding:0 var(--space-6);
+         border-radius:var(--radius-pill); font-size:15px; font-weight:600; }
+  .btn.primary { background:var(--accent); color:var(--accent-ink); }
+  .btn.ghost { background:transparent; color:var(--ink); border:1px solid var(--border-strong); }
+  .foot .stat { margin-left:auto; font-size:12px; color:var(--ink-muted); display:flex; align-items:center; gap:var(--space-2); }
+  .foot .dot { width:8px; height:8px; border-radius:var(--radius-pill); background:var(--ok); }
+</style>
+</head>
+<body>
+<div class="win" data-theme="cofre">
+
+  <div class="chrome">
+    <b>Owl Vault</b>
+    <span class="spacer"></span>
+    <span class="ctl">&#8211;</span><span class="ctl">&#9633;</span><span class="ctl">&#10005;</span>
+  </div>
+
+  <div class="steps">
+    <span class="step done"><i class="n">&#10003;</i>Pastas</span>
+    <i class="link done"></i>
+    <span class="step on"><i class="n">2</i>Senha</span>
+    <i class="link"></i>
+    <span class="step"><i class="n">3</i>Conferência</span>
+    <i class="link"></i>
+    <span class="step"><i class="n">4</i>Criar</span>
+  </div>
+
+  <div class="stage">
+    <div class="card main">
+      <h1>Escolha a senha do cofre</h1>
+      <p class="sub">É ela que abre o cofre depois. Sem ela não há recuperação: nem você, nem o Owl Vault conseguem ler os arquivos de volta.</p>
+
+      <div class="f">
+        <label>Senha</label>
+        <div class="input focus"><span class="val">Senha (mínimo 12 caracteres)</span><span class="eye">Mostrar</span></div>
+        <div class="meter"><i class="on"></i><i class="on"></i><i class="on"></i><i></i></div>
+        <div class="mrow"><span>Força da senha</span><b>Boa</b></div>
+      </div>
+
+      <div class="f" style="margin-bottom:0;">
+        <label>Confirmação</label>
+        <div class="input"><span class="val">Confirme a senha</span></div>
+      </div>
+
+      <div class="warnbox">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 1.5 21h21L12 3Zm0 6a1 1 0 0 1 1 1v5a1 1 0 0 1-2 0v-5a1 1 0 0 1 1-1Zm0 9.2a1.2 1.2 0 1 1 0-2.4 1.2 1.2 0 0 1 0 2.4Z"/></svg>
+        <span>O cofre é uma <b>cópia</b> criptografada. A pasta original continua legível até você removê-la — e, mesmo removida, podem restar cópias dela na Lixeira, em Versões anteriores, no OneDrive, em backups e no índice do Windows.</span>
+      </div>
+    </div>
+
+    <div class="side">
+      <div class="card">
+        <h2>ESCOLHAS DO PASSO 1</h2>
+        <div class="kv"><span>Origem · <span class="edit">alterar</span></span><code>C:\Users\Luis Felipe\Desktop\Cript Teste</code></div>
+        <div class="kv"><span>Local do cofre</span><code>C:\Users\Luis Felipe\Desktop\Cofre</code></div>
+        <div class="kv"><span>Nome do cofre</span><code>Cofre-20261117-1413</code></div>
+        <div class="kv"><span>Teste de restauração</span><code>C:\Users\LUISFE~1\AppData\Local\Temp</code></div>
+      </div>
+      <div class="tip">
+        <b>Por que o nome é genérico?</b>
+        O nome da pasta do cofre fica visível para qualquer pessoa que abrir o computador. Guarde o assunto na senha, não no nome.
+      </div>
+    </div>
+  </div>
+
+  <div class="foot">
+    <span class="btn ghost">Voltar</span>
+    <span class="btn primary">Continuar para a conferência</span>
+    <span class="stat"><i class="dot"></i>Pronto. Último cofre verificado às 14:13.</span>
+  </div>
+</div>
+</body>
+</html>

@@ -1,38 +1,60 @@
 # Owl Vault
 
-**Owl Vault** cria **cópias criptografadas e verificáveis** de pastas no Windows 10/11.
+**Owl Vault** tranca pastas do seu computador com criptografia, no Windows 10/11. A pasta
+trancada continua no mesmo lugar, com o ícone da coruja, mas os arquivos dentro dela ficam
+criptografados: só abrem pelo Owl Vault, com o seu **PIN** (ou a **senha mestra**).
 
-> ⚠️ O Owl Vault **não protege a pasta original**: ele cria uma *cópia* criptografada. A pasta
-> original continua legível até você removê-la manualmente — e, mesmo depois, podem restar
-> cópias dela (Lixeira, Versões anteriores, OneDrive, backups, índice do Windows, SSD).
-> **Sem a senha não há como recuperar os dados.** Não houve auditoria independente.
+> ⚠️ Enquanto a pasta está **aberta**, qualquer pessoa que use o computador pode ler os
+> arquivos. O Windows deixa rastros (Recentes, índice de pesquisa, miniaturas, SSD, backups,
+> Lixeira, OneDrive) que o Owl Vault não apaga. **Se você esquecer a senha mestra, ninguém
+> recupera os arquivos.** Não houve auditoria independente.
 
-## O que faz
+## Como usar
 
-| Operação | O que acontece |
-|----------|----------------|
-| **Criar cofre** | Pré-verifica a origem; cifra cada arquivo (AES-256-GCM, chave derivada da senha com Argon2id) numa pasta de cofre nova; verifica todos os blocos com leitura sem cache; faz um **teste de restauração** de cada arquivo comparando SHA-256 com uma releitura da origem; varre a origem de novo; só então declara sucesso. A origem **nunca** é alterada. |
-| **Verificar cofre** | Somente leitura: autentica cabeçalho, manifesto, registro de conclusão e todos os blocos; aponta anomalias. |
-| **Restaurar** | Para uma pasta **nova e vazia**, validando tudo antes de gravar; nunca sobrescreve; retomável. |
-| **Salvamento de emergência** (CLI) | Se o manifesto for perdido, recupera o conteúdo dos arquivos sem os nomes. |
+1. Rode `OwlVault.exe`. Na primeira vez ele se instala só para o seu usuário
+   (`%LOCALAPPDATA%\Programs\Owl Vault`, com atalho no Menu Iniciar; não pede administrador).
+2. **Crie a senha mestra** (mínimo 12 caracteres — anote num lugar seguro) e o **PIN** (6 a 12
+   números, só para este computador).
+3. **+ Proteger uma pasta…** → escolha a pasta → confira o resumo → **Proteger**. O Owl Vault
+   guarda os arquivos criptografados dentro da própria pasta (`.owlvault`, oculta), confere
+   tudo, testa a recuperação de cada arquivo e só então apaga as cópias legíveis.
+4. Para abrir: dois cliques em **Abrir com Owl Vault** dentro da pasta (ou no botão **Abrir**
+   do programa) e digite o PIN. A pasta abre no Explorer. Quando terminar, **Trancar**.
+5. **Esconder do Explorer** (menu ⋯) faz a pasta trancada sumir do Explorer; ela volta pelo
+   Owl Vault.
 
-Detalhes: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) · formato: [docs/FORMAT.md](docs/FORMAT.md) ·
+| Na lista | Botão | O que significa |
+|----------|-------|-----------------|
+| Trancada / Escondida | **Abrir** | arquivos criptografados dentro da pasta |
+| Aberta — visível neste computador | **Trancar** | arquivos legíveis; tranque ao terminar |
+| Precisa de atenção | **Resolver…** | algo foi interrompido ou mudou; o programa explica e oferece no máximo 2 saídas |
+
+O programa trava sozinho depois de 5 minutos sem uso, ao bloquear o Windows (Win+L) e ao
+suspender. Ao sair com pastas abertas, ele oferece **Trancar e sair**.
+
+**Backup**: copie a pasta trancada inteira (com os itens ocultos). Em outro computador,
+instale o Owl Vault e use ☰ → **Recuperar uma pasta protegida** com a sua senha mestra.
+
+Regras que o Owl Vault segue para não perder dados: nada é apagado antes de estar guardado,
+conferido e testado; cada original é conferido (identidade, tamanho e datas) no momento de
+apagar e, se mudou, fica na pasta; uma versão anterior com arquivos que não estão na pasta
+nunca é apagada sem você confirmar a lista. Pastas do OneDrive, unidades FAT/exFAT, pastas do
+Windows (Documentos, Área de Trabalho…), pastas com links e arquivos com vínculos são
+recusadas. Detalhes: [docs/PASTAS_PROTEGIDAS.md](docs/PASTAS_PROTEGIDAS.md) e
+[docs/UI_SPEC_V2.md](docs/UI_SPEC_V2.md).
+
+### Cópia criptografada (uso raro)
+
+☰ → **Cópia criptografada de uma pasta…** mantém o modo da v1: cria uma *cópia* criptografada
+noutro lugar (ex.: pendrive) sem alterar a pasta original, e abre uma cópia numa pasta nova.
+
+Detalhes técnicos: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) · formato: [docs/FORMAT.md](docs/FORMAT.md) ·
 ameaças e limites: [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) · segurança: [SECURITY.md](SECURITY.md) ·
 recuperação: [docs/RECOVERY.md](docs/RECOVERY.md) · Windows: [docs/WINDOWS.md](docs/WINDOWS.md) ·
 testes: [docs/TEST_PLAN.md](docs/TEST_PLAN.md).
 
-## Usar o executável
-
-1. Rode `OwlVault.exe` (o Windows SmartScreen pode avisar porque o executável não é assinado —
-   confira o SHA-256 em `OwlVault.exe.sha256`).
-2. **Criar cofre**: escolha a origem, o local do cofre (ex.: HD externo) e uma senha longa
-   (mínimo 12 caracteres; prefira uma frase). Leia o relatório de pré-verificação e os avisos.
-3. Depois de criado: **Verificar cofre** (de preferência em outro computador) e faça uma
-   **restauração de teste** antes de cogitar remover a origem. Mantenha backups.
-
-Limitações importantes da v1: pastas do OneDrive (Arquivos sob Demanda), links simbólicos,
-junctions e outros pontos de reparse são **recusados**; caminhos de rede não são suportados;
-permissões, atributos, data de criação e fluxos alternativos NTFS não são preservados.
+O Windows SmartScreen pode avisar porque o executável não é assinado — confira o SHA-256 em
+`OwlVault.exe.sha256`.
 
 ## Desenvolvimento
 
@@ -58,7 +80,7 @@ rápida que só existe para testes (a UI/CLI não conseguem usá-la).
 
 Interface gráfica a partir do código: `.\.venv\Scripts\python.exe -m owl_vault`
 
-### CLI de laboratório
+### CLI de laboratório (cópias criptografadas da v1)
 
 ```powershell
 .\.venv\Scripts\python.exe -m owl_vault.cli.main preflight C:\Dados\Projeto E:\Cofre-1
@@ -91,8 +113,9 @@ Gera `dist\OwlVault.exe` (onefile, sem console, `asInvoker`, sem UPX) e
 src/owl_vault/
   domain/       modelos, erros, limites, nomes do Windows
   crypto/       Argon2id, HKDF, AES-GCM em chunks
-  storage/      formatos, layout, diário, E/S Win32 (winfs), varredura
-  application/  preflight, criar/retomar, verificar, restaurar, salvar
+  storage/      formatos, layout, diário, E/S Win32 (winfs), varredura, DPAPI, Explorer (shell)
+  application/  preflight, criar/retomar, verificar, restaurar, salvar;
+                profile (senha mestra + PIN), lockers (pastas protegidas), install
   cli/          CLI de laboratório
   ui/           PySide6
 tests/          pytest
@@ -113,4 +136,4 @@ logo:
 ```
 
 A interface usa um tema roxo derivado das cores da logo (escuro por padrão; o claro fica em
-Exibir → Tema escuro).
+☰ → Tema).
