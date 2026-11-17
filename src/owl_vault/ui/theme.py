@@ -220,6 +220,40 @@ QLabel#banner {{
     border-radius: 8px; padding: 10px 12px; font-weight: 600;
 }}
 QLabel#hint {{ color: {c.muted}; }}
+QLabel#pageTitle {{ font-size: 14pt; font-weight: 700; }}
+QLabel#error {{ color: {c.banner_edge}; font-weight: 600; }}
+QLabel#rowName {{ font-size: 11pt; font-weight: 700; }}
+QLabel#rowPath {{ color: {c.muted}; }}
+QLabel#stateLocked {{ color: {c.accent_hover}; font-weight: 600; }}
+QLabel#stateOpen {{ color: {c.banner_edge}; font-weight: 600; }}
+QLabel#stateAttention {{ color: {c.banner_edge}; font-weight: 700; }}
+QFrame#card {{
+    background: {c.surface_alt}; border: 1px solid {c.border}; border-radius: 10px;
+}}
+QFrame#card:hover {{ border-color: {c.border_strong}; }}
+QFrame#openBanner {{
+    background: {c.banner_bg}; border: 1px solid {c.border_strong};
+    border-left: 4px solid {c.banner_edge}; border-radius: 8px;
+}}
+QFrame#openBanner QLabel {{ color: {c.banner_text}; font-weight: 600; }}
+QPushButton#link {{
+    background: transparent; border: none; color: {c.accent_hover}; padding: 2px 0;
+    text-decoration: underline; text-align: left;
+}}
+QPushButton#link:hover {{ color: {c.text}; }}
+QPushButton#link:focus {{ border: none; padding: 2px 0; color: {c.text}; }}
+QToolButton#more {{
+    background: {c.button}; color: {c.text}; border: 1px solid {c.border_strong};
+    border-radius: 8px; padding: 4px 10px; font-size: 12pt;
+}}
+QToolButton#more:hover {{ background: {c.button_hover}; }}
+QToolButton#more::menu-indicator {{ image: none; width: 0; }}
+QScrollArea {{ background: transparent; }}
+QScrollArea > QWidget > QWidget {{ background: transparent; }}
+QListWidget {{
+    background: {c.surface}; color: {c.text}; border: 1px solid {c.control_border};
+    border-radius: 6px;
+}}
 QLabel#brandTitle {{ font-size: 16pt; font-weight: 700; }}
 QLabel#brandSubtitle {{ color: {c.muted}; }}
 QWidget#header {{ background: transparent; }}

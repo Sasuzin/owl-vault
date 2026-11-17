@@ -1,17 +1,17 @@
-"""Janela principal: abas Criar / Verificar / Restaurar, progresso, cancelamento e log em memória."""
+"""Cópia criptografada de uma pasta (modo v1, uso raro — UI_SPEC_V2 T14).
+
+Criar uma cópia, conferir e abrir uma cópia em outra pasta. A pasta original não é alterada.
+"""
 
 from __future__ import annotations
 
 import datetime as _dt
 import os
-from collections.abc import Callable
 from typing import Any
 
-from PySide6.QtCore import QSettings, Qt, Slot
-from PySide6.QtGui import QAction, QCloseEvent, QGuiApplication, QImage, QPixmap
+from PySide6.QtCore import Qt, Slot
+from PySide6.QtGui import QAction, QCloseEvent
 from PySide6.QtWidgets import (
-    QApplication,
-    QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QLabel,
@@ -43,20 +43,10 @@ from owl_vault.domain.errors import CancelledError, OwlVaultError, PreflightErro
 from owl_vault.domain.limits import MIB, MIN_PASSWORD_LENGTH
 from owl_vault.storage import winfs
 from owl_vault.ui import strings as S
+from owl_vault.ui.common import brand_header, choose_folder, hidpi
 from owl_vault.ui.dialogs import PreflightDialog, ReportDialog
-from owl_vault.ui.icon import WORD_PURPLE, logo_image, owl_icon, owl_image
-from owl_vault.ui.theme import apply_theme, save_theme, saved_theme
+from owl_vault.ui.icon import WORD_PURPLE, logo_image, owl_icon
 from owl_vault.ui.workers import JobRunner, QtProgress
-
-
-def _clear_qt_dialog_history() -> None:
-    """Melhor esforço: o Qt guarda a última pasta usada no registro (THREAT_MODEL §4)."""
-    s = QSettings(QSettings.Scope.UserScope, "QtProject")
-    s.beginGroup("FileDialog")
-    for key in ("lastVisited", "history"):
-        s.remove(key)
-    s.endGroup()
-    s.sync()
 
 
 class PathRow(QWidget):
@@ -72,50 +62,15 @@ class PathRow(QWidget):
         lay.addWidget(self.button)
 
     def _choose(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Escolher pasta", self.edit.text())
-        _clear_qt_dialog_history()
+        path = choose_folder(self, "Escolher pasta", self.edit.text())
         if path:
-            self.edit.setText(os.path.normpath(path))
+            self.edit.setText(path)
 
     def text(self) -> str:
         return self.edit.text().strip()
 
     def setText(self, value: str) -> None:
         self.edit.setText(value)
-
-
-def _hidpi(render: Callable[[int], QImage], logical: int) -> QPixmap:
-    """Gera a imagem na densidade real da tela (nitida em escala de 125%/150%)."""
-    screen = QGuiApplication.primaryScreen()
-    dpr = screen.devicePixelRatio() if screen is not None else 1.0
-    pixmap = QPixmap.fromImage(render(max(1, round(logical * dpr))))
-    pixmap.setDevicePixelRatio(dpr)
-    return pixmap
-
-
-def _brand_header() -> QWidget:
-    """Cabeçalho com a coruja e o nome "Owl Vault" (Vault em roxo), como no logo."""
-    header = QWidget()
-    header.setObjectName("header")
-    lay = QHBoxLayout(header)
-    lay.setContentsMargins(2, 0, 2, 0)
-    lay.setSpacing(12)
-    owl = QLabel()
-    owl.setPixmap(_hidpi(lambda px: owl_image(px), 56))
-    owl.setFixedSize(56, 56)
-    lay.addWidget(owl)
-    texts = QVBoxLayout()
-    texts.setSpacing(0)
-    title = QLabel(f'Owl <span style="color:{WORD_PURPLE.name()}">Vault</span>')
-    title.setObjectName("brandTitle")
-    title.setTextFormat(Qt.TextFormat.RichText)
-    subtitle = QLabel("Cópias criptografadas e verificáveis de pastas")
-    subtitle.setObjectName("brandSubtitle")
-    texts.addWidget(title)
-    texts.addWidget(subtitle)
-    lay.addLayout(texts)
-    lay.addStretch(1)
-    return header
 
 
 def _wipe(edit: QLineEdit) -> None:
@@ -137,12 +92,12 @@ def _hint(text: str) -> QLabel:
     return lbl
 
 
-class MainWindow(QMainWindow):
+class CopyWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle(S.APP_TITLE)
+        self.setWindowTitle("Owl Vault — Cópia criptografada")
         self.setWindowIcon(owl_icon())
-        self.resize(860, 720)
+        self.resize(780, 640)
         self.runner = JobRunner(self)
         self.session_sources: list[str] = []
         self._totals = (0, 0)
@@ -153,16 +108,16 @@ class MainWindow(QMainWindow):
         root = QVBoxLayout(central)
         root.setContentsMargins(14, 10, 14, 12)
         root.setSpacing(10)
-        root.addWidget(_brand_header())
+        root.addWidget(brand_header("Cópia criptografada de uma pasta"))
         banner = QLabel(S.BANNER)
         banner.setObjectName("banner")
         banner.setWordWrap(True)
         root.addWidget(banner)
 
         self.tabs = QTabWidget()
-        self.tabs.addTab(self._build_create_tab(), "Criar cofre")
-        self.tabs.addTab(self._build_verify_tab(), "Verificar cofre")
-        self.tabs.addTab(self._build_restore_tab(), "Restaurar")
+        self.tabs.addTab(self._build_create_tab(), "Criar cópia")
+        self.tabs.addTab(self._build_restore_tab(), "Abrir uma cópia")
+        self.tabs.addTab(self._build_verify_tab(), "Conferir cópia")
         root.addWidget(self.tabs)
 
         status = QHBoxLayout()
@@ -202,11 +157,6 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ construção
     def _build_menu(self) -> None:
-        view = self.menuBar().addMenu("&Exibir")
-        self.dark_action = QAction("Tema escuro", self, checkable=True)
-        self.dark_action.setChecked(saved_theme() == "dark")
-        self.dark_action.toggled.connect(self._toggle_theme)
-        view.addAction(self.dark_action)
         help_menu = self.menuBar().addMenu("&Ajuda")
         limits = QAction(S.LIMITS_TITLE, self)
         limits.triggered.connect(
@@ -222,7 +172,7 @@ class MainWindow(QMainWindow):
     def _show_about(self) -> None:
         box = QMessageBox(self)
         box.setWindowTitle("Sobre o Owl Vault")
-        box.setIconPixmap(_hidpi(lambda px: logo_image(px), 132))
+        box.setIconPixmap(hidpi(lambda px: logo_image(px), 132))
         box.setTextFormat(Qt.TextFormat.RichText)
         box.setText(
             f'<b>Owl <span style="color:{WORD_PURPLE.name()}">Vault</span></b> {__version__}'
@@ -238,29 +188,40 @@ class MainWindow(QMainWindow):
         lay.addWidget(_hint(S.CREATE_HINT))
         form = QFormLayout()
         self.c_source = PathRow("Pasta que será copiada (não será alterada)")
+        self.c_source.button.setText("Escolher…")
         self.c_source.edit.editingFinished.connect(self._suggest_test_dir)
         self.c_source.edit.textChanged.connect(lambda _t: self._suggest_test_dir())
-        self.c_parent = PathRow("Onde criar o cofre (ex.: pendrive ou HD externo)")
+        self.c_parent = PathRow("Onde salvar a cópia (ex.: pendrive ou HD externo)")
         self.c_name = QLineEdit(default_vault_name())
         self.c_test = PathRow("Pasta temporária do teste de restauração")
         self.c_pw1 = _password_edit(f"Senha (mínimo {MIN_PASSWORD_LENGTH} caracteres)")
         self.c_pw2 = _password_edit("Confirme a senha")
         self.c_strength = QLabel("")
         self.c_pw1.textChanged.connect(self._update_strength)
-        form.addRow("Origem:", self.c_source)
-        form.addRow("Local do cofre:", self.c_parent)
-        form.addRow("Nome do cofre:", self.c_name)
-        form.addRow("Teste de restauração:", self.c_test)
-        form.addRow("Senha:", self.c_pw1)
-        form.addRow("Confirmação:", self.c_pw2)
+        form.addRow("Pasta a copiar:", self.c_source)
+        form.addRow("Salvar a cópia em:", self.c_parent)
+        form.addRow("Senha da cópia:", self.c_pw1)
+        form.addRow("Repita a senha:", self.c_pw2)
         form.addRow("", self.c_strength)
         lay.addLayout(form)
-        lay.addWidget(_hint(S.TEST_DIR_HINT))
+        self.c_adv_toggle = QPushButton("Avançado ▸")
+        self.c_adv_toggle.setObjectName("link")
+        self.c_adv_toggle.setFlat(True)
+        self.c_adv = QWidget()
+        adv = QFormLayout(self.c_adv)
+        adv.setContentsMargins(0, 0, 0, 0)
+        adv.addRow("Nome da pasta da cópia:", self.c_name)
+        adv.addRow("Pasta do teste:", self.c_test)
+        adv.addRow("", _hint(S.TEST_DIR_HINT))
+        self.c_adv.hide()
+        self.c_adv_toggle.clicked.connect(self._toggle_advanced)
+        lay.addWidget(self.c_adv_toggle, 0, Qt.AlignmentFlag.AlignLeft)
+        lay.addWidget(self.c_adv)
         row = QHBoxLayout()
-        self.c_go = QPushButton("Pré-verificar e criar cofre...")
+        self.c_go = QPushButton("Criar cópia criptografada…")
         self.c_go.setObjectName("primary")
         self.c_go.clicked.connect(self._start_preflight)
-        self.c_resume = QPushButton("Retomar criação interrompida")
+        self.c_resume = QPushButton("Continuar uma cópia interrompida")
         self.c_resume.clicked.connect(self._start_resume)
         row.addWidget(self.c_go)
         row.addWidget(self.c_resume)
@@ -284,12 +245,12 @@ class MainWindow(QMainWindow):
         lay = QVBoxLayout(w)
         lay.addWidget(_hint(S.VERIFY_HINT))
         form = QFormLayout()
-        self.v_vault = PathRow("Pasta do cofre")
-        self.v_pw = _password_edit("Senha do cofre")
-        form.addRow("Cofre:", self.v_vault)
+        self.v_vault = PathRow("Pasta da cópia criptografada")
+        self.v_pw = _password_edit("Senha da cópia")
+        form.addRow("Cópia:", self.v_vault)
         form.addRow("Senha:", self.v_pw)
         lay.addLayout(form)
-        self.v_go = QPushButton("Verificar cofre")
+        self.v_go = QPushButton("Conferir cópia")
         self.v_go.setObjectName("primary")
         self.v_go.clicked.connect(self._start_verify)
         lay.addWidget(self.v_go, 0, Qt.AlignmentFlag.AlignLeft)
@@ -302,22 +263,26 @@ class MainWindow(QMainWindow):
         lay = QVBoxLayout(w)
         lay.addWidget(_hint(S.RESTORE_HINT))
         form = QFormLayout()
-        self.r_vault = PathRow("Pasta do cofre")
-        self.r_pw = _password_edit("Senha do cofre")
-        self.r_parent = PathRow("Onde criar a pasta restaurada")
+        self.r_vault = PathRow("Pasta da cópia criptografada")
+        self.r_pw = _password_edit("Senha da cópia")
+        self.r_parent = PathRow("Onde criar a pasta com os arquivos")
         self.r_name = QLineEdit(_dt.datetime.now().strftime("Restaurado-%Y%m%d-%H%M"))
-        form.addRow("Cofre:", self.r_vault)
+        form.addRow("Cópia:", self.r_vault)
         form.addRow("Senha:", self.r_pw)
-        form.addRow("Destino (pasta pai):", self.r_parent)
-        form.addRow("Nome da pasta nova:", self.r_name)
+        form.addRow("Abrir em:", self.r_parent)
         lay.addLayout(form)
-        self.r_go = QPushButton("Restaurar para pasta nova")
+        self.r_go = QPushButton("Abrir numa pasta nova")
         self.r_go.setObjectName("primary")
         self.r_go.clicked.connect(self._start_restore)
         lay.addWidget(self.r_go, 0, Qt.AlignmentFlag.AlignLeft)
         lay.addStretch(1)
         self._inputs_restore = [self.r_vault, self.r_pw, self.r_parent, self.r_name, self.r_go]
         return w
+
+    def _toggle_advanced(self) -> None:
+        show = not self.c_adv.isVisible()
+        self.c_adv.setVisible(show)
+        self.c_adv_toggle.setText("Avançado ▾" if show else "Avançado ▸")
 
     # ------------------------------------------------------------------ utilidades
     def _log(self, message: str) -> None:
@@ -334,13 +299,6 @@ class MainWindow(QMainWindow):
 
     def _warn(self, text: str) -> None:
         QMessageBox.warning(self, S.APP_TITLE, text)
-
-    def _toggle_theme(self, dark: bool) -> None:
-        theme = "dark" if dark else "light"
-        save_theme(theme)
-        app = QApplication.instance()
-        if isinstance(app, QApplication):
-            apply_theme(app, theme)
 
     def _update_strength(self) -> None:
         st = password_strength(self.c_pw1.text())

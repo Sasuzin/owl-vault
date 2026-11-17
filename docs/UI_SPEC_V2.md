@@ -1,0 +1,136 @@
+# Owl Vault v2 — Especificação das telas
+
+Consolidada pela revisão de design (juiz independente). Princípio: o usuário só digita PIN ou senha mestra.
+
+PRINCÍPIO: o usuário só digita PIN ou senha mestra. Todo o resto é escolher pasta no seletor do Windows ou clicar em botão. Não existe campo de cofre nem de pasta de teste. Estados de uma pasta: Trancada · Aberta — visível neste computador · Escondida · Precisa de atenção · Indisponível — conecte a unidade · Trancando…/Abrindo… N%.
+
+
+## T0 INSTALAÇÃO (sem tela): na 1ª execução, o app se copia para %LOCALAPPDATA%\Programs\Owl Vault\OwlVault.exe e cria um atalho no Menu Iniciar.
+
+
+## T1 ASSISTENTE 1/2 — "Crie sua senha mestra"
+
+## Texto: "A senha mestra abre suas pastas em qualquer computador. Se você esquecê-la, ninguém consegue recuperar os arquivos — nem o Owl Vault."
+Campos: [Senha mestra] [Repita a senha mestra] (mínimo de 12 caracteres, com indicador de força).
+Caixa obrigatória: "Anotei minha senha mestra em um lugar seguro."
+Botão: [Continuar]. Link: "Já usei o Owl Vault — recuperar minhas pastas" (→ T12).
+
+
+## T2 ASSISTENTE 2/2 — "Crie seu PIN"
+
+## Texto: "Use o PIN no dia a dia, só neste computador. Ele é mais fraco que a senha mestra: não use datas nem sequências como 123456."
+Campos: [PIN (6 a 12 números)] [Repita o PIN]. Erro: "Este PIN é fácil de adivinhar. Escolha outro."
+Botão: [Concluir] (→ T4).
+
+
+## T3 DESBLOQUEIO — "Digite seu PIN"
+Campo: [PIN]. Botão: [Entrar]. Links: "Usar a senha mestra" · "Esqueci o PIN".
+Erro: "PIN incorreto. Restam N tentativas; depois disso, só a senha mestra." Depois de 5 erros, o campo passa a ser [Senha mestra].
+Variante de prática (no 1º desbloqueio depois de 1 dia e depois a cada 30 dias): "Digite sua senha mestra — pedimos de vez em quando para você não esquecê-la." Campo: [Senha mestra]. Botão: [Entrar]. Depois de 3 erros: "Esqueceu? Enquanto o PIN funciona, você pode criar uma nova." [Criar nova senha mestra] [Usar o PIN desta vez].
+Variante DPAPI: "O Windows não consegue mais usar o PIN deste computador (a senha do Windows foi redefinida ou o Windows foi reinstalado). Digite sua senha mestra." Campo: [Senha mestra]. Depois → T2 para criar um PIN novo.
+Variante atalho: título "Abrir '<Nome>'", campo [PIN], botão [Abrir]. Aparece SEMPRE que o atalho é usado, mesmo com o app destravado.
+
+## Travamento automático: o app volta para T3 depois de 5 min sem uso, ao bloquear o Windows (Win+L) e ao suspender. Também existe ☰ > "Bloquear agora".
+
+
+## T4 TELA PRINCIPAL — "Pastas protegidas"
+
+## Topo: botão principal [+ Proteger uma pasta…] e o menu ☰.
+Faixa (enquanto houver pasta aberta): "1 pasta está aberta e visível neste computador. [Trancar agora]".
+Estado vazio: "Nenhuma pasta protegida ainda. Clique em 'Proteger uma pasta…' e escolha a pasta que você quer trancar."
+Cada linha mostra ícone, Nome (negrito), Local (cinza), Estado por extenso e UM botão:
+- Trancada → [Abrir]
+- Escondida → [Abrir]
+- Aberta — visível neste computador → [Trancar]
+- Precisa de atenção → [Resolver…]
+- Indisponível — conecte a unidade X → sem botão
+- Trancando…/Abrindo… N% → barra de progresso; clicar abre T6
+Menu "⋯" da linha:
+- Trancada: "Esconder do Explorer" · "Verificar arquivos" · "Remover proteção…"
+- Escondida: "Mostrar no Explorer" · "Verificar arquivos" · "Remover proteção…"
+- Aberta: "Abrir a pasta no Explorer" · "Trancar e esconder" · "Remover proteção…"
+Menu ☰: "Recuperar uma pasta protegida…" · "Cópia criptografada de uma pasta…" · "Alterar PIN…" · "Bloquear agora" · "Limites da proteção" · "Tema".
+
+
+## T5 PROTEGER UMA PASTA (nenhum campo para preencher)
+5a. Seletor de pastas do Windows: "Escolha a pasta que você quer proteger".
+5b. "Conferindo a pasta…" com barra e [Cancelar].
+5c. Recusa: UMA caixa com o motivo principal, uma ação, "Detalhes" recolhido (até 5 nomes + "e mais N") e os botões [Tentar de novo] [Fechar]. Textos:
+- Pasta do Windows: "Não dá para proteger a pasta Documentos inteira. Crie uma pasta dentro dela (ex.: Documentos\Particular), coloque lá o que quer esconder e proteja essa."
+- Contém pasta do Windows: "Esta pasta contém a pasta Downloads, que o Windows usa. Escolha uma pasta que não contenha pastas do sistema."
+- OneDrive: "Esta pasta está no OneDrive, que guarda cópias na nuvem que o Owl Vault não consegue apagar. Mova a pasta para fora do OneDrive (ex.: C:\Particular), apague-a também da Lixeira do OneDrive na internet e tente de novo."
+- FAT/exFAT: "Esta unidade usa exFAT. O Owl Vault só tranca pastas em unidades NTFS. Para pendrives, use ☰ > Cópia criptografada de uma pasta."
+- Em uso: "Feche estes arquivos e clique em Tentar de novo: Relatório.docx, …"
+- Bloqueio do Windows (Acesso controlado a pastas ou permissão): "O Windows não deixou o Owl Vault apagar arquivos aqui. Em Segurança do Windows > Proteção contra ransomware > Permitir um aplicativo, adicione %LOCALAPPDATA%\Programs\Owl Vault\OwlVault.exe."
+- Vínculo: "O arquivo 'X' também existe em outro lugar do computador (vínculo do Windows). Trancado aqui, continuaria visível lá. Copie-o para fora, apague o vínculo e tente de novo."
+- Atalhos especiais: "A pasta tem atalhos especiais do Windows que o Owl Vault não protege: X. Tire-os da pasta e tente de novo."
+- Maiúsculas: "Dois itens têm o mesmo nome, mudando só maiúsculas e minúsculas: A e a. Renomeie um deles."
+- Espaço: "Falta espaço no disco D:. Libere cerca de 12 GB."
+- Dentro de outra protegida: "Esta pasta fica dentro de 'Particular', que já é protegida."
+- Sem escrita ao lado: "O Windows não deixa criar arquivos ao lado desta pasta. Mova-a para dentro de Documentos e tente de novo."
+- Sistema, perfil ou raiz: "Escolha uma pasta sua, como Documentos\Particular."
+5d. Confirmação "Proteger '<Nome>'?": "1.234 arquivos · 40 GB · pode levar cerca de 1 hora." (o tempo só aparece se passar de 2 min)
+"• Os arquivos ficam guardados, criptografados, dentro da própria pasta. As cópias legíveis são apagadas (não vão para a Lixeira)."
+"• Para abrir, use o atalho dentro da pasta ou o Owl Vault, com o seu PIN."
+"• Cópias que já existem em outros lugares (Lixeira, OneDrive, backups, versões anteriores) não são apagadas. Recomendamos ativar o BitLocker."
+"• Ao abrir, os arquivos voltam com nome, conteúdo e data de modificação; data de criação, atributos e permissões não voltam."
+"• Enquanto aberta, a pasta ocupa o dobro do espaço."
+Na 1ª proteção do perfil, a caixa "Entendi" é obrigatória. Botões: [Proteger] [Cancelar].
+5e. Progresso (→ T6).
+
+
+## T6 PROGRESSO
+"Trancando '<Nome>'": "1/4 Guardando os arquivos (523 de 1.234)" · "2/4 Conferindo" · "3/4 Testando a recuperação" · "4/4 Apagando as cópias legíveis". Mostra o tempo restante e "Não use esta pasta até terminar."
+Botões: [Cancelar] nas etapas 1 a 3 ("Nada foi apagado."); na etapa 4, [Parar depois do arquivo atual] (a pasta vai para Precisa de atenção).
+Fim: "'<Nome>' está trancada." Em unidade removível NTFS, acrescenta: "Use 'Remover hardware com segurança' antes de tirar a unidade."
+"Abrindo '<Nome>' (523 de 1.234)" com [Cancelar] (dá para continuar depois). No fim, a pasta abre no Explorer.
+
+
+## T7 TRANCAR UMA PASTA ABERTA: vai direto para T6, sem confirmação, EXCETO se faltarem arquivos que estavam no cofre anterior:
+"Desde que você abriu '<Nome>', 3 arquivos foram apagados ou movidos: a.docx, b.jpg, c.pdf. Eles não ficarão na pasta trancada." [Trancar mesmo assim] [Cancelar]
+
+
+## T8 RESOLVER… (Precisa de atenção): uma explicação e no máximo 2 botões.
+- Trancamento interrompido: "Seus arquivos já estão guardados. N arquivos ainda não foram apagados da pasta porque estavam abertos ou foram alterados: Relatório.docx, … Feche-os e clique em Continuar trancando." [Continuar trancando] [Desfazer (deixar a pasta aberta)]
+- Abertura incompleta: "N arquivos não puderam ser abertos: … A cópia protegida deles continua guardada." [Tentar de novo] [Continuar sem eles] (o cofre anterior nunca é apagado automaticamente)
+- Item colocado na pasta trancada: "Há 1 item que foi colocado em '<Nome>' depois de trancar: Nova planilha.xlsx. Mova-o para outro lugar e clique em Tentar de novo." [Mostrar no Explorer] [Tentar de novo]
+- Pasta não encontrada: "A pasta '<Nome>' não está mais em D:\Fotos." [Procurar a pasta…] [Tirar da lista] ("Nada será apagado.")
+- Versão anterior mantida: "Foi mantida uma versão anterior de '<Nome>' com N arquivos que não estão na pasta." [Recuperar esses arquivos em outra pasta…] [Apagar a versão anterior…] (a confirmação lista os N nomes)
+- Senha mestra antiga: "Tranque de novo para atualizar a senha mestra." [Abrir] (só aparece depois de 'Criar nova senha mestra')
+
+
+## T9 ESCONDER DO EXPLORER: "Esconder '<Nome>'? A pasta some do Explorer e só volta pelo Owl Vault. Quem souber mostrar arquivos protegidos do sistema ainda pode ver que ela existe, mas não o conteúdo." [Esconder] [Cancelar]. Só vale para pasta trancada; numa pasta aberta, a opção é "Trancar e esconder". "Mostrar no Explorer" age na hora, sem confirmação.
+
+
+## T10 REMOVER PROTEÇÃO: "Remover a proteção de '<Nome>'? A pasta volta a ser comum e qualquer pessoa que use este computador poderá ver os arquivos." Campo: [PIN]. Botões: [Remover proteção] [Cancelar]. Se a pasta estiver trancada, ela é aberta antes (T6). Se faltar algo, o app mostra a lista e pede confirmação antes de apagar o cofre.
+
+
+## T11 SAIR COM PASTAS ABERTAS: "Sair do Owl Vault? Estas pastas estão abertas e visíveis: • Fotos (trancar leva cerca de 35 min)" [Trancar e sair] (padrão) [Sair sem trancar] [Cancelar]. Em caso de erro: "Não deu para trancar 'Fotos': feche 'IMG_0042.jpg' e clique em Tentar de novo." [Tentar de novo] [Sair sem trancar].
+
+
+## T12 RECUPERAR UMA PASTA PROTEGIDA: "Escolha a pasta com o ícone do Owl Vault. Se ela estava escondida, escolha a pasta onde ela ficava." → seletor do Windows → (se houver mais de uma, uma lista para marcar) → campo [Senha mestra] → botão [Recuperar].
+
+
+## T13 ALTERAR PIN: campos [PIN atual] [Novo PIN] [Repita o novo PIN], botão [Salvar]. Link "Esqueci o PIN" (pede a senha mestra).
+
+
+## T14 CÓPIA CRIPTOGRAFADA DE UMA PASTA (modo v1, uso raro)
+Faixa: "A pasta original não é alterada e continua legível."
+Campos: [Pasta a copiar…] [Salvar a cópia em…] [Senha mestra]. Nome do cofre e pasta de teste são automáticos (em "Avançado", recolhido).
+A caixa de aceite FAT/exFAT só aparece quando o destino é FAT/exFAT.
+Fim: "Esta cópia abre com a sua senha mestra em qualquer computador."
+
+
+## T15 LIMITES DA PROTEÇÃO (só texto)
+- Pasta aberta é legível por quem usa o computador.
+- Rastros: Recentes, listas de atalhos, índice do Windows, miniaturas, SSD e backups.
+- O nome da pasta trancada continua visível; use Esconder se o nome for sensível.
+- O PIN é mais fraco que a senha mestra.
+- Apagar a pasta trancada apaga os arquivos criptografados.
+- Copiar a pasta trancada inteira é o seu backup.
+
+
+## NO EXPLORER (pasta trancada): ícone da coruja; InfoTip "Pasta protegida pelo Owl Vault — os arquivos estão aqui, criptografados. Não apague." Itens visíveis: "Abrir com Owl Vault" (atalho) e "Como abrir esta pasta.txt", com o texto: "Esta pasta está protegida pelo Owl Vault e seus arquivos estão aqui dentro, criptografados. Dê dois cliques em 'Abrir com Owl Vault' ou abra o programa Owl Vault e digite seu PIN. Se o programa não estiver mais neste computador, instale-o de novo e use 'Recuperar uma pasta protegida' com a sua senha mestra. Não apague esta pasta." Os itens ocultos+sistema (desktop.ini, .owlvault.ico, .owlvault\) não aparecem.
+
+
+## CAMPOS EM TODO O APP: senha mestra ×2 e PIN ×2 (só no assistente); PIN (desbloquear, abrir pelo atalho, remover proteção); PIN atual + novo ×2 (alterar PIN); senha mestra (prática periódica, recuperar, cópia criptografada).

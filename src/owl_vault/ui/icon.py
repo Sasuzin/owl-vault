@@ -8,10 +8,11 @@ em qualquer tamanho.
 
 from __future__ import annotations
 
+import struct
 from functools import lru_cache
 from pathlib import Path
 
-from PySide6.QtCore import QPointF, QRect, QRectF, Qt
+from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QPointF, QRect, QRectF, Qt
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -90,6 +91,31 @@ def owl_image(size: int) -> QImage:
     p.drawImage(QPointF((size - small.width()) / 2, (size - small.height()) / 2), small)
     p.end()
     return img
+
+
+ICO_SIZES = (16, 24, 32, 48, 64, 128, 256)
+
+
+def ico_bytes(sizes: tuple[int, ...] = ICO_SIZES) -> bytes:
+    """Arquivo .ico (imagens PNG embutidas) com o escudo da coruja. Sem dependências."""
+    pngs: list[tuple[int, bytes]] = []
+    for size in sizes:
+        data = QByteArray()
+        buf = QBuffer(data)
+        buf.open(QIODevice.OpenModeFlag.WriteOnly)
+        owl_image(size).save(buf, "PNG")  # type: ignore[call-overload]  # o PySide aceita str em tempo de execução
+        buf.close()
+        pngs.append((size, bytes(data.data())))
+    header = struct.pack("<HHH", 0, 1, len(pngs))
+    offset = 6 + 16 * len(pngs)
+    entries = b""
+    blobs = b""
+    for size, png in pngs:
+        dim = 0 if size >= 256 else size
+        entries += struct.pack("<BBBBHHII", dim, dim, 0, 0, 1, 32, len(png), offset)
+        blobs += png
+        offset += len(png)
+    return header + entries + blobs
 
 
 def owl_icon() -> QIcon:

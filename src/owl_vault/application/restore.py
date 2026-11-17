@@ -17,6 +17,7 @@ from owl_vault.application.common import (
     round_up,
     write_motw,
 )
+from owl_vault.application.keysource import KeySource
 from owl_vault.application.progress import CancelToken, NullProgress, ProgressSink
 from owl_vault.application.protection import ProtectedPaths, destination_location_problems
 from owl_vault.application.vault import OpenedVault, open_vault, read_completion, read_manifest
@@ -195,7 +196,7 @@ def _ordered(manifest: Manifest) -> list[DirEntryRecord | FileEntryRecord]:
 
 def restore_vault(
     vault_dir: str,
-    password: str,
+    password: str | KeySource,
     dest_dir: str,
     *,
     policy: KdfPolicy,
@@ -425,6 +426,29 @@ def _check_marker(marker_path: str, vault_id_hex: str, manifest_sha: str) -> str
     ):
         raise StateError("A restauração interrompida nesta pasta é de outro cofre/versão.")
     return str(obj["restore_id"])
+
+
+def write_restore_marker(dest_dir: str, vault_id_hex: str, manifest_sha256_hex: str) -> None:
+    """Grava o marcador de restauração v1 numa pasta que JÁ tem arquivos (pastas protegidas:
+    permite "Desfazer" um trancamento parcial com ``restore_vault(allow_resume=True)``)."""
+    dest_ext = winfs.to_extended(dest_dir)
+    marker = {
+        "app": "Owl Vault",
+        "vault_id": vault_id_hex,
+        "manifest_sha256": manifest_sha256_hex,
+        "restore_id": secrets.token_hex(16),
+        "phase": "restoring",
+    }
+    write_new_no_replace(
+        winfs.join(dest_ext, MARKER_NAME), json.dumps(marker).encode("ascii"), op="marker"
+    )
+
+
+def remove_restore_marker(dest_dir: str) -> None:
+    dest_ext = winfs.to_extended(dest_dir)
+    marker = winfs.join(dest_ext, MARKER_NAME)
+    if os.path.lexists(marker):
+        safe_remove_own(marker, winfs.resolve(dest_ext), _MARKER_RE)
 
 
 def _cleanup_parts(dest_ext: str, root: winfs.Resolved, prefix: str, cancel: CancelToken) -> None:

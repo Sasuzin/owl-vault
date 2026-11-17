@@ -10,6 +10,7 @@ import os
 from dataclasses import dataclass, field
 
 from owl_vault.application.common import display
+from owl_vault.application.keysource import KeySource
 from owl_vault.application.progress import CancelToken, NullProgress, ProgressSink
 from owl_vault.application.protection import ProtectedPaths, destination_location_problems
 from owl_vault.application.restore import restore_file_content
@@ -31,7 +32,7 @@ class SalvageReport:
 
 def salvage_vault(
     vault_dir: str,
-    password: str,
+    password: str | KeySource,
     dest_dir: str,
     *,
     policy: KdfPolicy,

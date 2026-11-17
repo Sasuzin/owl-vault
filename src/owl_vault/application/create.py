@@ -20,6 +20,7 @@ from owl_vault.application.common import (
     now_utc_iso,
     validate_new_password,
 )
+from owl_vault.application.keysource import KeySource
 from owl_vault.application.preflight import CreatePlan, SourceRecord, preflight_create
 from owl_vault.application.progress import CancelToken, NullProgress, ProgressSink
 from owl_vault.application.protection import ProtectedPaths
@@ -104,6 +105,9 @@ class CreateResult:
     warnings: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     removable_media: bool = False
+    #: impressão digital de cada arquivo no momento da cifragem (caminho relativo → fp),
+    #: usada pelas pastas protegidas para apagar os originais com segurança
+    fingerprints: dict[tuple[str, ...], Fingerprint] = field(default_factory=dict)
 
     @property
     def message(self) -> str:
@@ -172,7 +176,7 @@ class _Session:
         layout: VaultLayout,
         master_key: bytes,
         vault_id: bytes,
-        password: str,
+        password: str | KeySource,
         policy: KdfPolicy,
         journal: JournalWriter,
         jstate: JournalState,
@@ -565,6 +569,7 @@ class _Session:
             warnings=self.warnings,
             notes=self.notes,
             removable_media=removable,
+            fingerprints={f.path: fp for f, fp in self.state.files.values()},
         )
 
 
@@ -611,7 +616,7 @@ def cleanup_after_completion(
 def create_vault(
     source: str,
     vault_dir: str,
-    password: str,
+    password: str | KeySource,
     *,
     test_parent: str | None = None,
     kdf_params: KdfParams | None = None,
@@ -623,8 +628,16 @@ def create_vault(
     progress: ProgressSink | None = None,
     cancel: CancelToken | None = None,
 ) -> CreateResult:
-    """Cria um cofre novo a partir de ``source`` (que NUNCA é alterada)."""
-    validate_new_password(password)
+    """Cria um cofre novo a partir de ``source`` (que NUNCA é alterada).
+
+    ``password`` pode ser a senha (str) ou um :class:`KeySource` com KEK pré-derivada
+    (pastas protegidas: salt/params do perfil, sem Argon2id a cada trava)."""
+    keys = KeySource.of(password)
+    if keys.has_kek:
+        kdf_params = keys.params
+    else:
+        assert keys.password is not None
+        validate_new_password(keys.password)
     progress = progress or NullProgress()
     cancel = cancel or CancelToken()
     if plan is None:
@@ -664,14 +677,17 @@ def create_vault(
                 )
             vault_id = os.urandom(ID_SIZE)
             master_key = os.urandom(KEY_SIZE)
-            progress.stage("Derivando chave (não cancelável)")
+            if not keys.has_kek:
+                progress.stage("Derivando chave (não cancelável)")
             header = build_header(
                 master_key,
                 vault_id,
-                password,
+                keys.password,
                 kdf_params,
                 kdf_policy,
                 mem.available_commit if mem else None,
+                salt=keys.salt if keys.has_kek else None,
+                kek=keys.kek if keys.has_kek else None,
             )
             raw = header.pack()
             write_new_no_replace(layout.header, raw, op="header")
@@ -699,7 +715,7 @@ def create_vault(
                 layout,
                 master_key,
                 vault_id,
-                password,
+                keys,
                 kdf_policy,
                 journal,
                 jstate,
@@ -718,7 +734,7 @@ def create_vault(
 def resume_create(
     vault_dir: str,
     source: str,
-    password: str,
+    password: str | KeySource,
     *,
     kdf_policy: KdfPolicy = PRODUCTION_POLICY,
     protected: ProtectedPaths | None = None,
@@ -745,7 +761,7 @@ def resume_create(
 def _resume_create(
     vault_dir: str,
     source: str,
-    password: str,
+    password: str | KeySource,
     *,
     kdf_policy: KdfPolicy,
     protected: ProtectedPaths | None,

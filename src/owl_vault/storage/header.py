@@ -114,18 +114,32 @@ def parse_header(data: bytes, policy: KdfPolicy) -> VaultHeader:
 def build_header(
     master_key: bytes,
     vault_id: bytes,
-    password: str,
+    password: str | None,
     params: KdfParams,
     policy: KdfPolicy,
     available_memory: int | None = None,
+    *,
+    salt: bytes | None = None,
+    kek: bytes | None = None,
 ) -> VaultHeader:
+    """Monta o cabeçalho. Com ``salt`` + ``kek`` já derivados (KEK do perfil das pastas
+    protegidas = Argon2id(senha mestra, salt, params)), não roda o Argon2id de novo; o
+    resultado é idêntico ao de derivar a partir da senha com esse salt."""
     if len(master_key) != KEY_SIZE or len(vault_id) != ID_SIZE:
         raise ValueError("tamanhos de chave/id inválidos")
     validate_params(params, policy)
-    salt = os.urandom(SALT_SIZE)
+    if kek is not None:
+        if salt is None or len(salt) != SALT_SIZE or len(kek) != KEY_SIZE:
+            raise ValueError("KEK pré-derivada exige salt de 32 bytes e chave de 32 bytes")
+    else:
+        if password is None:
+            raise ValueError("informe a senha ou uma KEK pré-derivada")
+        salt = os.urandom(SALT_SIZE)
     nonce = os.urandom(NONCE_SIZE)
     draft = VaultHeader(vault_id, params, salt, nonce, b"\x00" * (KEY_SIZE + TAG_SIZE))
-    kek = derive_kek(password, salt, params, policy, available_memory)
+    if kek is None:
+        assert password is not None
+        kek = derive_kek(password, salt, params, policy, available_memory)
     wrapped = AESGCM(kek).encrypt(nonce, master_key, draft.core_bytes())
     return VaultHeader(vault_id, params, salt, nonce, wrapped)
 

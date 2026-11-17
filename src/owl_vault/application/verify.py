@@ -6,6 +6,7 @@ import os
 from dataclasses import dataclass, field
 
 from owl_vault.application.common import display
+from owl_vault.application.keysource import KeySource
 from owl_vault.application.progress import CancelToken, NullProgress, ProgressSink
 from owl_vault.application.vault import (
     ManifestRead,
@@ -167,7 +168,7 @@ def data_anomalies(
 
 def verify_vault(
     vault_dir: str,
-    password: str,
+    password: str | KeySource,
     *,
     policy: KdfPolicy,
     progress: ProgressSink | None = None,

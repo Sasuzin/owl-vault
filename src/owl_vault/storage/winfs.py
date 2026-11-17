@@ -93,6 +93,11 @@ FileRenameInfo = 3
 FileDispositionInfo = 4
 FileAttributeTagInfo = 9
 FileIdInfo = 18
+FileDispositionInfoEx = 21
+FILE_DISPOSITION_FLAG_DELETE = 0x1
+FILE_DISPOSITION_FLAG_POSIX_SEMANTICS = 0x2
+FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE = 0x10
+ERROR_DIR_NOT_EMPTY = 145
 
 DRIVE_REMOTE = 4
 
@@ -255,6 +260,10 @@ class _FILE_ATTRIBUTE_TAG_INFO(ctypes.Structure):
 
 class _FILE_ID_INFO(ctypes.Structure):
     _fields_ = [("VolumeSerialNumber", ctypes.c_ulonglong), ("FileId", ctypes.c_ubyte * 16)]
+
+
+class _FILE_DISPOSITION_INFO_EX(ctypes.Structure):
+    _fields_ = [("Flags", wintypes.DWORD)]
 
 
 class _FILE_DISPOSITION_INFO(ctypes.Structure):
@@ -597,9 +606,13 @@ class Win32File:
         # Atenção: um nome simples seria interpretado relativo ao diretório ATUAL do
         # processo pela camada Win32. Por isso o destino é sempre o caminho completo
         # (mesma pasta do arquivo de origem do handle).
-        target = join(parent_of(self.path), new_name)
+        self.rename_to(join(parent_of(self.path), new_name), retries=retries)
+
+    def rename_to(self, target: str, *, retries: int = 8) -> None:
+        """Renomeia/move pelo handle para ``target`` (caminho estendido completo, mesmo
+        volume), SEM substituir destino existente. Atômico no NTFS/ReFS."""
         if not is_extended(target):
-            raise ValueError("rename_in_place exige caminho estendido")
+            raise ValueError("rename_to exige caminho estendido")
         encoded = target.encode("utf-16-le")
         base = ctypes.sizeof(_FILE_RENAME_INFO)
         total = base + len(encoded)
@@ -634,6 +647,96 @@ class Win32File:
             self.handle, FileDispositionInfo, ctypes.byref(disp), ctypes.sizeof(disp)
         ):
             raise _os_error(_last_error(), self.path)
+
+    def delete_now(self) -> None:
+        """Exclui pelo handle, ignorando o atributo somente leitura (POSIX: o nome some na
+        hora). Não passa pela Lixeira. Cai para o modo clássico em Windows antigos."""
+        ex = _FILE_DISPOSITION_INFO_EX(
+            FILE_DISPOSITION_FLAG_DELETE
+            | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
+            | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE
+        )
+        if _SetFileInformationByHandle(
+            self.handle, FileDispositionInfoEx, ctypes.byref(ex), ctypes.sizeof(ex)
+        ):
+            return
+        code = _last_error()
+        if code not in (ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, ERROR_INVALID_FUNCTION):
+            raise _os_error(code, self.path)
+        # Windows sem FileDispositionInfoEx: tira o somente leitura e usa o modo clássico
+        basic = _FILE_BASIC_INFO()
+        self._get_info(FileBasicInfo, basic)
+        if basic.FileAttributes & 0x1:
+            basic.FileAttributes &= ~0x1
+            if basic.FileAttributes == 0:
+                basic.FileAttributes = FILE_ATTRIBUTE_NORMAL
+            basic.CreationTime = basic.LastAccessTime = basic.LastWriteTime = 0
+            basic.ChangeTime = 0
+            if not _SetFileInformationByHandle(
+                self.handle, FileBasicInfo, ctypes.byref(basic), ctypes.sizeof(basic)
+            ):
+                raise _os_error(_last_error(), self.path)
+        self.mark_delete()
+
+
+def delete_checked(path: str, expected: Fingerprint | None, *, is_dir: bool = False) -> None:
+    """Apaga UM original com conferência no próprio handle (pastas protegidas, §4.1.5).
+
+    Abre sem compartilhamento (nenhum outro programa pode estar com o arquivo aberto), sem
+    seguir links; confere: não é ponto de reparse, um único vínculo, e — para arquivos — a
+    impressão digital registrada na cifragem (FileId, tamanho, LastWriteTime, ChangeTime).
+    Só então exclui pelo MESMO handle. Pastas: só vazias (o NTFS recusa as outras).
+    """
+    flags = FILE_FLAG_OPEN_REPARSE_POINT | (FILE_FLAG_BACKUP_SEMANTICS if is_dir else 0)
+    delay = 0.05
+    for attempt in range(9):
+        try:
+            f = Win32File.open(
+                path, DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE, 0, OPEN_EXISTING, flags
+            )
+            break
+        except OSError as exc:
+            code = winerror_of(exc)
+            if code in (ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION) and attempt < 8:
+                time.sleep(delay)  # indexador/antivírus segurando por instantes
+                delay = min(delay * 2, 1.0)
+                continue
+            raise classify_os_error(exc, "Não foi possível apagar o original") from exc
+    with f:
+        info = f.info()
+        if info.attributes & FILE_ATTRIBUTE_REPARSE_POINT:
+            raise UnsafePathError("é um link/ponto de reparse; não foi apagado")
+        if is_dir != info.is_directory:
+            raise SourceChangedError("o tipo do item mudou (arquivo/pasta); não foi apagado")
+        if not is_dir:
+            if info.number_of_links > 1:
+                raise UnsafePathError("o arquivo tem outro vínculo (hard link); não foi apagado")
+            if expected is None or info.fingerprint() != expected:
+                raise SourceChangedError(
+                    "o arquivo mudou depois de ser criptografado; não foi apagado"
+                )
+        try:
+            f.delete_now()
+        except OSError as exc:
+            if winerror_of(exc) == ERROR_DIR_NOT_EMPTY:
+                raise SourceChangedError("a pasta não está vazia; não foi apagada") from exc
+            raise classify_os_error(exc, "Não foi possível apagar o original") from exc
+
+
+def rename_dir(path: str, target: str) -> None:
+    """Move uma pasta pelo handle para ``target`` no mesmo volume, sem substituir."""
+    f = Win32File.open(
+        path,
+        DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+    )
+    with f:
+        info = f.info()
+        if not info.is_directory or info.attributes & FILE_ATTRIBUTE_REPARSE_POINT:
+            raise UnsafePathError("o item a mover não é uma pasta comum")
+        f.rename_to(target)
 
 
 # --- origem -----------------------------------------------------------------------------
@@ -865,6 +968,13 @@ def unbuffered_fallback_count() -> int:
 def is_plain_file_at(path: str) -> bool:
     try:
         return is_plain_file(os.lstat(path))
+    except OSError:
+        return False
+
+
+def is_plain_dir_at(path: str) -> bool:
+    try:
+        return is_plain_dir(os.lstat(path))
     except OSError:
         return False
 

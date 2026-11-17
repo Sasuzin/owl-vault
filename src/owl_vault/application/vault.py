@@ -7,7 +7,8 @@ import hashlib
 import os
 from dataclasses import dataclass, field
 
-from owl_vault.crypto.kdf import KdfPolicy, derive_kek
+from owl_vault.application.keysource import KeySource
+from owl_vault.crypto.kdf import KdfPolicy
 from owl_vault.domain.errors import (
     AuthenticationError,
     FormatError,
@@ -85,7 +86,7 @@ def hint_vault_ids(layout: VaultLayout) -> set[bytes]:
 
 def open_vault(
     vault_dir: str,
-    password: str,
+    password: str | KeySource,
     policy: KdfPolicy,
     *,
     unbuffered: bool = False,
@@ -141,7 +142,7 @@ def open_vault(
     # Caso comum: duas cópias idênticas ⇒ uma derivação.
     if len(copies) == 2 and copies[0][1] == copies[1][1]:
         name, _, hdr = copies[0]
-        kek = derive_kek(password, hdr.salt, hdr.kdf, policy, avail)
+        kek = KeySource.of(password).kek_for(hdr.salt, hdr.kdf, policy, avail)
         try:
             master = unwrap_with_kek(hdr, kek)
         except AuthenticationError as exc:
@@ -164,7 +165,7 @@ def open_vault(
         key = (hdr.salt, hdr.kdf)
         try:
             if key not in kek_cache:
-                kek_cache[key] = derive_kek(password, hdr.salt, hdr.kdf, policy, avail)
+                kek_cache[key] = KeySource.of(password).kek_for(hdr.salt, hdr.kdf, policy, avail)
             master = unwrap_with_kek(hdr, kek_cache[key])
         except AuthenticationError:
             notes.append(f"{name}: não autenticou")
