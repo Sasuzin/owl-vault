@@ -1,0 +1,74 @@
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "owl-vault"
+version = "0.1.0"
+description = "Owl Vault — cópias criptografadas e verificáveis de pastas no Windows"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Proprietary" }
+dependencies = [
+    "cryptography>=44",
+    "argon2-cffi>=23.1",
+]
+
+[project.optional-dependencies]
+gui = ["PySide6-Essentials>=6.7"]
+dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.11", "pyinstaller>=6.10"]
+
+[project.scripts]
+owl-vault = "owl_vault.cli.main:main"
+
+[project.gui-scripts]
+owl-vault-gui = "owl_vault.ui.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "slow: testes demorados (arquivos grandes sintéticos)",
+    "gui: testes que exigem PySide6",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "SIM", "RUF", "PL"]
+ignore = [
+    "PLR0913",  # muitos argumentos: aceitável em casos de uso
+    "PLR2004",  # números mágicos: limites do formato são documentados
+    "PLR0912",
+    "PLR0915",
+    "RUF001", "RUF002", "RUF003",  # textos em português com acentos
+    "PLR0911", "PLR0917",  # muitos returns/argumentos posicionais: aceitável aqui
+    "PLW0108", "SIM105", "UP042",
+    "S101",  # asserts só para invariantes de tipagem (checagens de segurança são explícitas)
+    "E501",  # o formatador cuida do código; mensagens longas em pt-BR são aceitáveis
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "PLC0415", "S108"]
+"src/owl_vault/selftest.py" = ["PLC0415"]  # imports tardios de propósito
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "src"
+packages = ["owl_vault"]
+exclude = ["tests/"]
+
+[[tool.mypy.overrides]]
+module = ["argon2.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["owl_vault.ui.*"]
+disallow_untyped_calls = false

@@ -1,0 +1,43 @@
+"""Limites do formato v1 (ver docs/FORMAT.md). Alterá-los exige nova versão do formato."""
+
+from __future__ import annotations
+
+FORMAT_VERSION = 1
+
+KIB = 1024
+MIB = 1024 * KIB
+GIB = 1024 * MIB
+TIB = 1024 * GIB
+
+# Blobs
+DEFAULT_CHUNK_SIZE = 1 * MIB
+MIN_CHUNK_SIZE = 64 * KIB
+MAX_CHUNK_SIZE = 16 * MIB
+MAX_FILE_SIZE = 1 * TIB  # 2**40
+TAG_SIZE = 16
+NONCE_SIZE = 12
+KEY_SIZE = 32
+ID_SIZE = 16
+
+# Manifesto / contêineres
+MAX_ENTRIES = 1_000_000
+MAX_DEPTH = 256
+MAX_COMPONENT_UTF16 = 255
+MAX_MANIFEST_PLAINTEXT = 256 * MIB
+MAX_JOURNAL_SEGMENT_PLAINTEXT = 64 * MIB
+MAX_COMPLETION_PLAINTEXT = 1 * MIB
+CONTAINER_HEADER_SIZE = 64
+
+# mtime_ns: de 1601-01-01 (época FILETIME) até 2**63-1
+MIN_MTIME_NS = -11_644_473_600 * 1_000_000_000
+MAX_MTIME_NS = 2**63 - 1
+
+# Caminhos
+MAX_EXTENDED_PATH_UTF16 = 32_000
+LEGACY_MAX_PATH = 259
+
+# FAT32: limite de tamanho de arquivo
+FAT32_MAX_FILE_SIZE = 0xFFFFFFFF
+
+# Senha
+MIN_PASSWORD_LENGTH = 12

@@ -1,0 +1,80 @@
+# Owl Vault — Recuperação e solução de problemas
+
+Regra de ouro: **antes de qualquer tentativa de reparo, copie a pasta do cofre inteira** para
+outro lugar. Nunca trabalhe na única cópia.
+
+## 1. A criação foi interrompida (queda de energia, cancelamento, disco cheio)
+
+* Abra o Owl Vault → **Criar cofre** → preencha a **mesma origem** e o **mesmo local/nome do
+  cofre** → digite a senha → **Retomar criação interrompida**.
+  CLI: `owl-vault create <origem> <cofre>` detecta o cofre incompleto e retoma.
+* A retomada confere cada arquivo já cifrado (existência, tamanho exato, cabeçalho) e se a
+  origem mudou; o que estiver alterado ou danificado é cifrado de novo com identificador novo.
+  Nada já verificado é sobrescrito.
+* Se a mensagem for "interrompida antes do primeiro registro de progresso", apague a pasta do
+  cofre manualmente e crie de novo (nada havia sido cifrado).
+* A pasta temporária do teste de restauração (`OwlVault-teste-<código>`) é limpa pela
+  retomada. Se você desistir do cofre, apague-a manualmente: ela pode conter arquivos
+  `.chk`/`.part` temporários **sem os nomes originais, mas com o CONTEÚDO dos arquivos em texto
+  claro**. Não há garantia de apagamento seguro.
+* Se a criação já tinha terminado e só a limpeza final foi interrompida, "Retomar" apenas
+  remove os resíduos (diário e pasta de teste) — nada é cifrado de novo.
+* A retomada exige a **mesma pasta de origem, no mesmo caminho**. Se a pasta foi movida ou
+  renomeada, devolva-a ao caminho original (o Owl Vault confere a identidade da pasta e recusa
+  uma pasta diferente que esteja nesse caminho).
+
+## 2. "Senha incorreta"
+
+* Confira Caps Lock e o layout do teclado. A senha diferencia maiúsculas/minúsculas.
+* Se a mensagem disser "cabeçalhos divergentes", uma das duas cópias do cabeçalho
+  (`vault.owl`, `vault.owl.bak`) está corrompida. O Owl Vault já tenta as duas
+  automaticamente. Se ele abrir usando a cópia de segurança, faça o reparo manual:
+  1. copie a pasta do cofre inteira para outro lugar (backup);
+  2. na pasta do cofre, substitua o arquivo danificado pela cópia boa (por exemplo, copie
+     `vault.owl.bak` sobre `vault.owl`);
+  3. rode **Verificar cofre**.
+  O Owl Vault nunca faz esse reparo sozinho.
+
+## 3. Verificar aponta problemas
+
+| Mensagem | Significado | O que fazer |
+|----------|-------------|-------------|
+| "dado criptografado ausente" | o blob do arquivo sumiu | restaure de outra cópia do cofre; os demais arquivos continuam restauráveis |
+| "falha de autenticação no bloco N" / "truncado" | o blob foi corrompido/adulterado | idem; não confie no conteúdo |
+| "usando a cópia de segurança do manifesto/cabeçalho" | uma cópia está danificada | faça o reparo manual (seção 2) após backup |
+| "manifestos divergentes" | as duas cópias do manifesto são válidas e diferentes | não use o cofre; use outra cópia |
+| "Criação NÃO concluída" | o teste de restauração nunca terminou | retome a criação (seção 1) |
+| "blob não referenciado" / "item desconhecido" | sobras ou arquivos estranhos na pasta | o cofre continua válido; investigue a origem dos itens |
+
+Uma restauração com arquivos danificados é **parcial**: o Owl Vault restaura todos os
+arquivos íntegros, lista os que falharam e nunca grava um arquivo que não passou na
+verificação.
+
+## 4. Restauração interrompida
+
+Escolha a mesma pasta de destino e confirme "continuar de onde parou". Arquivos já
+restaurados são conferidos pelo hash; nada é sobrescrito. Arquivos temporários `.part` desta
+restauração são removidos. Alternativa: restaure de novo numa pasta nova.
+
+## 5. Manifesto perdido nas duas cópias (salvamento de emergência)
+
+Sem o manifesto não há nomes nem estrutura de pastas, mas o conteúdo de cada arquivo ainda é
+recuperável com a senha:
+
+```powershell
+.\.venv\Scripts\python.exe -m owl_vault.cli.main salvage E:\Cofre-1 C:\Emergencia-1
+```
+
+Gera `recuperado-00001.bin`, `recuperado-00002.bin`, ... (cada um é o conteúdo autenticado de
+um arquivo). Identifique o tipo pelo conteúdo (abrir com o programa adequado). O salvamento
+ignora os identificadores em claro do manifesto/diário danificados e usa apenas o cabeçalho
+autenticado; blobs de outro cofre são recusados.
+
+## 6. O que NÃO tem solução
+
+* Senha esquecida.
+* Todas as cópias do cabeçalho perdidas (`vault.owl` e `vault.owl.bak`).
+* Blob de um arquivo perdido em todas as cópias do cofre.
+
+Por isso: mantenha **mais de uma cópia do cofre** em mídias diferentes e mantenha a origem
+até confirmar, em outro computador, que o cofre verifica e restaura.
