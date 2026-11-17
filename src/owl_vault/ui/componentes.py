@@ -303,6 +303,7 @@ class CartaoLateral(QFrame):
         """``[(chave, valor, ao_alterar|None), ...]`` — valores longos são cortados no meio."""
         for w in self._itens:
             self._lay.removeWidget(w)
+            w.hide()  # sem isto o item velho fica desenhado sob o novo até o deleteLater rodar
             w.deleteLater()
         self._itens = []
         for i, (chave, valor, ao_alterar) in enumerate(itens):

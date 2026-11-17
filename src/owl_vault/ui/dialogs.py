@@ -1,19 +1,21 @@
-"""Diálogos: relatório de pré-verificação com aceites obrigatórios e relatórios finais."""
+"""Aceites obrigatórios e relatórios da cópia criptografada (visual "Cofre").
+
+``CaixaAceite`` é a caixa de seleção com texto longo (quebra linha e alterna ao clicar no
+texto) usada no passo "Conferência" do assistente. ``PreflightDialog`` e ``ReportDialog``
+continuam disponíveis com o mesmo contrato, agora com os componentes do tema.
+"""
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QMouseEvent
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
-    QDialogButtonBox,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
-    QPlainTextEdit,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -21,6 +23,16 @@ from PySide6.QtWidgets import (
 
 from owl_vault.application.preflight import CreatePlan
 from owl_vault.ui import strings as S
+from owl_vault.ui.componentes import (
+    botao,
+    botao_primario,
+    lista_detalhes,
+    nota,
+    rotulo,
+    subtitulo,
+    titulo,
+    transparente,
+)
 
 
 class _ClickLabel(QLabel):
@@ -29,22 +41,46 @@ class _ClickLabel(QLabel):
     def __init__(self, text: str, box: QCheckBox) -> None:
         super().__init__(text)
         self.setWordWrap(True)
+        self.setObjectName("aceiteTexto")
         self._box = box
 
     def mousePressEvent(self, ev: QMouseEvent) -> None:
-        self._box.toggle()
+        if self._box.isEnabled():
+            self._box.toggle()
         super().mousePressEvent(ev)
 
 
-def _list_box(title: str, items: Sequence[str]) -> QGroupBox:
-    box = QGroupBox(f"{title} ({len(items)})")
-    lay = QVBoxLayout(box)
-    text = QPlainTextEdit()
-    text.setReadOnly(True)
-    text.setPlainText("\n".join(f"• {i}" for i in items))
-    text.setMinimumHeight(90)
-    lay.addWidget(text)
-    return box
+class CaixaAceite(QWidget):
+    """Aceite obrigatório: caixa de seleção + texto que quebra linha (clicável)."""
+
+    toggled = Signal(bool)
+
+    def __init__(self, texto: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("transparente")
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 2, 0, 2)
+        lay.setSpacing(10)
+        self.caixa = QCheckBox()
+        self.caixa.setAccessibleName(texto)
+        self.caixa.toggled.connect(self.toggled.emit)
+        self.texto = _ClickLabel(texto, self.caixa)
+        lay.addWidget(self.caixa, 0, Qt.AlignmentFlag.AlignTop)
+        lay.addWidget(self.texto, 1)
+
+    def isChecked(self) -> bool:
+        return self.caixa.isChecked()
+
+    def setChecked(self, value: bool) -> None:
+        self.caixa.setChecked(value)
+
+    def text(self) -> str:
+        return self.texto.text()
+
+
+def _secao(lay: QVBoxLayout, title: str, items: Sequence[str]) -> None:
+    lay.addWidget(rotulo(f"{title} ({len(items)})"))
+    lay.addWidget(lista_detalhes(items))
 
 
 class PreflightDialog(QDialog):
@@ -55,56 +91,43 @@ class PreflightDialog(QDialog):
         self.setWindowTitle(f"{S.APP_TITLE} — pré-verificação")
         self.setMinimumWidth(640)
         lay = QVBoxLayout(self)
-        summary = QLabel("\n".join(plan.summary_lines()))
-        summary.setWordWrap(True)
-        lay.addWidget(summary)
+        lay.setContentsMargins(24, 24, 24, 24)
+        lay.setSpacing(12)
+        lay.addWidget(titulo("Conferência antes de criar"))
+        lay.addWidget(nota("\n".join(plan.summary_lines())))
         if plan.blockers:
-            lay.addWidget(
-                QLabel("<b>Não é possível criar o cofre.</b> Corrija os bloqueios abaixo:")
-            )
-            lay.addWidget(_list_box("Bloqueios", plan.blockers))
+            lay.addWidget(subtitulo("Não é possível criar o cofre. Corrija os bloqueios abaixo:"))
+            _secao(lay, "Bloqueios", plan.blockers)
         if plan.warnings:
-            lay.addWidget(_list_box("Avisos", plan.warnings))
-        self._checks: list[QCheckBox] = []
+            _secao(lay, "Avisos", plan.warnings)
+        self.aceites: list[CaixaAceite] = []
         if not plan.blockers:
-            limits = QGroupBox(S.LIMITS_TITLE)
-            ll = QVBoxLayout(limits)
-            lbl = QLabel(S.LIMITS_TEXT)
-            lbl.setWordWrap(True)
-            ll.addWidget(lbl)
-            lay.addWidget(limits)
-            self._add_check(lay, "Li e entendi os limites da proteção.")
-            self._add_check(lay, S.BACKUP_TEXT)
-            self._add_check(lay, S.PASSWORD_LOSS_TEXT)
+            lay.addWidget(rotulo(S.LIMITS_TITLE))
+            lay.addWidget(nota(S.LIMITS_TEXT))
+            textos = [S.COPIA_ACEITE_LIMITES, S.BACKUP_TEXT, S.PASSWORD_LOSS_TEXT]
             if plan.needs_fat_ack:
-                self._add_check(lay, S.FAT_ACK_TEXT)
-        buttons = QDialogButtonBox()
+                textos.append(S.FAT_ACK_TEXT)
+            for t in textos:
+                caixa = CaixaAceite(t)
+                caixa.toggled.connect(self._update)
+                lay.addWidget(caixa)
+                self.aceites.append(caixa)
+        linha, ll = transparente(QHBoxLayout)
+        ll.addStretch(1)
         self._ok: QPushButton | None = None
         if not plan.blockers:
-            self._ok = buttons.addButton("Criar cofre", QDialogButtonBox.ButtonRole.AcceptRole)
-            self._ok.setObjectName("primary")
+            self._ok = botao_primario("Criar cofre")
             self._ok.setEnabled(False)
-        buttons.addButton(
-            "Fechar" if plan.blockers else "Cancelar", QDialogButtonBox.ButtonRole.RejectRole
-        )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        lay.addWidget(buttons)
-
-    def _add_check(self, lay: QVBoxLayout, text: str) -> None:
-        row = QHBoxLayout()
-        cb = QCheckBox()
-        cb.setAccessibleName(text)
-        cb.toggled.connect(self._update)
-        label = _ClickLabel(text, cb)
-        row.addWidget(cb, 0, Qt.AlignmentFlag.AlignTop)
-        row.addWidget(label, 1)
-        lay.addLayout(row)
-        self._checks.append(cb)
+            self._ok.clicked.connect(self.accept)
+            ll.addWidget(self._ok)
+        fechar = botao("Fechar" if plan.blockers else "Cancelar")
+        fechar.clicked.connect(self.reject)
+        ll.addWidget(fechar)
+        lay.addWidget(linha)
 
     def _update(self) -> None:
         if self._ok is not None:
-            self._ok.setEnabled(all(c.isChecked() for c in self._checks))
+            self._ok.setEnabled(all(c.isChecked() for c in self.aceites))
 
 
 class ReportDialog(QDialog):
@@ -119,12 +142,15 @@ class ReportDialog(QDialog):
         self.setWindowTitle(f"{S.APP_TITLE} — {title}")
         self.setMinimumWidth(620)
         lay = QVBoxLayout(self)
-        lbl = QLabel(headline)
-        lbl.setWordWrap(True)
-        lay.addWidget(lbl)
+        lay.setContentsMargins(24, 24, 24, 24)
+        lay.setSpacing(12)
+        lay.addWidget(subtitulo(headline))
         for name, items in sections:
             if items:
-                lay.addWidget(_list_box(name, items))
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
-        buttons.accepted.connect(self.accept)
-        lay.addWidget(buttons)
+                _secao(lay, name, items)
+        linha, ll = transparente(QHBoxLayout)
+        ll.addStretch(1)
+        ok = botao_primario("OK")
+        ok.clicked.connect(self.accept)
+        ll.addWidget(ok)
+        lay.addWidget(linha)

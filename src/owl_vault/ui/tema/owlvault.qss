@@ -105,7 +105,7 @@ QLabel#secaoLateral {{
 }}
 QLabel#resumoChave {{ font-size: 12px; color: {ink-muted}; }}
 QLabel#resumoValor {{
-    font-family: "{font-mono}";
+    font-family: "{font-mono}", "{font-mono-reserva}";
     font-size: 12px;
     color: {ink};
 }}
@@ -126,7 +126,7 @@ QLineEdit {{
 }}
 QLineEdit:focus {{ border: 2px solid {focus}; padding: 0 15px; }}
 QLineEdit:disabled {{ color: {ink-muted}; border-color: {border}; }}
-QLineEdit[caminho="sim"] {{ font-family: "{font-mono}"; font-size: 13px; }}
+QLineEdit[caminho="sim"] {{ font-family: "{font-mono}", "{font-mono-reserva}"; font-size: 13px; }}
 
 /* ---------- botões ---------- */
 
@@ -224,7 +224,7 @@ QPlainTextEdit#log, QTextEdit#log {{
     color: {log-ink};
     border: 1px solid {border};
     border-radius: {radius-lg};
-    font-family: "{font-mono}";
+    font-family: "{font-mono}", "{font-mono-reserva}";
     font-size: 13px;
     padding: {space-4};
 }}
@@ -326,7 +326,7 @@ QFrame#linhaPasta {{
 QFrame#linhaPasta:hover {{ border: 1px solid {border-strong}; }}
 QFrame#linhaPasta QWidget {{ background: transparent; }}
 QLabel#linhaNome {{ font-size: 15px; font-weight: 600; color: {ink}; }}
-QLabel#linhaLocal {{ font-family: "{font-mono}"; font-size: 12px; color: {ink-muted}; }}
+QLabel#linhaLocal {{ font-family: "{font-mono}", "{font-mono-reserva}"; font-size: 12px; color: {ink-muted}; }}
 QLabel#linhaEstado {{ font-size: 13px; font-weight: 600; color: {accent-text}; }}
 QLabel#linhaEstado[estado="aberta"] {{ color: {warn}; }}
 QLabel#linhaEstado[estado="atencao"] {{ color: {danger}; }}
@@ -355,7 +355,7 @@ QPlainTextEdit {{
     color: {ink};
     border: 1px solid {border};
     border-radius: {radius-md};
-    font-family: "{font-mono}";
+    font-family: "{font-mono}", "{font-mono-reserva}";
     font-size: 12px;
     padding: {space-2};
     selection-background-color: {accent};
@@ -391,3 +391,55 @@ QLabel#forcaTexto[nivel="fraca"] {{ color: {warn}; }}
 /* v2: textos dentro da dica e do aviso */
 QLabel#dicaTexto {{ font-size: 13px; color: {ink}; }}
 QLabel#avisoIcone {{ font-size: 16px; font-weight: 700; color: {notice-ink}; }}
+
+/* dialogos */
+/* "QFrame#cartao QWidget" (transparente) é mais específico que as regras de um só
+   objectName: devolve o fundo próprio do que fica DENTRO de um cartão. */
+QFrame#cartao QFrame#aviso {{ background: {notice-bg}; }}
+QFrame#cartao QFrame#dica {{ background: {accent-soft}; }}
+QFrame#cartao QProgressBar {{ background: {panel-alt}; }}
+QFrame#cartao QListWidget {{ background: {field}; }}
+QFrame#cartao QFrame#forca {{ background: {panel-alt}; }}
+QFrame#cartao QFrame#forca[ativo="sim"] {{ background: {ok}; }}
+QFrame#cartao QFrame#forca[ativo="sim"][nivel="fraca"] {{ background: {warn}; }}
+QFrame#cartao QPushButton:hover {{ background: {panel-alt}; }}
+QFrame#cartao QPushButton#discreto:hover {{ background: transparent; }}
+QFrame#cartao QPushButton#primario {{ background: {accent}; }}
+QFrame#cartao QPushButton#primario:hover {{ background: {accent-hover}; }}
+QFrame#cartao QPushButton#primario:pressed {{ background: {accent}; }}
+QFrame#cartao QPushButton#primario:disabled {{ background: {panel-alt}; }}
+/* etapa atual da tela de progresso e marcadores das listas de texto */
+QLabel#etapa {{ font-size: 14px; font-weight: 600; color: {ink}; }}
+QLabel#corpo {{ font-size: 14px; color: {ink}; }}
+QLabel#marcador {{ font-size: 14px; font-weight: 700; color: {accent-text}; }}
+
+/* copia */
+/* topo da "Cópia criptografada": a ferramenta atual fica sublinhada (como uma aba) */
+QPushButton#discreto[atual="sim"] {{
+    color: {ink};
+    border: 0;
+    border-bottom: 2px solid {accent-text};
+    border-radius: 0;
+}}
+/* resultado da operação e texto dos aceites obrigatórios (corpo 14px) */
+QLabel#resultadoTexto {{ font-size: 14px; color: {ink}; }}
+QLabel#aceiteTexto {{ font-size: 14px; color: {ink}; }}
+/* "QFrame#rodape QWidget" e "QFrame#cartaoLateral QWidget" (transparentes) são mais
+   específicos que as regras de um só objectName: devolve o fundo do botão primário e do
+   ponto de estado no rodapé, e o divisor entre as escolhas na lateral. */
+QFrame#rodape QPushButton#primario {{ background: {accent}; }}
+QFrame#rodape QPushButton#primario:hover {{ background: {accent-hover}; }}
+QFrame#rodape QPushButton#primario:pressed {{ background: {accent}; }}
+QFrame#rodape QPushButton#primario:disabled {{ background: {panel-alt}; }}
+QFrame#rodape QPushButton:hover {{ background: {panel-alt}; }}
+QFrame#rodape QPushButton#discreto:hover {{ background: transparent; }}
+QFrame#rodape QLabel#estadoPonto {{ background: {ok}; }}
+QFrame#rodape QLabel#estadoPonto[estado="erro"] {{ background: {danger}; }}
+QFrame#rodape QLabel#estadoPonto[estado="trabalhando"] {{ background: {warn}; }}
+QFrame#cartaoLateral QFrame#ligacao {{ background: {border}; }}
+
+/* integracao */
+/* "QFrame#aviso QWidget" (transparente) também apaga o hover do botão da faixa de aviso fora
+   dos cartões ('Trancar agora' na lista): devolve. As linhas da lista ficam dentro do cartão
+   e já são cobertas pelas regras "QFrame#cartao QPushButton…" do bloco dialogos. */
+QFrame#aviso QPushButton:hover {{ background: {panel-alt}; }}

@@ -45,6 +45,12 @@ Os testes usam a política de KDF de teste (8 MiB, t=1), inalcançável pela UI/
 | CLI: senha só via getpass/`--password-stdin`, aceite de limites, códigos de saída | `test_cli.py` |
 | Regressões da revisão de segurança do código (origem movida, trava com link, redundância, limpeza final, senha com BOM, salvamento, junction na retomada da restauração, ponto final em componente) | `test_security_regressions.py` |
 
+| **v2 — perfil**: PIN (validação, contador nas duas cópias, desativação), DPAPI, índice cifrado sem nomes em claro, `.bak`, troca de PIN/senha mestra, prática | `test_profile.py` |
+| **v2 — pastas protegidas**: trancar/abrir/esconder/remover, regra de ouro, versão mantida, quedas simuladas em cada estado, arquivo aberto/alterado no meio, recusas da pré-verificação, pasta movida, recuperar | `test_lockers.py` |
+| **v2 — Windows e telas**: `desktop.ini`, atributos, atalho (lido pela API), DPAPI, instalação e versão, menus por estado, bloqueio sem nomes na tela | `test_shell_ui_v2.py` |
+| **Visual Cofre**: contraste WCAG dos dois temas, QSS casado com os tokens, nenhuma cor literal fora do tema | `test_tema.py` |
+| **Diálogos e cópia criptografada (assistente de 4 passos)** | `test_dialogs_v2.py`, `test_copy_window.py` |
+
 Testes manuais (checklist, não automatizados): pasta real do OneDrive; remover pendrive
 durante a gravação; queda de energia; `subst`; ponto de montagem (admin); executável em
 máquina limpa.

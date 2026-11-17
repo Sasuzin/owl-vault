@@ -68,6 +68,8 @@ TOKENS: dict[str, str] = {
     # --- tipografia ---
     "font-ui": "Segoe UI",
     "font-mono": "Cascadia Code",
+    # reserva do font-mono: Cascadia vem no Windows 11 (e no Windows Terminal), não no 10
+    "font-mono-reserva": "Consolas",
 }
 
 #: Variante clara (mesmos papéis; valores escolhidos para o mesmo contraste mínimo).

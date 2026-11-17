@@ -25,7 +25,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from PySide6.QtCore import QCoreApplication, QEvent
+from PySide6.QtCore import SIGNAL, QCoreApplication, QEvent, Qt
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -33,10 +34,12 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMenu,
     QPushButton,
+    QScrollArea,
     QToolButton,
     QWidget,
 )
 
+from owl_vault import version_label
 from owl_vault.application import install
 from owl_vault.application import profile as profile_mod
 from owl_vault.application.lockers import (
@@ -46,22 +49,36 @@ from owl_vault.application.lockers import (
     APAGANDO,
     ICON_NAME,
     INFOTIP,
+    MANTIDO,
     TRANCADA,
     TRANCANDO,
     FolderView,
+    LockOutcome,
+    ProtectCheck,
+    UnlockOutcome,
 )
 from owl_vault.application.profile import (
     DpapiUnavailableError,
     FolderRecord,
     PinError,
+    PinUnavailableError,
+    ProfileCorruptError,
     ProfileStore,
+    VaultRef,
 )
 from owl_vault.application.protection import ProtectedPaths
+from owl_vault.application.restore import RestoreReport
 from owl_vault.crypto.kdf import TESTING_PARAMS, TESTING_POLICY
-from owl_vault.domain.errors import AuthenticationError, OwlVaultError
+from owl_vault.domain.errors import (
+    AuthenticationError,
+    CancelledError,
+    OwlVaultError,
+    PreflightError,
+    StateError,
+)
 from owl_vault.storage import dpapi, shell, winfs
 from owl_vault.ui import app as ui_app
-from owl_vault.ui import common, owl_window, pages, single_instance
+from owl_vault.ui import common, owl_window, pages, protect_flow, single_instance
 from owl_vault.ui.owl_window import IDLE_LOCK_SECONDS, OwlWindow
 from owl_vault.ui.workers import JobRunner
 
@@ -711,14 +728,11 @@ def test_fmt_size(n: int, esperado: str) -> None:
     assert common.fmt_size(n) == esperado
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: fmt_size arredonda só na exibição: 1 MiB - 1 byte vira '1024,0 KB' (deveria "
-    "subir para '1,0 MB'); o mesmo em todas as fronteiras de unidade",
-)
-@pytest.mark.parametrize("n", [1024**2 - 1, 1024**3 - 1])
-def test_fmt_size_fronteira_nao_mostra_1024(n: int) -> None:
+@pytest.mark.parametrize(("n", "esperado"), [(1024**2 - 1, "1,0 MB"), (1024**3 - 1, "1,0 GB")])
+def test_fmt_size_fronteira_nao_mostra_1024(n: int, esperado: str) -> None:
+    # Regressão: arredondava só na exibição e mostrava '1024,0 KB'.
     assert not common.fmt_size(n).startswith("1024,0")
+    assert common.fmt_size(n) == esperado
 
 
 @pytest.mark.parametrize(
@@ -896,6 +910,8 @@ TRATADORES = {
 }
 
 ROTULOS_ACAO = {"abrir": "Abrir", "trancar": "Trancar", "resolver": "Resolver…"}
+#: cor da linha (QLabel#linhaEstado[estado]) por ação/issue
+ESTADO_LINHA = {"abrir": "trancada", "trancar": "aberta", "resolver": "atencao", "": "indisponivel"}
 
 
 def _registro(state: str, *, hidden: bool = False, name: str = NOME) -> FolderRecord:
@@ -931,6 +947,10 @@ def _view(caso: tuple[str, str, bool, str, str, str, list[tuple[str, str]]]) -> 
     )
 
 
+def _por_nome(widget: QWidget, nome: str) -> list[QLabel]:
+    return [lbl for lbl in widget.findChildren(QLabel) if lbl.objectName() == nome]
+
+
 @pytest.mark.parametrize("caso", CASOS_MENU, ids=[c[0] for c in CASOS_MENU])
 def test_row_menu_por_estado(
     caso: tuple[str, str, bool, str, str, str, list[tuple[str, str]]],
@@ -949,15 +969,21 @@ def test_folder_row_botao_e_menu(
     view = _view(caso)
     chamadas: list[tuple[str, str]] = []
     row = pages.FolderRow(view, lambda fid, act: chamadas.append((fid, act)), pages.row_menu(view))
-    textos = _textos(row)
-    assert NOME in textos
-    assert "C:\\Sintetico\\Pastas" in textos  # local (pai), sem o prefixo \\?\
-    assert view.label in textos
+    assert row.objectName() == "linhaPasta"
+    assert [lbl.text() for lbl in _por_nome(row, "linhaNome")] == [NOME]
+    assert row.where.objectName() == "linhaLocal"
+    assert row.where.toolTip() == "C:\\Sintetico\\Pastas"  # local (pai), sem o prefixo \\?\
+    estado = _por_nome(row, "linhaEstado")
+    assert [e.text() for e in estado] == [view.label]
+    assert estado[0].property("estado") == ESTADO_LINHA[view.action]
     if view.action == "resolver":
-        assert "Atenção sintética" in textos
+        assert [d.text() for d in _por_nome(row, "linhaDetalhe")] == ["Atenção sintética"]
     botoes = row.findChildren(QPushButton)
     if view.action:
         assert [b.text() for b in botoes] == [ROTULOS_ACAO[view.action]]
+        # UM botão: primário para Abrir/Trancar, comum para Resolver…
+        assert (botoes[0].objectName() == "primario") == (view.action != "resolver")
+        assert botoes[0].accessibleName() == f"{ROTULOS_ACAO[view.action]} {NOME}"
         botoes[0].click()
         assert chamadas == [(view.record.id, view.action)]
     else:
@@ -969,6 +995,8 @@ def test_folder_row_botao_e_menu(
         assert mais == []
     else:
         assert len(mais) == 1
+        assert mais[0].objectName() == "mais"
+        assert mais[0].text() == "⋯"
         menu = mais[0].menu()
         assert menu is not None
         acoes = [a for a in menu.actions() if not a.isSeparator()]
@@ -983,37 +1011,89 @@ def test_folder_row_botao_e_menu(
 # =========================================================================== pages: lista (T4)
 
 
+def _caso(nome: str) -> tuple[str, str, bool, str, str, str, list[tuple[str, str]]]:
+    return next(c for c in CASOS_MENU if c[0] == nome)
+
+
 @gui
 def test_home_page_lista_vazia_faixa_e_limpeza(qapp: QApplication) -> None:
-    home = pages.HomePage(QMenu())
+    home = pages.HomePage()
     assert any("Nenhuma pasta protegida ainda" in t for t in _textos(home))
     assert home.banner.isHidden()
-    abertas = [_view(CASOS_MENU[2]), _view(CASOS_MENU[2])]
-    trancada = _view(CASOS_MENU[0])
+    assert home.banner.objectName() == "aviso"
+    assert home.rodape.primario.text() == "+ Proteger uma pasta…"
+    assert home.rodape.primario.isDefault()
+    abertas = [_view(_caso("aberta")), _view(_caso("aberta"))]
+    trancada = _view(_caso("trancada"))
     home.set_rows([abertas[0], trancada], lambda _f, _a: None)
     assert not home.banner.isHidden()
-    assert home.banner_text.text() == "1 pasta está aberta e visível neste computador."
+    assert home.banner_text == "1 pasta está aberta e visível neste computador."
     assert len(home.findChildren(pages.FolderRow)) == 2
     home.set_rows([*abertas, trancada], lambda _f, _a: None)
     _descarta()
-    assert home.banner_text.text() == "2 pastas estão abertas e visíveis neste computador."
+    assert home.banner_text == "2 pastas estão abertas e visíveis neste computador."
     assert len(home.findChildren(pages.FolderRow)) == 3
+    assert not home.lock_all.isHidden()
     sinal: list[bool] = []
     home.lock_all_clicked.connect(lambda: sinal.append(True))
     trancar_agora = [
         b for b in home.banner.findChildren(QPushButton) if b.text() == "Trancar agora"
     ]
-    assert len(trancar_agora) == 1
+    assert trancar_agora == [home.lock_all]
     trancar_agora[0].click()
     assert sinal == [True]
+    protegido: list[bool] = []
+    home.protect_clicked.connect(lambda: protegido.append(True))
+    home.rodape.primario.click()
+    assert protegido == [True]
     home.set_notice(f"'{NOME}' está trancada.")
     assert not home.notice.isHidden()
     home.clear()
     _descarta()
     assert home.banner.isHidden()
     assert home.notice.isHidden()
+    assert home.notice.text() == ""  # nem escondido o nome fica num rótulo
     assert home.findChildren(pages.FolderRow) == []
-    assert not [t for t in _textos(home, so_visiveis=True) if NOME in t]
+    assert not [t for t in _textos(home) if NOME in t]
+    home.deleteLater()
+    _descarta()
+
+
+@gui
+def test_home_page_faixa_conta_pastas_com_copias_legiveis(qapp: QApplication) -> None:
+    """Abrindo/apagando/abertura incompleta também deixam arquivos legíveis (T11)."""
+    home = pages.HomePage()
+    atencao = [_view(_caso(n)) for n in ("apagando", "abrindo", "abertura_incompleta")]
+    home.set_rows(atencao, lambda _f, _a: None)
+    assert home.banner_text.startswith("3 pastas estão abertas e visíveis")
+    assert "Resolver" in home.banner_text
+    assert home.lock_all.isHidden()  # nenhuma ABERTA: "Trancar agora" não faria nada
+    home.set_rows([_view(_caso("trancando"))], lambda _f, _a: None)
+    assert home.banner.isHidden()
+    home.deleteLater()
+    _descarta()
+
+
+@gui
+def test_home_page_resumo_e_dica(qapp: QApplication) -> None:
+    home = pages.HomePage()
+    assert home.counts == {"trancadas": 0, "abertas": 0, "escondidas": 0, "atencao": 0}
+    assert "Proteger uma pasta" in home.dica._texto.text()
+    views = [
+        _view(_caso("trancada")),
+        _view(_caso("trancada")),
+        _view(_caso("escondida")),
+        _view(_caso("aberta")),
+        _view(_caso("itens_extras")),
+    ]
+    home.set_rows(views, lambda _f, _a: None)
+    assert home.counts == {"trancadas": 2, "abertas": 1, "escondidas": 1, "atencao": 1}
+    textos = _textos(home.resumo)
+    for chave in ("Trancadas", "Abertas", "Escondidas", "Precisam de atenção"):
+        assert chave in textos
+    assert home.resumo.objectName() == "cartaoLateral"
+    assert home.dica._titulo.text() == "Precisa de atenção"
+    assert not [t for t in _textos(home.resumo) if NOME in t]  # o resumo só tem contagens
     home.deleteLater()
     _descarta()
 
@@ -1026,12 +1106,18 @@ def test_assistente_valida_senha_mestra_e_pin(qapp: QApplication) -> None:
     page = pages.SetupPage()
     recebidos: list[tuple[str, str, bool]] = []
     page.finished.connect(lambda sm, pin, rec: recebidos.append((sm, pin, rec)))
+    assert page.trilha.atual == 0
+    assert page.rodape.primario.text() == "Continuar para o PIN"
+    assert page.rodape.voltar.isHidden()
+    assert pages._AVISO_SM in page.aviso.texto()  # o aviso da senha mestra nunca some
+    assert "ninguém consegue recuperar os arquivos" in pages._AVISO_SM
     page.sm1.setText("curta")
     page.sm2.setText("curta")
     page._next()
     assert page.stack.currentIndex() == 0
     assert "pelo menos" in page.err1.text()
     page.sm1.setText(SENHA_MESTRA)
+    assert page.forca.accessibleDescription().startswith("Força da senha: ")
     page.sm2.setText(SENHA_MESTRA + "x")
     page._next()
     assert page.err1.text() == "As duas senhas não são iguais."
@@ -1041,6 +1127,9 @@ def test_assistente_valida_senha_mestra_e_pin(qapp: QApplication) -> None:
     page.noted.setChecked(True)
     page._next()
     assert page.stack.currentIndex() == 1
+    assert page.trilha.atual == 1
+    assert page.rodape.primario.text() == "Concluir"
+    assert not page.rodape.voltar.isHidden()
     assert page.err1.isHidden()
     for ruim, trecho in (
         ("12345", "6 a 12"),
@@ -1058,8 +1147,13 @@ def test_assistente_valida_senha_mestra_e_pin(qapp: QApplication) -> None:
     page._finish()
     assert page.err2.text() == "Os dois PINs não são iguais."
     assert recebidos == []
+    page.rodape.voltar.click()  # Voltar não perde o que foi digitado
+    assert page.stack.currentIndex() == 0
+    assert page.sm1.text() == SENHA_MESTRA
+    page.rodape.primario.click()
+    assert page.stack.currentIndex() == 1
     page.pin2.setText(PIN)
-    page._finish()
+    page.rodape.primario.click()
     assert recebidos == [(SENHA_MESTRA, PIN, False)]
     for campo in (page.sm1, page.sm2, page.pin1, page.pin2):
         assert campo.text() == ""  # apagados depois de emitir
@@ -1068,11 +1162,38 @@ def test_assistente_valida_senha_mestra_e_pin(qapp: QApplication) -> None:
 
 
 @gui
+def test_assistente_enter_aciona_o_botao_primario(qapp: QApplication) -> None:
+    page = pages.SetupPage()
+    assert page.rodape.primario.isDefault()
+    page.sm1.setText(SENHA_MESTRA)
+    page.sm2.setText(SENHA_MESTRA)
+    page.noted.setChecked(True)
+    QTest.keyClick(page.sm2, Qt.Key.Key_Return)
+    assert page.stack.currentIndex() == 1
+    page.set_busy(True, "Preparando…")
+    assert not page.rodape.primario.isEnabled()
+    QTest.keyClick(page.pin2, Qt.Key.Key_Return)  # ocupado: Enter não faz nada
+    assert page.err2.isHidden()
+    page.set_busy(False)
+    page.deleteLater()
+    _descarta()
+
+
+@gui
 def test_assistente_recuperar_marca_pedido(qapp: QApplication) -> None:
     page = pages.SetupPage()
-    page._recover_hint()
+    assert not page.recover_link.isHidden()
+    page.recover_link.click()
     assert page.wants_recover
-    assert "MESMA senha mestra" in page.err1.text()
+    assert "MESMA senha mestra" in page.recover_note.text()
+    assert not page.recover_note.isHidden()
+    assert page.recover_link.isHidden()
+    page.start()  # recomeçar zera o pedido
+    assert not page.wants_recover
+    assert page.recover_note.isHidden()
+    page.start(recuperar=True)  # vindo de "perfil danificado"
+    assert page.wants_recover
+    assert not page.recover_note.isHidden()
     page.deleteLater()
     _descarta()
 
@@ -1086,6 +1207,8 @@ def test_unlock_page_pin_envio_e_troca(qapp: QApplication) -> None:
     enviados: list[tuple[str, bool]] = []
     page.submitted.connect(lambda s, m: enviados.append((s, m)))
     page.configure(master=False)
+    assert page.go is page.rodape.primario
+    assert page.go.text() == "Entrar"
     assert page.edit.placeholderText() == "PIN"
     assert page.edit.maxLength() == 12
     assert page.edit.echoMode() == QLineEdit.EchoMode.Password
@@ -1093,11 +1216,11 @@ def test_unlock_page_pin_envio_e_troca(qapp: QApplication) -> None:
     assert page.err.text() == "Digite o PIN."
     assert enviados == []
     page.edit.setText(PIN)
-    page._submit()
+    QTest.keyClick(page.edit, Qt.Key.Key_Return)  # Enter no campo = Entrar
     assert enviados == [(PIN, False)]
     assert page.edit.text() == ""
     assert not page.go.isEnabled()
-    assert page.go.text() == "Abrindo…"
+    assert page.go.text() == "Entrando…"
     page.fail("PIN incorreto.")
     assert page.go.isEnabled()
     assert page.err.text() == "PIN incorreto."
@@ -1110,6 +1233,26 @@ def test_unlock_page_pin_envio_e_troca(qapp: QApplication) -> None:
     page._forgot()
     assert page.master
     assert "Alterar PIN" in page.text.text()
+    page.configure(master=False, title="Abrir pasta protegida", button="Abrir")
+    assert page.go.text() == "Abrir"
+    page.set_busy(True)
+    assert page.go.text() == "Abrindo…"
+    page.deleteLater()
+    _descarta()
+
+
+@gui
+def test_unlock_page_ocupada_desativa_os_links(qapp: QApplication) -> None:
+    """Com o desbloqueio rodando, nada na tela pode disparar outro pedido (achado: 2º Enter)."""
+    page = pages.UnlockPage()
+    page.configure(master=False)
+    page.set_busy(True)
+    for w in (page.go, page.edit, page.switch, page.forgot, page.new_master, page.once):
+        assert not w.isEnabled()
+    assert page.rodape.ponto.property("estado") == "trabalhando"
+    page.set_busy(False)
+    for w in (page.go, page.edit, page.switch, page.forgot, page.new_master, page.once):
+        assert w.isEnabled()
     page.deleteLater()
     _descarta()
 
@@ -1132,6 +1275,272 @@ def test_unlock_page_pratica_tres_erros_oferece_nova_senha(qapp: QApplication) -
     _descarta()
 
 
+# =========================================================================== proteger (T5, assistente)
+
+
+def _check(nome: str = NOME, files: int = 1234, total: int = 40 * 1024**3) -> ProtectCheck:
+    return ProtectCheck(
+        "\\\\?\\C:\\Sintetico\\Pastas\\" + nome,
+        nome,
+        files,
+        total,
+        None,  # type: ignore[arg-type]  # o plano não é usado pela tela
+    )
+
+
+@pytest.fixture
+def proteger(qapp: QApplication) -> Iterator[protect_flow.ProtectPage]:
+    runner = JobRunner()
+    page = protect_flow.ProtectPage(runner)
+    yield page
+    page.deleteLater()
+    runner.deleteLater()
+    _descarta()
+
+
+def _estados(page: protect_flow.ProtectPage) -> dict[str, str]:
+    return {k: str(linha.icone.property("estado")) for k, linha in page.linhas.items()}
+
+
+@gui
+def test_proteger_passo_pasta_exige_escolha(proteger: protect_flow.ProtectPage) -> None:
+    page = proteger
+    page.start(first_time=True)
+    assert page.step == 0
+    assert page.trilha.atual == 0
+    assert [t for t in _textos(page.trilha)] == ["1", "Pasta", "2", "Conferência", "3", "Trancar"]
+    assert not page.rodape.primario.isEnabled()
+    assert page.rodape.primario.text() == "Continuar para a conferência"
+    voltou: list[bool] = []
+    page.back_to_list.connect(lambda: voltou.append(True))
+    page.rodape.voltar.click()
+    assert voltou == [True]
+    pedidos: list[str] = []
+    page.check_requested.connect(pedidos.append)
+    page.set_path("C:\\Sintetico\\Pastas\\" + NOME)
+    assert page.campo.texto() == "C:\\Sintetico\\Pastas\\" + NOME
+    assert page.rodape.primario.isEnabled()
+    page.rodape.primario.click()
+    assert pedidos == ["C:\\Sintetico\\Pastas\\" + NOME]
+
+
+@gui
+def test_proteger_conferencia_sem_falhas_e_entendi(proteger: protect_flow.ProtectPage) -> None:
+    page = proteger
+    page.start(first_time=True)
+    page.set_path("C:\\Sintetico\\Pastas\\" + NOME)
+    page.checking()
+    assert page.step == 1
+    assert page.trilha.atual == 1
+    assert set(_estados(page).values()) == {""}  # ainda não rodaram
+    assert not page.rodape.primario.isEnabled()
+    assert page.rodape.voltar.text() == "Cancelar"
+    page.show_check(_check())
+    assert set(_estados(page).values()) == {"ok"}
+    assert page.linhas["arquivos"].detalhe.text().startswith("1.234 arquivo(s) · 40,0 GB")
+    assert "pode levar" in page.linhas["arquivos"].detalhe.text()
+    assert [linha.titulo.text() for linha in page.linhas.values()] == [
+        "Pasta permitida",
+        "Arquivos",
+        "Espaço em disco",
+        "Arquivos em uso",
+        "Permissão para apagar",
+    ]
+    # todos os pontos da confirmação T5d continuam na tela
+    aviso = page.aviso2.texto()
+    for trecho in (
+        "não vão para a Lixeira",
+        "atalho dentro da pasta",
+        "BitLocker",
+        "data de criação, atributos e permissões não voltam",
+        "dobro do espaço",
+    ):
+        assert trecho in aviso
+    assert page.t2.text() == f"Proteger '{NOME}'?"
+    # 1ª proteção: "Entendi" é obrigatória
+    assert not page.entendi.isHidden()
+    assert not page.rodape.primario.isEnabled()
+    assert "Entendi" in page.rodape.texto.text()
+    pedidos: list[bool] = []
+    page.lock_requested.connect(lambda: pedidos.append(True))
+    page._primario()
+    assert pedidos == []
+    page.entendi.setChecked(True)
+    assert page.rodape.primario.isEnabled()
+    assert page.rodape.primario.text() == "Trancar agora"
+    page.rodape.primario.click()
+    assert pedidos == [True]
+    # nas próximas proteções a caixa não aparece
+    page.start(first_time=False)
+    page.set_path("C:\\x")
+    page.show_check(_check())
+    assert page.entendi.isHidden()
+    assert page.rodape.primario.isEnabled()
+
+
+#: com bloqueio, só "passou" o que certamente rodou inteiro (nunca um ✓ sem conferência)
+CASOS_BLOQUEIO = [
+    (
+        "em_uso",
+        ["Relatório.docx: arquivo em uso por outro programa. Feche-o e tente novamente."],
+        {"permitida": "ok", "arquivos": "", "espaco": "ok", "em_uso": "falhou", "permissao": ""},
+    ),
+    (
+        "espaco",
+        ["Espaço insuficiente para o cofre: necessário ~900 MiB, livre 10 MiB."],
+        {"permitida": "ok", "arquivos": "", "espaco": "falhou", "em_uso": "", "permissao": ""},
+    ),
+    (
+        "permissao",
+        [
+            "O Windows não deixou o Owl Vault apagar arquivos aqui ('a.txt'). Em Segurança do "
+            "Windows > Proteção contra ransomware > Permitir um aplicativo, adicione o Owl Vault."
+        ],
+        {"permitida": "ok", "arquivos": "", "espaco": "ok", "em_uso": "", "permissao": "falhou"},
+    ),
+    (
+        "pasta",
+        ["Não dá para proteger a pasta Documentos inteira. Crie uma pasta dentro dela."],
+        {"permitida": "falhou", "arquivos": "", "espaco": "", "em_uso": "", "permissao": ""},
+    ),
+    (
+        "varios",
+        [
+            "Esta unidade usa exFAT. O Owl Vault só tranca pastas em unidades NTFS.",
+            "a.txt: arquivo em uso por outro programa.",
+            "b.txt: arquivo em uso por outro programa.",
+        ],
+        {"permitida": "falhou", "arquivos": "", "espaco": "", "em_uso": "falhou", "permissao": ""},
+    ),
+]
+
+
+@gui
+@pytest.mark.parametrize(
+    ("_id", "bloqueios", "esperado"), CASOS_BLOQUEIO, ids=[c[0] for c in CASOS_BLOQUEIO]
+)
+def test_proteger_conferencia_classifica_cada_bloqueio(
+    proteger: protect_flow.ProtectPage, _id: str, bloqueios: list[str], esperado: dict[str, str]
+) -> None:
+    page = proteger
+    page.start(first_time=False)
+    page.set_path("C:\\Sintetico\\Pastas\\" + NOME)
+    page.checking()
+    page.show_blockers(bloqueios)
+    assert _estados(page) == esperado
+    for key, motivos in page.failures.items():
+        detalhe = page.linhas[key].detalhe.text()
+        assert detalhe.startswith(motivos[0])  # o motivo, não um texto genérico
+        if len(motivos) > 1:
+            assert detalhe.endswith(f"(e mais {len(motivos) - 1})")
+    assert not page.rodape.primario.isEnabled()  # com falha, não tranca
+    assert not page.again.isHidden()  # "Conferir de novo"
+    assert page.rodape.ponto.property("estado") == "erro"
+    assert page.show_details.isHidden() == (len(bloqueios) == 1)
+    pedidos: list[str] = []
+    page.check_requested.connect(pedidos.append)
+    page.again.click()
+    assert pedidos == ["C:\\Sintetico\\Pastas\\" + NOME]
+
+
+def test_proteger_classificar_bloqueios() -> None:
+    c = protect_flow.classificar
+    assert c("x.txt: arquivo em uso por outro programa.") == "em_uso"
+    assert c("Falta espaço no disco D:. Libere cerca de 12 GB.") == "espaco"
+    assert c("Cofre: não foi possível consultar o espaço livre (x).") == "espaco"
+    assert c("O Windows não deixou o Owl Vault apagar arquivos aqui.") == "permissao"
+    assert c("Em Segurança do Windows > Proteção contra ransomware") == "permissao"
+    assert c("Esta pasta está no OneDrive.") == "permitida"
+    assert c("Origem: a pasta não existe.") == "permitida"
+
+
+@gui
+def test_proteger_trancando_mostra_etapas_sem_nomes_de_arquivos(
+    proteger: protect_flow.ProtectPage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    page = proteger
+    cancelados: list[bool] = []
+    monkeypatch.setattr(page._runner, "cancel", lambda: cancelados.append(True))
+    page.start(first_time=False)
+    page.set_path("C:\\Sintetico\\Pastas\\" + NOME)
+    page.show_check(_check())
+    page.locking()
+    assert page.step == 2
+    assert page.trilha.atual == 2
+    assert page.t3.text() == f"Trancando '{NOME}'"
+    assert page.aviso3.texto() == "Não use esta pasta até terminar."
+    assert page.log.objectName() == "log"
+    assert page.rodape.primario.isHidden()
+    assert page.rodape.voltar.text() == "Cancelar"
+    b = page._runner.bridge
+    b.stage.emit("Criptografando", 1000, 10)
+    assert page.etapa.text() == "1/4 Guardando os arquivos (0 de 10)"
+    b.advance.emit(500, 5)
+    assert page.etapa.text() == "1/4 Guardando os arquivos (5 de 10)"
+    assert page.bar3.value() == 500
+    b.info.emit("Segredo do Projeto.docx")  # nomes de arquivos nunca vão para o registro
+    b.warning.emit("Segredo do Projeto.docx: aviso")
+    b.stage.emit("Verificando o cofre (derivando chave — não cancelável)", 0, 0)
+    b.stage.emit("Teste de restauração", 0, 10)
+    b.stage.emit("Apagando as cópias legíveis", 0, 10)
+    assert page.etapa.text() == "4/4 Apagando as cópias legíveis"
+    assert page.rodape.voltar.text() == "Parar depois do arquivo atual"
+    registro = page.log.toPlainText()
+    for etapa in ("1/4", "2/4", "3/4", "4/4"):
+        assert etapa in registro
+    assert "Segredo" not in registro
+    page.rodape.voltar.click()
+    assert cancelados == [True]
+    assert not page.rodape.voltar.isEnabled()
+    b.stage.emit("Apagando as cópias legíveis", 0, 10)  # nova etapa não reativa o botão
+    assert not page.rodape.voltar.isEnabled()
+    rec = _registro(TRANCADA)
+    page.finish(LockOutcome(rec, True, removable=True))
+    assert page.t3.text() == f"'{NOME}' está trancada."
+    assert "Remover hardware com segurança" in page.s3.text()
+    assert page.rodape.primario.text() == "Voltar para a lista"
+    assert not page.another.isHidden()
+    assert page.rodape.voltar.isHidden()
+    texto = page.etapa.text()
+    b.stage.emit("Restaurando", 0, 0)  # desconectado depois do fim
+    assert page.etapa.text() == texto
+    voltou: list[bool] = []
+    page.back_to_list.connect(lambda: voltou.append(True))
+    page.rodape.primario.click()
+    assert voltou == [True]
+    page.another.click()  # "Proteger outra pasta": volta ao passo 1, limpo
+    assert page.step == 0
+    assert page.campo.texto() == ""
+
+
+@gui
+def test_proteger_falha_e_limpeza(proteger: protect_flow.ProtectPage) -> None:
+    page = proteger
+    page.start(first_time=False)
+    page.set_path("C:\\Sintetico\\Pastas\\" + NOME)
+    page.show_check(_check())
+    page.locking()
+    page.fail(CancelledError("cancelado"))
+    assert page.t3.text() == "O trancamento foi cancelado"
+    assert "Nada foi apagado" in page.s3.text()
+    page.locking()  # cancelado na etapa 4: os arquivos já estão guardados, não "nada mudou"
+    page._runner.bridge.stage.emit("Apagando as cópias legíveis", 0, 3)
+    page.fail(CancelledError("cancelado"))
+    assert "Nada foi apagado" not in page.s3.text()
+    assert "Resolver" in page.s3.text()
+    page.locking()
+    page.fail(PreflightError("Não é possível proteger esta pasta.", ["a.txt: em uso"]))
+    assert page.t3.text() == f"Não foi possível trancar '{NOME}'"
+    assert page.s3.text().startswith("a.txt: em uso")
+    assert page.rodape.ponto.property("estado") == "erro"
+    page.clear()  # ao bloquear: nenhum nome nem caminho fica nos rótulos
+    _descarta()
+    assert not [t for t in _textos(page) if NOME in t]
+    assert NOME not in page.rodape.texto.text()
+    assert page.campo.texto() == ""
+    assert page.log.toPlainText() == ""
+
+
 # =========================================================================== OwlWindow
 
 
@@ -1140,25 +1549,43 @@ class Tela:
     win: OwlWindow
     dialogos: list[tuple[str, str]]
     perfil: Path
+    respostas: dict[str, Any]
+    perguntas: list[dict[str, Any]]
 
     @property
     def store(self) -> ProfileStore:
         return self.win.store
+
+    def pergunta(self, titulo: str) -> dict[str, Any]:
+        achadas = [p for p in self.perguntas if p["title"] == titulo]
+        assert achadas, (titulo, [p["title"] for p in self.perguntas])
+        return achadas[-1]
 
 
 @pytest.fixture
 def abrir_tela(
     qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> Iterator[Callable[..., Tela]]:
-    """Fábrica de janelas com perfil em tmp_path e diálogos substituídos por gravadores."""
-    dialogos: list[tuple[str, str]] = []
+    """Fábrica de janelas com perfil em tmp_path e diálogos substituídos por gravadores.
 
-    def ask(_p: object, title: str, *_a: object, **_k: object) -> str:
+    ``respostas`` (prefixo do título → resposta ou função) escolhe o botão de ``ask``; sem
+    resposta, é "cancel".
+    """
+    dialogos: list[tuple[str, str]] = []
+    perguntas: list[dict[str, Any]] = []
+    respostas: dict[str, Any] = {}
+
+    def ask(_p: object, title: str, text: str = "", buttons: Any = (), **kw: object) -> str:
         dialogos.append(("ask", title))
+        perguntas.append({"title": title, "text": text, "buttons": [k for _l, k in buttons], **kw})
+        for prefixo, resposta in respostas.items():
+            if title.startswith(prefixo):
+                return str(resposta() if callable(resposta) else resposta)
         return "cancel"
 
-    def inform(_p: object, title: str, *_a: object, **_k: object) -> None:
+    def inform(_p: object, title: str, text: str = "", *_a: object, **_k: object) -> None:
         dialogos.append(("inform", title))
+        perguntas.append({"title": title, "text": text, "buttons": ["ok"]})
 
     def choose_folder(_p: object, title: str, *_a: object, **_k: object) -> None:
         dialogos.append(("choose_folder", title))
@@ -1171,6 +1598,7 @@ def abrir_tela(
     monkeypatch.setattr(owl_window, "choose_folder", choose_folder)
     monkeypatch.setattr(owl_window, "limits_dialog", limits)
     monkeypatch.setattr(owl_window, "saved_theme", lambda: "dark")  # não lê o registro real
+    monkeypatch.setattr(owl_window, "open_in_explorer", lambda p: dialogos.append(("explorer", p)))
     real_manager = owl_window.LockerManager
 
     def gerente(session: Any, **kw: Any) -> Any:
@@ -1186,12 +1614,15 @@ def abrir_tela(
         win = OwlWindow(
             LAUNCHER, open_request=open_request, policy=TESTING_POLICY, profile_dir=perfil
         )
+        for nome in ("showNormal", "raise_", "activateWindow"):  # nada de janela real
+            monkeypatch.setattr(win, nome, lambda: None)
         janelas.append(win)
-        return Tela(win, dialogos, perfil)
+        return Tela(win, dialogos, perfil, respostas, perguntas)
 
     yield abrir
     for win in janelas:
         _espera(lambda w=win: not w.runner.busy)
+        _descarta()
         win._quitting = True
         win.close()
         win.deleteLater()
@@ -1203,8 +1634,8 @@ def _criar_perfil(tela: Tela) -> profile_mod.ProfileSession:
     return tela.store.create(SENHA_MESTRA, PIN, params=TESTING_PARAMS)
 
 
-def _pasta_aberta(base: Path, nome: str = NOME) -> FolderRecord:
-    """Pasta real (sintética) em tmp_path registrada como 'aberta'."""
+def _pasta_aberta(base: Path, nome: str = NOME, state: str = ABERTA) -> FolderRecord:
+    """Pasta real (sintética) em tmp_path registrada como 'aberta' (ou ``state``)."""
     pasta = base / "pastas" / nome
     pasta.mkdir(parents=True)
     (pasta / "nota.txt").write_bytes(b"dados sinteticos")
@@ -1216,7 +1647,7 @@ def _pasta_aberta(base: Path, nome: str = NOME) -> FolderRecord:
         path=winfs.to_extended(str(pasta)),
         volume=res.volume,
         file_id=res.identity.file_id.hex(),
-        state=ABERTA,
+        state=state,
     )
 
 
@@ -1234,16 +1665,82 @@ def _vencer_pratica(store: ProfileStore) -> None:
     store.write_both(obj)
 
 
+def _menu_principal(win: OwlWindow) -> QMenu:
+    menus = [
+        m for m in win.findChildren(QMenu) if any(a.text() == "Bloquear agora" for a in m.actions())
+    ]
+    assert len(menus) == 1
+    return menus[0]
+
+
 @gui
 def test_janela_sem_perfil_abre_no_assistente(abrir_tela: Callable[..., Tela]) -> None:
     tela = abrir_tela()
     win = tela.win
     assert win.store.dir == tela.perfil
     assert win.pages.currentWidget() is win.setup_page
+    assert win.rodapes.currentWidget() is win.setup_page.rodape
     assert win.setup_page.stack.currentIndex() == 0
     assert not tela.perfil.exists()  # abrir a janela não grava nada
     assert win.session is None
     assert win.mgr is None
+
+
+@gui
+def test_estrutura_da_janela_no_visual_cofre(abrir_tela: Callable[..., Tela]) -> None:
+    win = abrir_tela().win
+    central = win.centralWidget()
+    lay = central.layout()
+    assert lay is not None
+    m = lay.contentsMargins()
+    assert (m.left(), m.top(), m.right(), m.bottom()) == (0, 0, 0, 0)
+    conteudo = lay.itemAt(0).widget()
+    cl = conteudo.layout()
+    m = cl.contentsMargins()
+    assert (m.left(), m.top(), m.right(), m.bottom()) == (32, 20, 32, 24)
+    assert lay.itemAt(1).widget() is win.rodapes  # rodapé na largura toda, embaixo
+    assert win.menu_button.objectName() == "mais"
+    assert win.menu_button.text() == "☰"
+    assert win.menu_button.menu() is _menu_principal(win)
+    assert [w for w in win.findChildren(QLabel) if w.objectName() == "marcaRoxo"]
+    for page in win._all_pages:
+        assert page.rodape.objectName() == "rodape"
+        assert page.rodape.primario.objectName() == "primario"
+        assert page.rodape.primario.isDefault()
+    assert version_label() in win.windowTitle()
+
+
+def _cadeia_de_foco(win: QWidget) -> list[QWidget]:
+    out: list[QWidget] = []
+    w = win.nextInFocusChain()
+    while w is not win and len(out) < 10_000:
+        out.append(w)
+        w = w.nextInFocusChain()
+    return out
+
+
+@gui
+def test_tab_segue_a_ordem_de_leitura(abrir_tela: Callable[..., Tela]) -> None:
+    """Tab: ☰ → campos do cartão (na ordem em que aparecem) → rodapé (Voltar, primário)."""
+    tela = abrir_tela()
+    win = tela.win
+    cadeia = _cadeia_de_foco(win)
+    s = win.setup_page
+    ordem = [win.menu_button, s.sm1, s.sm1.mostrar, s.sm2, s.noted, s.rodape.voltar]
+    ordem += [s.rodape.primario, s.recover_link]
+    assert [cadeia.index(w) for w in ordem] == sorted(cadeia.index(w) for w in ordem)
+    u = win.unlock_page
+    ordem = [u.edit, u.switch, u.forgot, u.go]
+    assert [cadeia.index(w) for w in ordem] == sorted(cadeia.index(w) for w in ordem)
+    p = win.protect_page
+    ordem = [p.campo.campo, p.campo.botao, p.rodape.voltar, p.rodape.primario]
+    assert [cadeia.index(w) for w in ordem] == sorted(cadeia.index(w) for w in ordem)
+    # as áreas de rolagem não roubam um Tab
+    assert not [
+        w
+        for w in cadeia
+        if isinstance(w, QScrollArea) and w.focusPolicy() != Qt.FocusPolicy.NoFocus
+    ]
 
 
 @gui
@@ -1255,6 +1752,7 @@ def test_apos_criar_perfil_desbloqueio_pede_pin(abrir_tela: Callable[..., Tela])
     win._show_unlock()
     page = win.unlock_page
     assert win.pages.currentWidget() is page
+    assert win.rodapes.currentWidget() is page.rodape
     assert not page.master
     assert page.title.text() == "Digite seu PIN"
     assert page.edit.placeholderText() == "PIN"
@@ -1278,6 +1776,7 @@ def test_desbloqueado_mostra_lista_vazia(abrir_tela: Callable[..., Tela]) -> Non
     sessao = _criar_perfil(tela)
     win._unlocked(sessao)
     assert win.pages.currentWidget() is win.home
+    assert win.rodapes.currentWidget() is win.home.rodape
     assert win.session is sessao
     assert win.mgr is not None
     assert win.mgr.folders == []
@@ -1285,6 +1784,7 @@ def test_desbloqueado_mostra_lista_vazia(abrir_tela: Callable[..., Tela]) -> Non
     assert any("Nenhuma pasta protegida ainda" in t for t in _textos(win.home))
     assert win.home.banner.isHidden()
     assert win.home.notice.isHidden()
+    assert version_label() in win.home.rodape.texto.text()  # estado padrão com a versão
     _descarta()  # roda _after_unlock (nada pendente)
     assert tela.dialogos == []
 
@@ -1311,7 +1811,8 @@ def test_lista_mostra_pasta_aberta_e_trancada(
     assert "Fotos Trancadas" in textos
     assert "Aberta — visível neste computador" in textos
     assert "Trancada" in textos
-    assert win.home.banner_text.text() == "1 pasta está aberta e visível neste computador."
+    assert win.home.banner_text == "1 pasta está aberta e visível neste computador."
+    assert win.home.counts == {"trancadas": 1, "abertas": 1, "escondidas": 0, "atencao": 0}
     botoes = sorted(
         b.text() for b in win.home.findChildren(QPushButton) if b.text() in ("Abrir", "Trancar")
     )
@@ -1331,11 +1832,7 @@ def test_bloquear_agora_limpa_lista_e_volta_ao_pin(
     win.home.set_notice(f"'{NOME}' está aberta. Tranque de novo quando terminar.")
     assert [t for t in _textos(win, so_visiveis=True) if NOME in t]
     # ☰ > Bloquear agora
-    menus = [
-        m for m in win.findChildren(QMenu) if any(a.text() == "Bloquear agora" for a in m.actions())
-    ]
-    assert len(menus) == 1
-    bloquear = next(a for a in menus[0].actions() if a.text() == "Bloquear agora")
+    bloquear = next(a for a in _menu_principal(win).actions() if a.text() == "Bloquear agora")
     bloquear.trigger()
     _descarta()
     assert win.pages.currentWidget() is win.unlock_page
@@ -1352,11 +1849,6 @@ def test_bloquear_agora_limpa_lista_e_volta_ao_pin(
 
 
 @gui
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: HomePage.clear() (Bloquear agora) só esconde o aviso; o texto com o nome da "
-    "pasta continua num QLabel oculto da janela travada",
-)
 def test_bloquear_agora_nao_deixa_nome_em_rotulo_oculto(
     abrir_tela: Callable[..., Tela], tmp_path: Path
 ) -> None:
@@ -1367,18 +1859,20 @@ def test_bloquear_agora_nao_deixa_nome_em_rotulo_oculto(
     sessao.index.folders.append(_pasta_aberta(tmp_path))
     win._refresh()
     win.home.set_notice(f"'{NOME}' está trancada.")  # como em _lock_done
+    win._protect()  # assistente com a pasta escolhida também não pode guardar o nome
+    win.protect_page.set_path(winfs.strip_extended(sessao.index.folders[0].path))
     win.lock_now()
     _descarta()
     assert not [t for t in _textos(win) if NOME in t]
+    assert not [w for w in win.findChildren(QLineEdit) if NOME in w.text()]
 
 
 @gui
 def test_menu_principal_tem_itens_da_especificacao(abrir_tela: Callable[..., Tela]) -> None:
-    win = abrir_tela().win
-    menus = [
-        m for m in win.findChildren(QMenu) if any(a.text() == "Bloquear agora" for a in m.actions())
-    ]
-    textos = [a.text() for a in menus[0].actions() if not a.isSeparator()]
+    tela = abrir_tela()
+    win = tela.win
+    menu = _menu_principal(win)
+    textos = [a.text() for a in menu.actions() if not a.isSeparator()]
     for item in (
         "Recuperar uma pasta protegida…",
         "Cópia criptografada de uma pasta…",
@@ -1388,6 +1882,20 @@ def test_menu_principal_tem_itens_da_especificacao(abrir_tela: Callable[..., Tel
         "Tema",
     ):
         assert item in textos
+    so_destravado = (
+        "Recuperar uma pasta protegida…",
+        "Cópia criptografada de uma pasta…",
+        "Alterar PIN…",
+        "Bloquear agora",
+    )
+    visiveis = {a.text(): a.isVisible() for a in menu.actions()}
+    for item in so_destravado:  # travado: só Limites, Tema e Sobre
+        assert not visiveis[item], item
+    assert visiveis["Limites da proteção"]
+    win._unlocked(_criar_perfil(tela))
+    visiveis = {a.text(): a.isVisible() for a in menu.actions()}
+    for item in so_destravado:
+        assert visiveis[item], item
 
 
 @gui
@@ -1397,7 +1905,7 @@ def test_bloquear_durante_operacao_espera_terminar(abrir_tela: Callable[..., Tel
     win._unlocked(_criar_perfil(tela))
     liberar = threading.Event()
     fim: list[object] = []
-    win._run(lambda _p, _c: liberar.wait(10), fim.append)
+    assert win._run(lambda _p, _c: liberar.wait(10), fim.append)
     assert win.runner.busy
     win.lock_now()
     assert win._lock_after_job
@@ -1406,6 +1914,36 @@ def test_bloquear_durante_operacao_espera_terminar(abrir_tela: Callable[..., Tel
     _espera(lambda: win.session is None)
     assert fim == [True]
     assert win.pages.currentWidget() is win.unlock_page
+
+
+@gui
+def test_run_recusa_com_trabalho_em_andamento(abrir_tela: Callable[..., Tela]) -> None:
+    """Achado: o 2º _run sobrescrevia _job e a 1ª tela de progresso nunca fechava."""
+    tela = abrir_tela()
+    win = tela.win
+    win._unlocked(_criar_perfil(tela))
+    liberar = threading.Event()
+    primeiro: list[object] = []
+    segundo: list[object] = []
+    depois: list[bool] = []
+    assert win._run(
+        lambda _p, _c: liberar.wait(10) and "r1",
+        primeiro.append,
+        title="Primeira",
+        after=lambda: depois.append(True),
+    )
+    job = win._job
+    assert not win._run(lambda _p, _c: "r2", segundo.append, title="Segunda")
+    assert win._job is job  # o trabalho em curso não foi tocado
+    assert win.home.rodape.ponto.property("estado") == "erro"
+    liberar.set()
+    _espera(lambda: not win.runner.busy and win._job is None)
+    _descarta()
+    assert primeiro == ["r1"]
+    assert segundo == []
+    assert depois == [True]
+    assert job is not None and job.dialog is not None
+    assert not job.dialog.isVisible()  # a tela de progresso fechou
 
 
 @gui
@@ -1419,6 +1957,26 @@ def test_inatividade_bloqueia(abrir_tela: Callable[..., Tela]) -> None:
     win._idle_check()
     assert win.session is None
     assert win.pages.currentWidget() is win.unlock_page
+
+
+@gui
+def test_fim_de_operacao_longa_conta_como_uso(abrir_tela: Callable[..., Tela]) -> None:
+    """Achado: o resultado de uma verificação de 10 min sumia no travamento logo em seguida."""
+    tela = abrir_tela()
+    win = tela.win
+    win._unlocked(_criar_perfil(tela))
+    ainda_aberto: list[bool] = []
+
+    def resultado(_r: object) -> None:  # como um inform() aberto com o resultado
+        win._idle_check()
+        ainda_aberto.append(win.session is not None)
+
+    win._watcher.last = time.monotonic() - IDLE_LOCK_SECONDS - 1  # ninguém mexeu no mouse
+    assert win._run(lambda _p, _c: None, resultado)
+    _espera(lambda: bool(ainda_aberto))
+    assert ainda_aberto == [True]
+    win._idle_check()
+    assert win.session is not None
 
 
 @gui
@@ -1452,6 +2010,7 @@ def test_pratica_vencida_nao_atrapalha_pedido_do_atalho(abrir_tela: Callable[...
     assert win.pages.currentWidget() is win.unlock_page
     assert not win.unlock_page.master
     assert win.unlock_page.title.text() == "Abrir pasta protegida"
+    assert win.unlock_page.go.text() == "Abrir"
 
 
 @gui
@@ -1489,14 +2048,57 @@ def test_pin_desativado_pede_senha_mestra_sem_troca(abrir_tela: Callable[..., Te
 
 
 @gui
-def test_perfil_danificado_nunca_reabre_o_assistente(abrir_tela: Callable[..., Tela]) -> None:
+def test_perfil_danificado_tela_propria_e_recuperar_guarda_os_arquivos(
+    abrir_tela: Callable[..., Tela],
+) -> None:
+    """Perfil ilegível: nada de "PIN desativado"; [Recuperar…] guarda os arquivos ao lado."""
     tela = abrir_tela()
     tela.perfil.mkdir()
-    (tela.perfil / "perfil.owlp").write_bytes(b"lixo sintetico, nao e json")
+    lixo = {"perfil.owlp": b"lixo sintetico, nao e json", "perfil.owlp.bak": b"\x00\x01lixo"}
+    for nome, dados in lixo.items():
+        (tela.perfil / nome).write_bytes(dados)
     win = abrir_tela().win
+    page = win.problem_page
+    assert win.pages.currentWidget() is page
+    assert win.rodapes.currentWidget() is page.rodape
+    assert page.title.text() == "O perfil deste computador está danificado"
+    assert not [t for t in _textos(win, so_visiveis=True) if "PIN está desativado" in t]
+    assert page.rodape.primario.text() == "Recuperar minhas pastas com a senha mestra"
+    assert "Nada é apagado" in page.aviso.texto()
+    page.rodape.primario.click()
+    assert win.pages.currentWidget() is win.setup_page
+    assert win.setup_page.wants_recover  # depois do PIN, entra em "Recuperar"
+    assert not win.store.exists()
+    guardados = sorted(tela.perfil.iterdir())
+    assert len(guardados) == 2
+    for p in guardados:
+        original = p.name.split(".danificado-")[0]
+        assert original in lixo, p.name
+        assert p.read_bytes() == lixo[original]  # renomeado, nunca apagado
+
+
+@gui
+def test_perfil_inacessivel_oferece_tentar_de_novo(
+    abrir_tela: Callable[..., Tela], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tela = abrir_tela()
+    _criar_perfil(tela).close()
+    win = tela.win
+
+    def preso() -> bool:
+        raise PermissionError(32, "arquivo em uso por outro processo")
+
+    monkeypatch.setattr(win.store, "pin_available", preso)
+    win._show_unlock()
+    page = win.problem_page
+    assert win.pages.currentWidget() is page
+    assert not page.corrupt
+    assert page.title.text() == "Não foi possível ler o perfil agora"
+    assert page.rodape.primario.text() == "Tentar de novo"
+    monkeypatch.undo()  # o outro programa soltou o arquivo
+    page.rodape.primario.click()
     assert win.pages.currentWidget() is win.unlock_page
-    assert win.unlock_page.master
-    assert "danificado" in win.unlock_page.err.text()
+    assert (tela.perfil / "perfil.owlp").is_file()  # nada foi renomeado
 
 
 @gui
@@ -1537,12 +2139,6 @@ def test_cinco_pins_errados_desativam_o_pin(abrir_tela: Callable[..., Tela]) -> 
 
 
 @gui
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: ProfileStore.unlock_with_master zera pin_failures só no perfil principal "
-    "(session.save -> write); o .bak guarda a contagem antiga e unlock_with_pin usa o máximo "
-    "das duas cópias, então entrar com a senha mestra não devolve as 5 tentativas do PIN",
-)
 def test_senha_mestra_devolve_as_tentativas_do_pin(abrir_tela: Callable[..., Tela]) -> None:
     tela = abrir_tela()
     win = tela.win
@@ -1576,6 +2172,8 @@ def test_assistente_completo_cria_perfil_em_thread(
     page.pin1.setText(PIN)
     page.pin2.setText(PIN)
     page._finish()
+    assert not page.rodape.primario.isEnabled()  # ocupado enquanto cria
+    assert page.rodape.ponto.property("estado") == "trabalhando"
     _espera(lambda: not win.runner.busy)
     assert win.pages.currentWidget() is win.home
     assert (tela.perfil / "perfil.owlp").is_file()
@@ -1600,6 +2198,8 @@ def test_falhas_de_desbloqueio_mostradas_na_tela(abrir_tela: Callable[..., Tela]
     assert win._needs_new_pin
     assert win._unlock_failed(AuthenticationError("x"))
     assert win.unlock_page.err.text() == "Senha mestra incorreta."
+    assert win._unlock_failed(ProfileCorruptError("perfil ausente ou ilegível"))
+    assert win.pages.currentWidget() is win.problem_page
 
 
 @gui
@@ -1615,25 +2215,41 @@ def test_pedido_do_atalho_com_app_travado_guarda_e_pede_pin(
     assert win.pending_open == fid
     assert win.pages.currentWidget() is win.unlock_page
     assert win.unlock_page.title.text() == "Abrir pasta protegida"
+    assert win.unlock_page.go.text() == "Abrir"
     assert not win.unlock_page.master
+
+
+class _SegredoFalso:
+    """SecretDialog que não abre nada: devolve ``respostas`` em ordem (None = Cancelar)."""
+
+    criados: list[dict[str, object]]
+    respostas: list[str | None]
+
+    def __init__(self, _parent: object, title: str, text: str, button: str, **kw: Any) -> None:
+        type(self).criados.append({"title": title, "text": text, "button": button, **kw})
+        self.master = bool(kw.get("master"))
+        self._valor = type(self).respostas.pop(0) if type(self).respostas else None
+
+    def exec(self) -> QDialog.DialogCode:
+        if self._valor is None:
+            return QDialog.DialogCode.Rejected
+        return QDialog.DialogCode.Accepted
+
+    def take(self) -> str:
+        return self._valor or ""
+
+
+def _segredo_falso(monkeypatch: pytest.MonkeyPatch, respostas: list[str | None]) -> type:
+    cls = type("SegredoFalso", (_SegredoFalso,), {"criados": [], "respostas": list(respostas)})
+    monkeypatch.setattr(owl_window, "SecretDialog", cls)
+    return cls
 
 
 @gui
 def test_pedido_do_atalho_com_app_destravado_pede_pin_de_novo(
     abrir_tela: Callable[..., Tela], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    criados: list[dict[str, object]] = []
-
-    class DialogoFalso:
-        def __init__(
-            self, _parent: object, title: str, text: str, button: str, **kw: object
-        ) -> None:
-            criados.append({"title": title, "text": text, "button": button, **kw})
-
-        def exec(self) -> QDialog.DialogCode:  # não abre nada: "Cancelar"
-            return QDialog.DialogCode.Rejected
-
-    monkeypatch.setattr(owl_window, "SecretDialog", DialogoFalso)
+    falso = _segredo_falso(monkeypatch, [None])
     tela = abrir_tela()
     win = tela.win
     sessao = _criar_perfil(tela)
@@ -1641,12 +2257,205 @@ def test_pedido_do_atalho_com_app_destravado_pede_pin_de_novo(
     rec = _pasta_aberta(tmp_path)
     sessao.index.folders.append(rec)
     win.request_open(rec.id)
-    assert len(criados) == 1
-    assert criados[0]["title"] == f"Abrir '{NOME}'"
-    assert criados[0]["button"] == "Abrir"
-    assert criados[0]["master"] is False
+    assert len(falso.criados) == 1
+    assert falso.criados[0]["title"] == f"Abrir '{NOME}'"
+    assert falso.criados[0]["button"] == "Abrir"
+    assert falso.criados[0]["master"] is False
     assert not win.runner.busy  # cancelado: nada foi feito
     assert win.session is sessao
+    assert ("explorer", rec.path) not in tela.dialogos
+
+
+def _perfil_com_pasta(tela: Tela, tmp_path: Path) -> FolderRecord:
+    sessao = _criar_perfil(tela)
+    rec = _pasta_aberta(tmp_path)
+    sessao.index.folders.append(rec)
+    sessao.save()
+    sessao.close()
+    return rec
+
+
+@gui
+@pytest.mark.parametrize("resposta", ["cancel", "open"])
+def test_pedido_por_mensagem_so_abre_com_confirmacao_e_nome(
+    abrir_tela: Callable[..., Tela], tmp_path: Path, resposta: str
+) -> None:
+    """Achado: 'abrir <id>' vindo de outro processo reaproveitava o PIN da tela de desbloqueio
+    como consentimento e decifrava a pasta sem perguntar."""
+    tela = abrir_tela()
+    rec = _perfil_com_pasta(tela, tmp_path)
+    win = tela.win
+    win._show_unlock()
+    tela.respostas["Abrir '"] = resposta
+    win.handle_message(f"abrir {rec.id}")
+    assert win.pending_open == rec.id
+    assert win.unlock_page.title.text() == "Abrir pasta protegida"
+    _envia(tela, PIN)  # o PIN foi digitado "só para ver a lista"
+    _descarta()
+    pergunta = tela.pergunta(f"Abrir '{NOME}'?")
+    assert pergunta["buttons"] == ["open", "cancel"]
+    assert win.pending_open is None
+    abriu = ("explorer", rec.path) in tela.dialogos
+    assert abriu == (resposta == "open")
+
+
+@gui
+def test_pedido_da_linha_de_comando_abre_depois_do_pin(
+    abrir_tela: Callable[..., Tela], tmp_path: Path
+) -> None:
+    """O atalho iniciou o app (--abrir): o PIN digitado na tela "Abrir pasta protegida" basta."""
+    rec = _perfil_com_pasta(abrir_tela(), tmp_path)
+    tela = abrir_tela(open_request=rec.id)
+    _envia(tela, PIN)
+    _descarta()
+    assert ("explorer", rec.path) in tela.dialogos
+    assert not [p for p in tela.perguntas if p["title"].startswith("Abrir '")]
+
+
+@gui
+def test_atalho_de_pasta_fora_da_lista_explica_sem_pedir_pin(
+    abrir_tela: Callable[..., Tela], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    falso = _segredo_falso(monkeypatch, [])
+    tela = abrir_tela()
+    win = tela.win
+    win._unlocked(_criar_perfil(tela))
+    recuperar: list[bool] = []
+    monkeypatch.setattr(win, "_recover", lambda *a, **k: recuperar.append(True))
+    tela.respostas["Esta pasta não está na lista"] = "recover"
+    win.request_open(ID_OK)
+    assert falso.criados == []  # nada de PIN para dizer que a pasta não está na lista
+    pergunta = tela.pergunta("Esta pasta não está na lista")
+    assert "reinstalou" in pergunta["text"]
+    assert pergunta["buttons"] == ["recover", "close"]
+    assert recuperar == [True]
+
+
+@gui
+def test_recuperacao_em_andamento_adia_o_pedido_do_atalho(
+    abrir_tela: Callable[..., Tela], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tela = abrir_tela()
+    win = tela.win
+    depois: list[Callable[[], None]] = []
+    monkeypatch.setattr(win, "_recover", lambda then=None: depois.append(then))
+    win._wants_recover = True
+    win.pending_open = ID_OK  # atalho antigo (id de antes de reinstalar)
+    win._unlocked(_criar_perfil(tela))
+    _descarta()
+    assert len(depois) == 1  # a recuperação começou...
+    assert win.pending_open == ID_OK  # ...e o pedido do atalho esperou
+    assert tela.perguntas == []
+    callback = depois[0]
+    assert callback is not None
+    callback()  # a recuperação terminou
+    _descarta()
+    assert win.pending_open is None
+    assert not [p for p in tela.perguntas if p["title"] == "Esta pasta não está na lista"]
+    assert "recuperadas" in win.home.notice.text()
+
+
+@gui
+def test_after_unlock_encadeia_novo_pin_e_pedido_uma_etapa_por_vez(
+    abrir_tela: Callable[..., Tela], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Achado: _after_unlock iniciava o 'abrir' com o 'Salvando o PIN…' ainda rodando."""
+    novo_pin = "961473"
+
+    class NovoPinFalso:
+        def __init__(self, *_a: object, **_k: object) -> None:
+            pass
+
+        def exec(self) -> QDialog.DialogCode:
+            return QDialog.DialogCode.Accepted
+
+        def take(self) -> str:
+            return novo_pin
+
+    monkeypatch.setattr(owl_window, "NewSecretDialog", NovoPinFalso)
+    tela = abrir_tela()
+    win = tela.win
+    sessao = _criar_perfil(tela)
+    liberar = threading.Event()
+    real_set_pin = sessao.set_pin
+
+    def set_pin_lento(pin: str, **kw: Any) -> None:
+        liberar.wait(10)
+        real_set_pin(pin, **kw)
+
+    monkeypatch.setattr(sessao, "set_pin", set_pin_lento)
+    win._needs_new_pin = True
+    win.pending_open = ID_OK
+    win._unlocked(sessao)
+    _descarta()
+    assert win.runner.busy  # salvando o PIN...
+    assert win.pending_open == ID_OK  # ...e o pedido do atalho ainda espera
+    assert tela.perguntas == []
+    liberar.set()
+    _espera(lambda: not win.runner.busy)
+    _descarta()
+    _descarta()
+    assert win.pending_open is None
+    assert tela.pergunta("Esta pasta não está na lista")
+    assert win.home.notice.text() == "PIN criado."
+    win.lock_now()
+    _envia(tela, novo_pin)
+    assert win.session is not None  # o PIN novo foi gravado
+
+
+@gui
+def test_pin_errado_ao_remover_protecao_sincroniza_a_sessao(
+    abrir_tela: Callable[..., Tela], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Achado: depois de 5 PINs errados em 'Remover proteção', os saves seguintes gravavam o
+    PIN de volta com o contador zerado."""
+    falso = _segredo_falso(monkeypatch, [PIN_ERRADO] * 5 + [None])
+    tela = abrir_tela()
+    win = tela.win
+    sessao = _criar_perfil(tela)
+    win._unlocked(sessao)
+    win._remove(ID_OK)
+    _espera(lambda: len(falso.criados) == 6 and not win.runner.busy)
+    _descarta()
+    assert falso.criados[-1]["master"] is True  # o PIN foi desativado: só a senha mestra
+    assert sessao.obj["pin"] is None
+    assert sessao.obj["pin_failures"] >= 5
+    sessao.save()
+    sessao.save()
+    store = ProfileStore(tela.perfil, TESTING_POLICY)
+    assert not store.pin_available()
+    with pytest.raises(PinUnavailableError):
+        store.unlock_with_pin(PIN)
+
+
+@gui
+def test_pin_errado_ao_alterar_pin_sincroniza_a_sessao(
+    abrir_tela: Callable[..., Tela], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class AlterarFalso:
+        def __init__(self, *_a: object) -> None:
+            pass
+
+        def exec(self) -> QDialog.DialogCode:
+            return QDialog.DialogCode.Accepted
+
+        def take(self) -> tuple[str, str, bool]:
+            return PIN_ERRADO, "961473", False
+
+    monkeypatch.setattr(owl_window, "ChangePinDialog", AlterarFalso)
+    tela = abrir_tela()
+    win = tela.win
+    sessao = _criar_perfil(tela)
+    win._unlocked(sessao)
+    win._change_pin()
+    _espera(lambda: not win.runner.busy)
+    _descarta()
+    assert tela.pergunta("PIN incorreto")["text"] == "Restam 4 tentativa(s)."
+    assert sessao.obj["pin_failures"] == 1
+    sessao.save()  # um save depois do erro não zera o contador do disco
+    obj, bak = tela.store.read_raw()
+    assert obj["pin_failures"] == 1
+    assert bak is not None and bak["pin_failures"] == 1
 
 
 @gui
@@ -1655,8 +2464,6 @@ def test_mensagem_da_outra_instancia_so_aceita_id_valido(
 ) -> None:
     win = abrir_tela().win
     pedidos: list[str] = []
-    for nome in ("showNormal", "raise_", "activateWindow"):
-        monkeypatch.setattr(win, nome, lambda: None)
     monkeypatch.setattr(win, "request_open", pedidos.append)
     win.handle_message(f"abrir {ID_OK}")
     win.handle_message("mostrar")
@@ -1702,6 +2509,318 @@ def test_acoes_das_linhas_chegam_aos_tratadores(
 
 
 @gui
+def test_pasta_aberta_renomeada_oferece_procurar_e_explica_tirar_da_lista(
+    abrir_tela: Callable[..., Tela], tmp_path: Path
+) -> None:
+    tela = abrir_tela()
+    win = tela.win
+    sessao = _criar_perfil(tela)
+    win._unlocked(sessao)
+    rec = _pasta_aberta(tmp_path)
+    sessao.index.folders.append(rec)
+    pasta = Path(winfs.strip_extended(rec.path))
+    pasta.rename(pasta.with_name(NOME + " 2024"))  # renomeada no Explorer
+    win._refresh()
+    assert win.home.counts["atencao"] == 1
+    win._resolve(rec.id)
+    pergunta = tela.pergunta(f"'{NOME}' não foi encontrada")
+    assert pergunta["buttons"] == ["find", "forget"]
+    assert "renomeou" in pergunta["text"]
+    win._forget(rec.id)
+    texto = tela.pergunta(f"Tirar '{NOME}' da lista?")["text"]
+    assert f".owlvault-{rec.id}" in texto  # onde fica a cópia criptografada anterior
+    assert "Proteger uma pasta" in texto
+    assert "Recuperar uma pasta protegida" not in texto  # Recuperar não acharia nada aqui
+
+
+# --------------------------------------------------------------------------- integração 0.3
+# (a janela usa o que o motor das pastas passou a devolver: relatório do Desfazer, versão
+# anterior ilegível, conferência do atalho, aviso de 'Tirar da lista' e alertas destrutivos)
+
+
+def _destravada_com_pasta(
+    tela: Tela, tmp_path: Path, state: str = ABERTA
+) -> tuple[OwlWindow, FolderRecord]:
+    win = tela.win
+    sessao = _criar_perfil(tela)
+    win._unlocked(sessao)
+    rec = _pasta_aberta(tmp_path, state=state)
+    sessao.index.folders.append(rec)
+    return win, rec
+
+
+def _com_vista(
+    win: OwlWindow, monkeypatch: pytest.MonkeyPatch, rec: FolderRecord, issue: str
+) -> None:
+    assert win.mgr is not None
+    vista = FolderView(rec, "Precisa de atenção", "resolver", "Atenção sintética", issue=issue)
+    monkeypatch.setattr(win.mgr, "view", lambda _r: vista)
+
+
+def _versao_mantida(rec: FolderRecord, local: Path, *, existe: bool) -> None:
+    if existe:
+        local.mkdir(parents=True)
+    rec.vaults.append(VaultRef("ab" * 16, MANTIDO, winfs.to_extended(str(local))))
+
+
+@gui
+def test_desfazer_mostra_conflitos_falhas_ou_so_o_aviso(
+    abrir_tela: Callable[..., Tela], tmp_path: Path
+) -> None:
+    """Pendência do motor: depois de 'Desfazer', mostrar UnlockOutcome.report (conflito em
+    arquivo apagado ⇒ versão MANTIDA) em vez de só "'X' continua aberta."."""
+    tela = abrir_tela()
+    win, rec = _destravada_com_pasta(tela, tmp_path)
+    # 1) conflito num caminho que o Owl Vault apagou: a versão guardada foi mantida
+    _versao_mantida(rec, tmp_path / "area" / "novo-0123456789abcdef", existe=True)
+    rec.attention = (
+        "1 arquivo(s) não voltaram para a pasta porque já havia outro item com o mesmo nome: "
+        "a.txt. A versão guardada deles foi mantida."
+    )
+    conflito = RestoreReport(rec.path, "ok", conflicts=["a.txt"])
+    win._undo_done(UnlockOutcome(rec, True, conflito, rec.path), NOME)
+    assert "versão guardada deles foi mantida" in tela.pergunta(f"'{NOME}' continua aberta")["text"]
+    # 2) falha ao devolver: diz que nem tudo voltou
+    rec.attention = "Não foi possível devolver todos os arquivos: b.txt"
+    falha = RestoreReport(rec.path, "ok", failed=["b.txt"])
+    win._undo_done(UnlockOutcome(rec, False, falha, rec.path), NOME)
+    assert "b.txt" in tela.pergunta(f"Nem todos os arquivos voltaram para '{NOME}'")["text"]
+    # 3) tudo voltou: só o aviso na lista, sem caixa
+    rec.vaults.clear()
+    rec.attention = ""
+    antes = len(tela.perguntas)
+    win._undo_done(UnlockOutcome(rec, True, RestoreReport(rec.path, "ok"), rec.path), NOME)
+    assert len(tela.perguntas) == antes
+    assert win.home.notice.text() == f"'{NOME}' continua aberta."
+
+
+@gui
+@pytest.mark.parametrize("sumiu", [False, True])
+def test_versao_anterior_ilegivel_nunca_oferece_apagar(
+    abrir_tela: Callable[..., Tela],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sumiu: bool,
+) -> None:
+    tela = abrir_tela()
+    win, rec = _destravada_com_pasta(tela, tmp_path)
+    _versao_mantida(rec, tmp_path / "area" / "anterior-0123456789abcdef", existe=not sumiu)
+    _com_vista(win, monkeypatch, rec, "versao_anterior_ilegivel")
+    assert win.mgr is not None
+    esquecidas: list[str] = []
+
+    def esquecer(fid: str) -> int:
+        esquecidas.append(fid)
+        return 1
+
+    monkeypatch.setattr(win.mgr, "forget_missing_kept", esquecer)
+    tela.respostas["Versão anterior de"] = "forget_kept" if sumiu else "close"
+    win._resolve(rec.id)
+    pergunta = tela.pergunta(f"Versão anterior de '{NOME}'")
+    assert "delete" not in pergunta["buttons"]
+    if sumiu:
+        assert pergunta["buttons"] == ["forget_kept", "close"]
+        assert esquecidas == [rec.id]
+        assert "Nada foi apagado" in win.home.notice.text()
+    else:
+        assert pergunta["buttons"] == ["restore", "close"]
+        assert esquecidas == []
+
+
+@gui
+def test_versao_anterior_que_ficou_ilegivel_nao_conta_como_vazia(
+    abrir_tela: Callable[..., Tela], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """kept_only_files agora levanta StateError com a versão ilegível: a janela não quebra nem
+    oferece 'Apagar' (antes, a lista vazia virava "não tem arquivos que faltem. Apagar?")."""
+    tela = abrir_tela()
+    win, rec = _destravada_com_pasta(tela, tmp_path)
+    _versao_mantida(rec, tmp_path / "area" / "anterior-0123456789abcdef", existe=True)
+    _com_vista(win, monkeypatch, rec, "versao_anterior")
+    assert win.mgr is not None
+
+    def ilegivel(_fid: str) -> list[str]:
+        raise StateError("Não foi possível ler a versão anterior mantida. Nada foi apagado.")
+
+    monkeypatch.setattr(win.mgr, "kept_only_files", ilegivel)
+    win._resolve(rec.id)
+    pergunta = tela.pergunta(f"Versão anterior de '{NOME}'")
+    assert pergunta["buttons"] == ["restore", "close"]
+    # legível: 'Apagar a versão anterior…' é o botão destrutivo (vermelho)
+    monkeypatch.setattr(win.mgr, "kept_only_files", lambda _fid: ["a.txt"])
+    win._resolve(rec.id)
+    pergunta = tela.pergunta(f"Versão anterior de '{NOME}'")
+    assert pergunta["buttons"] == ["restore", "delete", "close"]
+    assert pergunta["perigo"] == "delete"
+
+
+@gui
+def test_pedido_do_atalho_confere_e_refaz_o_atalho(
+    abrir_tela: Callable[..., Tela], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tela = abrir_tela()
+    win, rec = _destravada_com_pasta(tela, tmp_path, TRANCADA)
+    assert win.mgr is not None
+    nota = f"O atalho 'Abrir com Owl Vault' de '{NOME}' estava diferente do esperado e foi refeito."
+    conferidas: list[str] = []
+
+    def refaz(fid: str) -> list[str]:
+        conferidas.append(fid)
+        return [nota]
+
+    monkeypatch.setattr(win.mgr, "repair_placeholders", refaz)
+    abertas: list[str] = []
+    monkeypatch.setattr(win, "_open_folder", abertas.append)
+    win._open_from_shortcut(rec.id)  # app destravado: depois do PIN pedido de novo
+    assert conferidas == [rec.id]
+    assert tela.pergunta("O atalho desta pasta foi refeito")["text"] == nota
+    assert abertas == [rec.id]
+    win._open_pending(rec.id, owl_window.ORIGEM_LINHA)  # --abrir: depois da tela de PIN
+    assert conferidas == [rec.id, rec.id]
+    assert abertas == [rec.id, rec.id]
+
+    def fora_do_lugar(_fid: str) -> list[str]:
+        raise StateError("A pasta não está no lugar.")
+
+    monkeypatch.setattr(win.mgr, "repair_placeholders", fora_do_lugar)
+    antes = len(tela.perguntas)
+    win._open_from_shortcut(rec.id)  # o próprio 'Abrir' explica o problema
+    assert len(tela.perguntas) == antes
+    assert abertas == [rec.id, rec.id, rec.id]
+
+
+@gui
+def test_tirar_da_lista_pasta_trancada_com_cofre_fora_avisa(
+    abrir_tela: Callable[..., Tela], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tela = abrir_tela()
+    win, rec = _destravada_com_pasta(tela, tmp_path, TRANCADA)
+    assert win.mgr is not None
+    aviso = (
+        f"'{NOME}' tem arquivos guardados fora da pasta (em X, uma pasta oculta). Depois de tirar "
+        "da lista, eles NÃO aparecem em 'Recuperar uma pasta protegida'."
+    )
+    monkeypatch.setattr(win.mgr, "forget_warning", lambda _fid: aviso)
+    win._forget(rec.id)
+    texto = tela.pergunta(f"Tirar '{NOME}' da lista?")["text"]
+    assert texto.startswith("Nada será apagado.")
+    assert aviso in texto
+    assert "use ☰ > Recuperar" not in texto
+    monkeypatch.setattr(win.mgr, "forget_warning", lambda _fid: "")
+    win._forget(rec.id)
+    assert "use ☰ > Recuperar" in tela.pergunta(f"Tirar '{NOME}' da lista?")["text"]
+    assert win.session is not None and win.session.index.folder(rec.id) is rec  # cancelado
+
+
+@gui
+def test_resolver_trancando_mostra_as_notas_da_conferencia(
+    abrir_tela: Callable[..., Tela], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tela = abrir_tela()
+    win, rec = _destravada_com_pasta(tela, tmp_path, TRANCANDO)
+    assert win.mgr is not None
+    nota = f"O trancamento de '{NOME}' foi interrompido antes de apagar arquivos."
+    monkeypatch.setattr(win.mgr, "reconcile_on_start", lambda: [nota])
+    _com_vista(win, monkeypatch, rec, TRANCANDO)
+    win._resolve(rec.id)
+    assert win.home.notice.text() == nota
+
+
+@gui
+def test_remover_protecao_usa_o_botao_de_perigo(
+    abrir_tela: Callable[..., Tela], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    falso = _segredo_falso(monkeypatch, [None])
+    tela = abrir_tela()
+    win, rec = _destravada_com_pasta(tela, tmp_path)
+    win._remove(rec.id)
+    assert len(falso.criados) == 1
+    assert falso.criados[0]["button"] == "Remover proteção"
+    assert falso.criados[0]["perigo"] is True
+    win.request_open(rec.id)  # o PIN do atalho não é destrutivo
+    assert falso.criados[1]["perigo"] is False
+
+
+# --------------------------------------------------------------------------- proteger na janela
+
+
+@gui
+def test_proteger_abre_o_assistente_na_janela(abrir_tela: Callable[..., Tela]) -> None:
+    tela = abrir_tela()
+    win = tela.win
+    win._unlocked(_criar_perfil(tela))
+    win.home.rodape.primario.click()  # "+ Proteger uma pasta…"
+    page = win.protect_page
+    assert win.pages.currentWidget() is page
+    assert win.rodapes.currentWidget() is page.rodape
+    assert page.step == 0
+    assert page.first_time  # nenhuma pasta ainda: "Entendi" obrigatório
+    page.rodape.voltar.click()
+    assert win.pages.currentWidget() is win.home
+    assert tela.dialogos == []  # nenhum diálogo modal (nem o seletor de pastas)
+
+
+@gui
+def test_proteger_pasta_que_nao_existe_mostra_o_motivo(
+    abrir_tela: Callable[..., Tela], tmp_path: Path
+) -> None:
+    tela = abrir_tela()
+    win = tela.win
+    win._unlocked(_criar_perfil(tela))
+    win._protect(str(tmp_path / "nao existe"))
+    _espera(lambda: not win.runner.busy)
+    _descarta()
+    page = win.protect_page
+    assert page.step == 1
+    assert page.failures
+    assert _estados(page)["permitida"] == "falhou"
+    assert not page.rodape.primario.isEnabled()
+    assert tela.dialogos == []  # a recusa aparece no passo "Conferência", não numa caixa
+
+
+@gui
+def test_proteger_confere_e_tranca_de_verdade(
+    abrir_tela: Callable[..., Tela], tmp_path: Path
+) -> None:
+    """Fluxo inteiro com uma pasta sintética: conferência real, trancar em thread, lista."""
+    tela = abrir_tela()
+    win = tela.win
+    win._unlocked(_criar_perfil(tela))
+    pasta = tmp_path / "pastas" / NOME
+    pasta.mkdir(parents=True)
+    (pasta / "Relatório sigiloso.txt").write_bytes(b"dados sinteticos " * 100)
+    win._protect(str(pasta))
+    page = win.protect_page
+    assert page.checking_now
+    _espera(lambda: not win.runner.busy)
+    _descarta()
+    assert page.check is not None, page.failures
+    assert set(_estados(page).values()) == {"ok"}
+    assert page.linhas["arquivos"].detalhe.text().startswith("1 arquivo(s)")
+    page.entendi.setChecked(True)
+    page.rodape.primario.click()  # Trancar agora
+    assert page.step == 2
+    assert page.locking_now
+    _espera(lambda: not win.runner.busy)
+    _descarta()
+    assert page.done
+    assert page.t3.text() == f"'{NOME}' está trancada."
+    registro = page.log.toPlainText()
+    assert "4/4" in registro
+    assert "Relatório" not in registro  # o registro só tem etapas
+    assert win.mgr is not None
+    assert [r.state for r in win.mgr.folders] == [TRANCADA]
+    assert not (pasta / "Relatório sigiloso.txt").exists()
+    page.rodape.primario.click()  # Voltar para a lista
+    assert win.pages.currentWidget() is win.home
+    assert len(win.home.findChildren(pages.FolderRow)) == 1
+    assert win.home.notice.text() == f"'{NOME}' está trancada."
+
+
+# --------------------------------------------------------------------------- sair (T11)
+
+
+@gui
 def test_sair_com_pasta_aberta_pergunta_antes(
     abrir_tela: Callable[..., Tela], tmp_path: Path
 ) -> None:
@@ -1711,8 +2830,183 @@ def test_sair_com_pasta_aberta_pergunta_antes(
     win._unlocked(sessao)
     sessao.index.folders.append(_pasta_aberta(tmp_path))
     assert not win.close()  # resposta gravada: "cancel"
-    assert ("ask", "Sair do Owl Vault?") in tela.dialogos
+    pergunta = tela.pergunta("Sair do Owl Vault?")
+    assert pergunta["buttons"] == ["lock", "quit", "cancel"]
+    assert pergunta["primary"] == "lock"  # "Trancar e sair" é o padrão
     assert win.session is sessao
     sessao.index.folders.clear()
     assert win.close()  # nenhuma aberta: sai e descarta as chaves
     assert win.session is None
+
+
+@gui
+def test_sair_com_app_travado_e_pasta_aberta_ainda_pergunta(
+    abrir_tela: Callable[..., Tela], tmp_path: Path
+) -> None:
+    """Achado: depois do travamento automático (mgr=None), o X fechava sem o T11."""
+    tela = abrir_tela()
+    win = tela.win
+    sessao = _criar_perfil(tela)
+    win._unlocked(sessao)
+    sessao.index.folders.append(_pasta_aberta(tmp_path))
+    win.lock_now()
+    assert win._visible_count == 1  # só a contagem, sem nomes
+    assert not win.close()
+    pergunta = tela.pergunta("Sair do Owl Vault?")
+    assert pergunta["text"] == "Há 1 pasta aberta e visível. Digite o PIN para trancar."
+    assert pergunta["buttons"] == ["quit", "cancel"]
+    assert NOME not in pergunta["text"]
+    assert win.pages.currentWidget() is win.unlock_page  # Cancelar: fica no PIN
+    tela.respostas["Sair do Owl Vault?"] = "quit"
+    assert win.close()
+
+
+@gui
+@pytest.mark.parametrize("estado", [APAGANDO, ABERTURA_INCOMPLETA, ABRINDO])
+def test_sair_com_pasta_com_copias_legiveis_pergunta(
+    abrir_tela: Callable[..., Tela], tmp_path: Path, estado: str
+) -> None:
+    tela = abrir_tela()
+    win = tela.win
+    sessao = _criar_perfil(tela)
+    win._unlocked(sessao)
+    sessao.index.folders.append(_pasta_aberta(tmp_path, state=estado))
+    win._refresh()
+    assert not win.home.banner.isHidden()  # a faixa também aparece
+    assert not win.close()
+    pergunta = tela.pergunta("Sair do Owl Vault?")
+    assert "lock" not in pergunta["buttons"]  # não dá para trancar automaticamente
+    assert pergunta["buttons"] == ["quit", "cancel"]
+    assert any("precisa de atenção" in d for d in pergunta["details"])
+
+
+@gui
+def test_fechar_durante_operacao_nao_deixa_conexao_permanente(
+    abrir_tela: Callable[..., Tela], tmp_path: Path
+) -> None:
+    """Achado: 'Parar e fechar' conectava runner.done → sair para sempre."""
+    tela = abrir_tela()
+    win = tela.win
+    sessao = _criar_perfil(tela)
+    win._unlocked(sessao)
+    sessao.index.folders.append(_pasta_aberta(tmp_path))
+    receptores = win.runner.receivers(SIGNAL("done(PyObject)"))
+    liberar = threading.Event()
+    assert win._run(lambda _p, _c: liberar.wait(10), lambda _r: None)
+
+    def termina_antes_de_responder() -> str:  # o trabalho acaba com a pergunta aberta
+        liberar.set()
+        _espera(lambda: not win.runner.busy)
+        return "stop"
+
+    tela.respostas["Há uma operação em andamento"] = termina_antes_de_responder
+    assert not win.close()
+    _descarta()
+    assert not win._quit_after_job  # já tinha terminado: segue o caminho normal (T11)
+    assert tela.pergunta("Sair do Owl Vault?")  # T11 perguntou e a resposta foi "cancel"
+    assert win.session is sessao
+    fim: list[object] = []
+    assert win._run(lambda _p, _c: "depois", fim.append)  # uma operação futura...
+    _espera(lambda: bool(fim))
+    _descarta()
+    assert not win._quitting  # ...não fecha o app
+    assert win.session is sessao
+    assert win.runner.receivers(SIGNAL("done(PyObject)")) == receptores
+
+
+@gui
+def test_parar_e_fechar_fecha_uma_vez_quando_o_trabalho_para(
+    abrir_tela: Callable[..., Tela],
+) -> None:
+    tela = abrir_tela()
+    win = tela.win
+    win._unlocked(_criar_perfil(tela))
+    liberar = threading.Event()
+    assert win._run(lambda _p, c: liberar.wait(10), lambda _r: None)
+    tela.respostas["Há uma operação em andamento"] = "stop"
+    assert not win.close()
+    assert win._quit_after_job
+    assert win.runner.cancel_token is not None and win.runner.cancel_token.cancelled
+    liberar.set()
+    _espera(lambda: win._quitting)
+    assert win.session is None
+    assert not win._quit_after_job
+
+
+class _CopiaFalsa(QWidget):
+    """Janela da Cópia criptografada (sem abrir a real): ``aceita`` decide se fecha."""
+
+    def __init__(self, aceita: bool) -> None:
+        super().__init__()
+        self.aceita = aceita
+        self.fechada = False
+
+    def isVisible(self) -> bool:
+        return not self.fechada
+
+    def close(self) -> bool:
+        if self.aceita:
+            self.fechada = True
+        return self.aceita
+
+
+@gui
+def test_fechar_a_janela_fecha_a_copia_e_nao_reaparece_sem_sessao(
+    abrir_tela: Callable[..., Tela], tmp_path: Path
+) -> None:
+    tela = abrir_tela()
+    win = tela.win
+    sessao = _criar_perfil(tela)
+    win._unlocked(sessao)
+    sessao.index.folders.append(_pasta_aberta(tmp_path, "Outra"))
+    sessao.index.folders[0].state = TRANCADA
+    win._refresh()
+    copia = _CopiaFalsa(aceita=True)
+    win._copy_window = copia
+    assert win.close()
+    assert copia.fechada
+    assert win._copy_window is None
+    assert win.session is None
+    assert win.home.findChildren(pages.FolderRow) == []  # nada da lista fica na janela
+    win.handle_message("mostrar")  # 2ª execução pede para mostrar
+    assert not win._quitting  # o próximo X passa pelo T11 de novo
+    assert win.pages.currentWidget() is win.unlock_page
+
+
+@gui
+def test_copia_ocupada_impede_fechar_pela_metade(abrir_tela: Callable[..., Tela]) -> None:
+    tela = abrir_tela()
+    win = tela.win
+    sessao = _criar_perfil(tela)
+    win._unlocked(sessao)
+    win._copy_window = _CopiaFalsa(aceita=False)  # trabalhando: recusa fechar
+    assert not win.close()
+    assert win.session is sessao
+    assert not win._quitting
+
+
+@gui
+@pytest.mark.parametrize(("resposta", "sai"), [("", False), ("quit", True)])
+def test_erro_no_trancar_e_sair_mostra_o_motivo_e_esc_nao_sai(
+    abrir_tela: Callable[..., Tela], tmp_path: Path, resposta: str, sai: bool
+) -> None:
+    tela = abrir_tela()
+    win = tela.win
+    sessao = _criar_perfil(tela)
+    win._unlocked(sessao)
+    rec = _pasta_aberta(tmp_path)
+    sessao.index.folders.append(rec)
+    tela.respostas["Não deu para trancar"] = resposta
+    erro = PreflightError(
+        "Não é possível proteger esta pasta.", ["IMG_0042.jpg: em uso", "IMG_0043.jpg: em uso"]
+    )
+    assert win._quit_lock_failed(rec.id, erro)
+    _descarta()
+    pergunta = tela.pergunta(f"Não deu para trancar '{NOME}'")
+    assert pergunta["text"].startswith("IMG_0042.jpg: em uso")
+    assert pergunta["details"] == ["IMG_0043.jpg: em uso"]
+    assert pergunta["primary"] == "retry"
+    assert win._quitting == sai
+    if not sai:  # Esc/X no aviso: volta ao app, nada de sair com a pasta aberta
+        assert win.session is sessao
+        assert "continuam abertas" in win.home.notice.text()

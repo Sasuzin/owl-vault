@@ -18,8 +18,9 @@ criptografados: só abrem pelo Owl Vault, com o seu **PIN** (ou a **senha mestra
 3. **+ Proteger uma pasta…** → escolha a pasta → confira o resumo → **Proteger**. O Owl Vault
    guarda os arquivos criptografados dentro da própria pasta (`.owlvault`, oculta), confere
    tudo, testa a recuperação de cada arquivo e só então apaga as cópias legíveis.
-4. Para abrir: dois cliques em **Abrir com Owl Vault** dentro da pasta (ou no botão **Abrir**
-   do programa) e digite o PIN. A pasta abre no Explorer. Quando terminar, **Trancar**.
+4. Para abrir: abra o Owl Vault pelo Menu Iniciar, digite o PIN e clique em **Abrir** na pasta
+   (o atalho **Abrir com Owl Vault** dentro da pasta faz o mesmo). A pasta abre no Explorer.
+   Quando terminar, **Trancar**.
 5. **Esconder do Explorer** (menu ⋯) faz a pasta trancada sumir do Explorer; ela volta pelo
    Owl Vault.
 

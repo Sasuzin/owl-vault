@@ -24,12 +24,14 @@ from owl_vault.application import profile as profile_mod
 from owl_vault.application.keysource import KeySource
 from owl_vault.application.profile import (
     MAX_PIN_FAILURES,
+    NOTE_BACKUP_USED,
     PRACTICE_EVERY_DAYS,
     PRACTICE_FIRST_DAYS,
     DpapiUnavailableError,
     FolderRecord,
     PinError,
     PinUnavailableError,
+    ProfileCorruptError,
     ProfileSession,
     ProfileStore,
     VaultRef,
@@ -213,7 +215,12 @@ def wrong_pin(store: ProfileStore) -> int:
         "47392816",
         "3819274650",
         "584930172648",  # 12 dígitos
-        "00000001",
+        "271946",
+        "830561",
+        "8305617",
+        "62940158",
+        "702581",
+        "15926073",
         # datas INVÁLIDAS não são recusadas
         "320190",  # 32/01/90 e 32-01-90 (dia 90)
         "31021990",  # 31/02/1990
@@ -297,17 +304,92 @@ def test_validate_pin_recusa_datas_validas(pin: str) -> None:
 
 
 @pytest.mark.parametrize("pin", ["1234567890", "0987654321"])
-@pytest.mark.xfail(
-    strict=True,
-    raises=pytest.fail.Exception,
-    reason=(
-        "BUG: validate_pin só recusa passo constante +1/-1; '1234567890' e '0987654321' "
-        "(fileira numérica do teclado, entre os PINs mais comuns) são aceitos"
-    ),
-)
 def test_validate_pin_recusa_sequencia_do_teclado(pin: str) -> None:
-    with pytest.raises(OwlVaultError):
+    """Regressão: a fileira numérica do teclado (9→0 quebrava a sequência) era aceita."""
+    with pytest.raises(OwlVaultError, match="fácil de adivinhar"):
         validate_pin(pin)
+
+
+@pytest.mark.parametrize(
+    "pin",
+    [
+        # lista embutida de PINs comuns (levantamentos públicos)
+        "123123",
+        "112233",
+        "147258",
+        "159357",
+        "102030",
+        "696969",
+        "789456",
+        "246810",
+        "11223344",
+        "12341234",
+        "112358",
+        "135790",
+        "147896",
+        "314159",
+        "1029384756",
+        # passo constante "no mostrador" (com a volta 9→0)
+        "135791",
+        "975319",
+        "7890123",
+        # bloco repetido (abab, abcabc, abcdabcd, inclusive com a última repetição pela metade)
+        "147147",
+        "987987",
+        "1231231",
+        "1234512345",
+        "583583",
+        # cada dígito repetido em seguida (aabbcc)
+        "998877",
+        "77553311",
+        # palíndromos
+        "123321",
+        "947749",
+        "3816183",
+        # no máximo 2 dígitos distintos
+        "00000001",
+        "100000",
+        "131313",
+        "202020",
+        "939399",
+        # linhas, colunas e diagonais do teclado numérico emendadas (e a coluna 2580)
+        "852456",
+        "159753",
+        "789789",
+        "963852",
+        "741852",
+        "369258",
+        "147369",
+        "456123",
+        "123654789",
+        "258025",
+        "1472583",
+        "2580258",
+        # contagens (números emendados em progressão)
+        "121314",
+        "10203040",
+        "5101520",
+        "9101112",
+        "100200300",
+        "302010",
+    ],
+)
+def test_validate_pin_recusa_padroes_faceis(pin: str) -> None:
+    with pytest.raises(OwlVaultError, match="fácil de adivinhar"):
+        validate_pin(pin)
+
+
+@pytest.mark.parametrize("pin", ["121212", "111222", "000123", "890123", "10111213"])
+def test_validate_pin_padrao_que_tambem_e_data_continua_recusado(pin: str) -> None:
+    """Datas válidas continuam com a mensagem de data, mesmo quando também são padrões."""
+    with pytest.raises(OwlVaultError, match="datas"):
+        validate_pin(pin)
+
+
+@pytest.mark.parametrize("pin", ["947361", "583920", "961473"])
+def test_validate_pin_aceita_os_pins_dos_testes(pin: str) -> None:
+    """Os PINs sintéticos usados por todos os testes continuam válidos com as regras novas."""
+    validate_pin(pin)
 
 
 # --- validate_master_password ------------------------------------------------------------
@@ -397,18 +479,20 @@ def test_create_grava_perfil(store: ProfileStore) -> None:
         session.close()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "BUG: ProfileStore.create grava só perfil.owlp; o .bak só aparece na 2ª gravação, "
-        "então o perfil recém-criado fica sem cópia de segurança"
-    ),
-)
 def test_create_grava_tambem_o_bak(store: ProfileStore) -> None:
+    """Regressão: o perfil recém-criado ficava sem cópia de segurança até a 2ª gravação."""
     _create(store).close()
     assert store.path.exists()
     assert store.bak.exists()
+    assert store.bak.read_bytes() == store.path.read_bytes()
+    assert sorted(p.name for p in store.dir.iterdir()) == ["perfil.owlp", "perfil.owlp.bak"]
+    # só o .bak já basta para abrir, com a SM e com o PIN
+    store.path.unlink()
+    s = store.unlock_with_master(MASTER)
+    assert NOTE_BACKUP_USED in s.notes
+    s.close()
+    store.path.unlink()
+    store.unlock_with_pin(PIN).close()
 
 
 def test_bak_e_a_versao_anterior_apos_cada_gravacao(store: ProfileStore) -> None:
@@ -596,20 +680,46 @@ def test_senha_mestra_zera_contador_no_principal(created: ProfileStore) -> None:
     created.unlock_with_pin(PIN).close()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "BUG: unlock_with_master zera pin_failures só no principal (store.write); o .bak "
-        "recebe a cópia anterior com as falhas e o contador efetivo é o máximo das duas "
-        "cópias, então a senha mestra não devolve as tentativas (4 erros + SM + 1 erro "
-        "desativa o PIN)"
-    ),
-)
 def test_senha_mestra_zera_contador_efetivo(created: ProfileStore) -> None:
+    """Regressão: a SM zerava o contador só no principal; o .bak guardava as falhas."""
     assert [wrong_pin(created) for _ in range(2)] == [4, 3]
     created.unlock_with_master(MASTER).close()
+    assert failures(created) == (0, 0)
     assert wrong_pin(created) == MAX_PIN_FAILURES - 1
+
+
+def test_quatro_erros_senha_mestra_e_mais_um_erro_nao_desativa(created: ProfileStore) -> None:
+    assert [wrong_pin(created) for _ in range(4)] == [4, 3, 2, 1]
+    created.unlock_with_master(MASTER).close()
+    assert failures(created) == (0, 0)
+    assert wrong_pin(created) == MAX_PIN_FAILURES - 1
+    assert created.pin_available()
+    created.unlock_with_pin(PIN).close()
+
+
+@pytest.mark.parametrize("como", ["por_erros", "so_o_pin_apagado"])
+def test_senha_mestra_nao_reativa_pin_desativado_so_no_bak(both: ProfileStore, como: str) -> None:
+    """Principal com o PIN (cópia antiga posta de volta), .bak com o PIN desativado: a SM
+    devolve as tentativas, mas o PIN continua desativado nas DUAS cópias (só set_pin reativa)."""
+    antigo = both.path.read_bytes()  # com o PIN e o contador zerado
+    if como == "por_erros":
+        for _ in range(MAX_PIN_FAILURES):
+            wrong_pin(both)
+    else:
+        edit_copies(both, lambda o: o.__setitem__("pin", None))
+    both.path.write_bytes(antigo)
+    assert read_json(both.path)["pin"] is not None
+    assert read_json(both.bak)["pin"] is None
+    s = both.unlock_with_master(MASTER)
+    assert s.obj["pin"] is None
+    s.close()
+    for p in (both.path, both.bak):
+        obj = read_json(p)
+        assert obj["pin"] is None
+        assert obj["pin_failures"] == 0
+    assert not both.pin_available()
+    with pytest.raises(PinUnavailableError):
+        both.unlock_with_pin(PIN)
 
 
 def test_senha_mestra_e_set_pin_reativam_pin_desativado(created: ProfileStore) -> None:
@@ -649,9 +759,187 @@ def test_restaurar_copia_antiga_nao_desbloqueia_pin(both: ProfileStore) -> None:
     # cópia antiga por cima do PRINCIPAL (o .bak continua bloqueado)
     both.path.write_bytes(antigo)
     both.bak.write_bytes(bloqueado)
+    assert not both.pin_available()  # coerente com o .bak
     with pytest.raises(PinUnavailableError):
         both.unlock_with_pin(PIN)
     assert failures(both) == (0, MAX_PIN_FAILURES)  # recusado antes de gravar qualquer coisa
+
+
+@pytest.mark.parametrize(
+    ("principal", "bak", "disponivel"),
+    [
+        ({}, {}, True),
+        ({}, {"pin": None}, False),  # só o .bak desativou
+        ({"pin": None}, {}, False),
+        ({}, {"pin_failures": MAX_PIN_FAILURES}, False),  # contador esgotado só no .bak
+        ({"pin_failures": MAX_PIN_FAILURES}, {}, False),
+        ({}, {"pin_failures": MAX_PIN_FAILURES - 1}, True),
+        ({"pin_failures": "lixo"}, {}, False),  # contador adulterado conta como esgotado
+        ({}, {"pin_failures": None}, False),
+        ({"pin_failures": -1000}, {"pin_failures": -1000}, True),  # negativo vale 0
+    ],
+    ids=[
+        "ambas_ok",
+        "bak_sem_pin",
+        "principal_sem_pin",
+        "bak_esgotado",
+        "principal_esgotado",
+        "bak_quase",
+        "contador_lixo",
+        "contador_nulo",
+        "contador_negativo",
+    ],
+)
+def test_pin_available_coerente_com_o_bak(
+    both: ProfileStore, principal: dict[str, Any], bak: dict[str, Any], disponivel: bool
+) -> None:
+    for path, mudanca in ((both.path, principal), (both.bak, bak)):
+        write_json(path, {**read_json(path), **mudanca})
+    assert both.pin_available() is disponivel
+    if disponivel:
+        both.unlock_with_pin(PIN).close()
+    else:
+        with pytest.raises(PinUnavailableError) as ei:
+            both.unlock_with_pin(PIN)
+        assert type(ei.value) is PinUnavailableError
+
+
+def test_contador_negativo_nao_da_tentativas_extras(both: ProfileStore) -> None:
+    edit_copies(both, lambda o: o.__setitem__("pin_failures", -1000))
+    assert wrong_pin(both) == MAX_PIN_FAILURES - 1
+    assert failures(both) == (1, 1)
+
+
+# --- sessão aberta: save() relê o disco ----------------------------------------------------
+
+
+def test_sessao_antiga_nao_reativa_pin_desativado(both: ProfileStore) -> None:
+    """Sessão aberta + PIN errado 5 vezes no pedido de confirmação ⇒ o save() seguinte da
+    sessão (estado antigo em memória: PIN ativo, contador 0) não reativa o PIN."""
+    s = both.unlock_with_master(MASTER)
+    add_folder(s)
+    for _ in range(MAX_PIN_FAILURES):
+        wrong_pin(both)
+    assert not both.pin_available()
+    s.save()
+    assert s.obj["pin"] is None
+    s.save()  # de novo: o .bak (versão anterior) também fica desativado
+    s.close()
+    for p in (both.path, both.bak):
+        obj = read_json(p)
+        assert obj["pin"] is None
+        assert obj["pin_failures"] == MAX_PIN_FAILURES
+    assert not both.pin_available()
+    with pytest.raises(PinUnavailableError):
+        both.unlock_with_pin(PIN)
+
+
+def test_sessao_antiga_nao_zera_o_contador(both: ProfileStore) -> None:
+    s = both.unlock_with_pin(PIN)
+    assert [wrong_pin(both) for _ in range(2)] == [4, 3]
+    s.save()
+    s.close()
+    assert failures(both) == (2, 2)
+    assert wrong_pin(both) == 2
+
+
+def test_save_usa_o_maximo_entre_memoria_e_disco(both: ProfileStore) -> None:
+    antigo = both.path.read_bytes()  # contador 0
+    s = both.unlock_with_master(MASTER)
+    assert [wrong_pin(both) for _ in range(3)] == [4, 3, 2]
+    s.save()
+    assert s.obj["pin_failures"] == 3
+    # alguém põe cópias antigas (contador 0) nas duas: a memória ainda lembra das 3 falhas
+    both.path.write_bytes(antigo)
+    both.bak.write_bytes(antigo)
+    s.save()
+    s.close()
+    assert read_json(both.path)["pin_failures"] == 3
+    assert wrong_pin(both) == 1
+
+
+def test_save_com_contador_so_no_bak(both: ProfileStore) -> None:
+    s = both.unlock_with_master(MASTER)
+    edit_copies(both, lambda o: o.__setitem__("pin_failures", 3))
+    write_json(both.path, {**read_json(both.path), "pin_failures": 0})
+    s.save()
+    s.close()
+    assert read_json(both.path)["pin_failures"] == 3
+    assert wrong_pin(both) == 1
+
+
+def test_desbloqueio_bem_sucedido_zera_de_proposito(both: ProfileStore) -> None:
+    s = both.unlock_with_master(MASTER)
+    assert [wrong_pin(both) for _ in range(2)] == [4, 3]
+    both.unlock_with_pin(PIN).close()  # outra confirmação, agora certa: zera
+    assert failures(both) == (0, 0)
+    s.save()
+    s.close()
+    assert failures(both) == (0, 0)
+    assert wrong_pin(both) == MAX_PIN_FAILURES - 1
+
+
+def test_set_pin_explicito_reativa_mesmo_com_o_disco_desativado(both: ProfileStore) -> None:
+    s = both.unlock_with_master(MASTER)
+    for _ in range(MAX_PIN_FAILURES):
+        wrong_pin(both)
+    s.set_pin(NEW_PIN)
+    s.save()  # depois do set_pin, o save() não desfaz nada
+    s.close()
+    assert failures(both) == (0, 0)
+    assert both.pin_available()
+    both.unlock_with_pin(NEW_PIN).close()
+
+
+def test_sessao_antiga_nao_desfaz_pin_trocado_por_outra_sessao(both: ProfileStore) -> None:
+    s1 = both.unlock_with_master(MASTER)
+    s2 = both.unlock_with_master(MASTER)
+    s2.set_pin(NEW_PIN)
+    s2.close()
+    s1.save()
+    s1.close()
+    with pytest.raises(PinError):
+        both.unlock_with_pin(PIN)
+    both.unlock_with_pin(NEW_PIN).close()
+
+
+def test_sessao_antiga_com_pin_desativado_nao_apaga_pin_novo(both: ProfileStore) -> None:
+    for _ in range(MAX_PIN_FAILURES):
+        wrong_pin(both)
+    s1 = both.unlock_with_master(MASTER)
+    assert s1.obj["pin"] is None
+    s2 = both.unlock_with_master(MASTER)
+    s2.set_pin(NEW_PIN)
+    s2.close()
+    s1.save()
+    s1.close()
+    assert both.pin_available()
+    both.unlock_with_pin(NEW_PIN).close()
+
+
+def test_save_mantem_a_geracao_crescente(both: ProfileStore) -> None:
+    s1 = both.unlock_with_master(MASTER)
+    s2 = both.unlock_with_master(MASTER)
+    for _ in range(3):
+        s2.save()
+    g = read_json(both.path)["generation"]
+    s2.close()
+    s1.save()
+    s1.close()
+    assert read_json(both.path)["generation"] == g + 1
+    assert read_json(both.bak)["generation"] == g
+
+
+def test_save_preserva_o_indice_da_sessao(both: ProfileStore) -> None:
+    """A mescla só mexe no PIN/contador: o índice gravado é o da memória da sessão."""
+    s = both.unlock_with_master(MASTER)
+    rec = add_folder(s)
+    wrong_pin(both)
+    s.save()
+    s.close()
+    s2 = both.unlock_with_master(MASTER)
+    assert s2.index.folder(rec.id) is not None
+    s2.close()
 
 
 # --- DPAPI --------------------------------------------------------------------------------
@@ -727,22 +1015,53 @@ def test_dpapi_blob_corrompido_e_tratado(
     both.unlock_with_pin(NEW_PIN).close()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=ValueError,
-    reason=(
-        "BUG: unlock_with_pin faz bytes.fromhex(pin['blob']) fora do try; um blob com "
-        "caractere não hexadecimal (perfil danificado) vaza ValueError cru em vez de "
-        "PinUnavailableError/DpapiUnavailableError"
-    ),
-)
 def test_dpapi_blob_nao_hex_e_tratado(both: ProfileStore) -> None:
+    """Regressão: um blob com caractere não hexadecimal vazava ValueError cru."""
+
     def fn(obj: dict[str, Any]) -> None:
         obj["pin"]["blob"] = "zz" + obj["pin"]["blob"][2:]
 
     edit_copies(both, fn)
-    with pytest.raises(PinUnavailableError):
+    with pytest.raises(DpapiUnavailableError, match="senha mestra"):
         both.unlock_with_pin(PIN)
+    assert failures(both) == (0, 0)  # não conta como PIN errado
+    s = both.unlock_with_master(MASTER)
+    s.set_pin(NEW_PIN)  # recuperação: SM + PIN novo
+    s.close()
+    both.unlock_with_pin(NEW_PIN).close()
+
+
+DANOS_CAIXA_PIN: dict[str, Callable[[dict[str, Any]], None]] = {
+    "blob_ausente": lambda p: p.pop("blob"),
+    "blob_numero": lambda p: p.__setitem__("blob", 12345),
+    "salt_nao_hex": lambda p: p.__setitem__("salt", "zz" + p["salt"][2:]),
+    "salt_curto": lambda p: p.__setitem__("salt", p["salt"][:8]),
+    "params_ausentes": lambda p: p.pop("memory_kib"),
+    "params_lixo": lambda p: p.__setitem__("iterations", "muitas"),
+    "params_fora_da_politica": lambda p: p.__setitem__("memory_kib", 1),
+}
+
+
+@pytest.mark.parametrize("danificar", list(DANOS_CAIXA_PIN.values()), ids=list(DANOS_CAIXA_PIN))
+def test_caixa_do_pin_danificada_e_tratada(
+    both: ProfileStore, danificar: Callable[[dict[str, Any]], None]
+) -> None:
+    edit_copies(both, lambda o: danificar(o["pin"]))
+    with pytest.raises(DpapiUnavailableError, match="senha mestra"):
+        both.unlock_with_pin(PIN)
+    assert failures(both) == (0, 0)
+    s = both.unlock_with_master(MASTER)
+    s.set_pin(NEW_PIN)
+    s.close()
+    both.unlock_with_pin(NEW_PIN).close()
+
+
+@pytest.mark.parametrize("valor", ["um texto", 42, ["lista"]], ids=["texto", "numero", "lista"])
+def test_campo_pin_que_nao_e_objeto_e_tratado(both: ProfileStore, valor: object) -> None:
+    edit_copies(both, lambda o: o.__setitem__("pin", valor))
+    with pytest.raises(DpapiUnavailableError):
+        both.unlock_with_pin(PIN)
+    assert failures(both) == (0, 0)
 
 
 # --- índice cifrado -------------------------------------------------------------------------
@@ -834,23 +1153,111 @@ def test_indice_corrompido_e_regravado_pela_senha_mestra(
 
 
 @pytest.mark.parametrize("pin", [PIN, WRONG_PIN], ids=["pin_certo", "pin_errado"])
-@pytest.mark.xfail(
-    strict=True,
-    raises=AuthenticationError,
-    reason=(
-        "BUG: unlock_with_pin grava o objeto do PRINCIPAL inteiro nas duas cópias "
-        "(write_both) antes de carregar o índice; com o índice do principal corrompido, o "
-        ".bak bom é sobrescrito e o próximo desbloqueio falha ('índice corrompido' nas duas "
-        "cópias: lista de pastas, estados e KEKs perdidos)"
-    ),
-)
 def test_pin_com_indice_do_principal_corrompido_preserva_o_bak(
     com_pasta: tuple[ProfileStore, str], pin: str
 ) -> None:
+    """Regressão: o PIN gravava o principal inteiro (índice danificado) nas duas cópias."""
     store, rid = com_pasta
     edit_copies(store, lambda o: corrupt_box(o, "index"), bak=False)
     with contextlib.suppress(PinError):
         store.unlock_with_pin(pin).close()
+    s = store.unlock_with_master(MASTER)
+    assert s.index.folder(rid) is not None
+    s.close()
+
+
+def test_pin_errado_grava_o_contador_sem_trocar_o_indice_de_cada_copia(
+    com_pasta: tuple[ProfileStore, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, rid = com_pasta
+    edit_copies(store, lambda o: corrupt_box(o, "index"), bak=False)
+    indice_principal = read_json(store.path)["index"]
+    indice_bak = read_json(store.bak)["index"]
+    assert indice_principal != indice_bak
+    vistos: list[tuple[Any, Any, tuple[int, int]]] = []
+    real = profile_mod.derive_kek
+
+    def espiao(*args: Any, **kwargs: Any) -> bytes:
+        vistos.append(
+            (read_json(store.path)["index"], read_json(store.bak)["index"], failures(store))
+        )
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(profile_mod, "derive_kek", espiao)
+    assert wrong_pin(store) == MAX_PIN_FAILURES - 1
+    # na hora de derivar, o contador já está nas duas cópias e cada uma tem o próprio índice
+    assert vistos == [(indice_principal, indice_bak, (1, 1))]
+    assert read_json(store.path)["index"] == indice_principal
+    assert read_json(store.bak)["index"] == indice_bak
+    monkeypatch.setattr(profile_mod, "derive_kek", real)
+    s = store.unlock_with_pin(PIN)
+    assert s.index.folder(rid) is not None
+    s.close()
+
+
+def test_pin_certo_com_indice_corrompido_regrava_o_indice_nas_duas_copias(
+    com_pasta: tuple[ProfileStore, str],
+) -> None:
+    """Depois de usar o .bak, o índice bom (em memória) é re-selado nas DUAS cópias na hora,
+    sem depender de um save() posterior."""
+    store, rid = com_pasta
+    edit_copies(store, lambda o: corrupt_box(o, "index"), bak=False)
+    s = store.unlock_with_pin(PIN)
+    assert NOTE_BACKUP_USED in s.notes
+    assert s.used_backup
+    s.close()  # nenhum save()
+    assert failures(store) == (0, 0)
+    assert store.path.read_bytes() == store.bak.read_bytes()
+    # 2ª abertura com o PIN: sem aviso, a pasta continua lá
+    s2 = store.unlock_with_pin(PIN)
+    assert s2.notes == []
+    assert s2.index.folder(rid) is not None
+    s2.close()
+    # o principal sozinho também abre (o índice dele foi consertado)
+    store.bak.write_bytes(b"\x00" * 64)
+    s3 = store.unlock_with_master(MASTER)
+    assert s3.notes == []
+    assert s3.index.folder(rid) is not None
+    s3.close()
+
+
+def test_pin_com_principal_ilegivel_conta_no_bak_sem_apagar_o_principal(
+    com_pasta: tuple[ProfileStore, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Principal ilegível: a tentativa é contada no .bak (a cópia que vale) antes de derivar,
+    e o principal danificado só é substituído por um desbloqueio bem-sucedido."""
+    store, rid = com_pasta
+    _estragar_principal(store, "zeros")
+    danificado = store.path.read_bytes()
+    vistos: list[tuple[int, bytes]] = []
+    real = profile_mod.derive_kek
+
+    def espiao(*args: Any, **kwargs: Any) -> bytes:
+        vistos.append((read_json(store.bak)["pin_failures"], store.path.read_bytes()))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(profile_mod, "derive_kek", espiao)
+    assert wrong_pin(store) == MAX_PIN_FAILURES - 1
+    assert vistos == [(1, danificado)]
+    assert wrong_pin(store) == MAX_PIN_FAILURES - 2
+    assert store.path.read_bytes() == danificado
+    monkeypatch.setattr(profile_mod, "derive_kek", real)
+    s = store.unlock_with_pin(PIN)
+    assert s.index.folder(rid) is not None
+    assert NOTE_BACKUP_USED in s.notes
+    s.close()
+    assert failures(store) == (0, 0)
+
+
+def test_gravar_nao_troca_um_bak_bom_por_um_principal_ilegivel(
+    com_pasta: tuple[ProfileStore, str],
+) -> None:
+    store, rid = com_pasta
+    bom = store.bak.read_bytes()
+    store.path.write_bytes(b"\x00" * 4096)
+    store.write(read_json(store.bak))
+    assert store.bak.read_bytes() == bom  # o lixo do principal não foi para o .bak
+    read_json(store.path)
     s = store.unlock_with_master(MASTER)
     assert s.index.folder(rid) is not None
     s.close()
@@ -904,41 +1311,104 @@ def test_principal_ilegivel_usa_o_bak(
     store.unlock_with_master(MASTER).close()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "BUG: com o principal ilegível (não-JSON, kind/versão errados) read_raw devolve o "
-        ".bak sem nenhum aviso em session.notes (PASTAS_PROTEGIDAS §2: '.bak ... com aviso')"
-    ),
-)
 @pytest.mark.parametrize("modo", ["master", "pin"])
+@pytest.mark.parametrize("como", ESTRAGOS)
 def test_principal_ilegivel_avisa_que_usou_o_bak(
-    com_pasta: tuple[ProfileStore, str], modo: str
+    com_pasta: tuple[ProfileStore, str], como: str, modo: str
 ) -> None:
+    """Regressão: com o principal ilegível o .bak era usado sem nenhum aviso (§2)."""
     store, _rid = com_pasta
-    _estragar_principal(store, "zeros")
+    _estragar_principal(store, como)
+    store.read_raw()
+    assert store.last_read_used_backup
     s = unlock(store, modo)
     notes = list(s.notes)
+    assert s.used_backup
     s.close()
-    assert notes
+    assert notes == [NOTE_BACKUP_USED]
+    # consertado: a próxima abertura não avisa mais
+    store.read_raw()
+    assert not store.last_read_used_backup
+    s2 = unlock(store, modo)
+    assert s2.notes == []
+    s2.close()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AuthenticationError,
-    reason=(
-        "BUG: com o wrap_sm do principal corrompido, unlock_with_master responde 'Senha mestra "
-        "incorreta.' sem tentar o wrap_sm do .bak (que está bom); §2: '.bak só se o principal "
-        "não autenticar'"
-    ),
-)
 def test_wrap_sm_do_principal_corrompido_usa_o_bak(com_pasta: tuple[ProfileStore, str]) -> None:
+    """Regressão: a SM era recusada sem tentar o wrap_sm do .bak (que estava bom)."""
     store, rid = com_pasta
     edit_copies(store, lambda o: corrupt_box(o, "wrap_sm"), bak=False)
     s = store.unlock_with_master(MASTER)
     assert s.index.folder(rid) is not None
+    assert NOTE_BACKUP_USED in s.notes
     s.close()
+    # o principal foi consertado: abre sozinho
+    store.bak.write_bytes(b"\x00" * 64)
+    s2 = store.unlock_with_master(MASTER)
+    assert s2.notes == []
+    s2.close()
+
+
+def test_senha_errada_com_wrap_sm_do_principal_corrompido(
+    com_pasta: tuple[ProfileStore, str],
+) -> None:
+    store, _rid = com_pasta
+    edit_copies(store, lambda o: corrupt_box(o, "wrap_sm"), bak=False)
+    antes = (store.path.read_bytes(), store.bak.read_bytes())
+    with pytest.raises(AuthenticationError, match="Senha mestra incorreta"):
+        store.unlock_with_master(WRONG_MASTER)
+    assert (store.path.read_bytes(), store.bak.read_bytes()) == antes
+
+
+def test_kdf_do_principal_corrompido_usa_o_bak(com_pasta: tuple[ProfileStore, str]) -> None:
+    store, rid = com_pasta
+
+    def estraga(o: dict[str, Any]) -> None:
+        o["kdf"]["salt"] = flip_hex(o["kdf"]["salt"])
+
+    edit_copies(store, estraga, bak=False)
+    s = store.unlock_with_master(MASTER)
+    assert s.index.folder(rid) is not None
+    assert NOTE_BACKUP_USED in s.notes
+    s.close()
+    assert read_json(store.path)["kdf"] == read_json(store.bak)["kdf"]
+    store.bak.unlink()
+    store.unlock_with_master(MASTER).close()
+
+
+def test_wrap_sm_do_principal_corrompido_nao_se_espalha_pelo_pin(
+    com_pasta: tuple[ProfileStore, str],
+) -> None:
+    """Regressão: o desbloqueio por PIN copiava o wrap_sm ruim do principal para o .bak e a
+    senha mestra deixava de abrir o perfil."""
+    store, rid = com_pasta
+    edit_copies(store, lambda o: corrupt_box(o, "wrap_sm"), bak=False)
+    s0 = store.unlock_with_pin(PIN)
+    assert NOTE_BACKUP_USED in s0.notes
+    s0.close()
+    # cada cópia, sozinha, abre com a senha mestra
+    for apagar in (store.path, store.bak):
+        guardada = apagar.read_bytes()
+        apagar.write_bytes(b"\x00" * 64)
+        s = store.unlock_with_master(MASTER)
+        assert s.index.folder(rid) is not None
+        s.close()
+        apagar.write_bytes(guardada)
+
+
+def test_wrap_sm_corrompido_nas_duas_copias_e_refeito_pelo_pin(
+    com_pasta: tuple[ProfileStore, str],
+) -> None:
+    store, rid = com_pasta
+    edit_copies(store, lambda o: corrupt_box(o, "wrap_sm"))
+    with pytest.raises(AuthenticationError, match="Senha mestra incorreta"):
+        store.unlock_with_master(MASTER)
+    s = store.unlock_with_pin(PIN)  # o PIN abre a PK; o índice tem a KEK da SM
+    assert s.notes == [profile_mod.NOTE_MASTER_REBUILT]
+    s.close()
+    s2 = store.unlock_with_master(MASTER)
+    assert s2.index.folder(rid) is not None
+    s2.close()
 
 
 @pytest.mark.parametrize("como", ["zeros", "json_truncado", "versao_futura", "ausente"])
@@ -947,13 +1417,13 @@ def test_duas_copias_ilegiveis_da_erro(com_pasta: tuple[ProfileStore, str], como
     _estragar_principal(store, como)
     store.bak.write_bytes(b"\x00" * 64)
     antes = store.bak.read_bytes()
-    with pytest.raises(FormatError):
+    with pytest.raises(ProfileCorruptError):
         store.unlock_with_master(MASTER)
-    with pytest.raises(FormatError):
+    with pytest.raises(ProfileCorruptError):
         store.unlock_with_pin(PIN)
-    with pytest.raises(FormatError):
+    with pytest.raises(ProfileCorruptError):
         store.practice_due()
-    with pytest.raises(FormatError):
+    with pytest.raises(ProfileCorruptError):
         store.pin_available()
     assert store.bak.read_bytes() == antes
 
@@ -962,11 +1432,27 @@ def test_duas_copias_ilegiveis_da_erro(com_pasta: tuple[ProfileStore, str], como
 def test_indice_corrompido_nas_duas_copias_da_erro(
     com_pasta: tuple[ProfileStore, str], modo: str
 ) -> None:
+    """Índice que não autentica em nenhuma cópia com a PK certa ⇒ perfil danificado, nunca
+    "Senha mestra incorreta"; as cópias danificadas não são reescritas (só o contador)."""
     store, _rid = com_pasta
     edit_copies(store, lambda o: corrupt_box(o, "index"))
-    with pytest.raises(AuthenticationError) as ei:
+    indices = (read_json(store.path)["index"], read_json(store.bak)["index"])
+    with pytest.raises(ProfileCorruptError, match="danificado") as ei:
         unlock(store, modo)
-    assert not isinstance(ei.value, PinError)
+    assert isinstance(ei.value, FormatError)
+    assert not isinstance(ei.value, AuthenticationError)
+    assert "incorreta" not in str(ei.value)
+    assert (read_json(store.path)["index"], read_json(store.bak)["index"]) == indices
+    assert failures(store) == (0, 0)  # o PIN estava certo: a tentativa não conta
+
+
+def test_cabecalho_ilegivel_nas_duas_copias_e_perfil_danificado(
+    com_pasta: tuple[ProfileStore, str],
+) -> None:
+    store, _rid = com_pasta
+    edit_copies(store, lambda o: o.pop("kdf"))
+    with pytest.raises(ProfileCorruptError):
+        store.unlock_with_master(MASTER)
 
 
 def test_wrap_sm_corrompido_nas_duas_copias_da_erro(com_pasta: tuple[ProfileStore, str]) -> None:

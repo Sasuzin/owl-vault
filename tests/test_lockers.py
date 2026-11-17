@@ -8,8 +8,10 @@ perfil real (%LOCALAPPDATA%\\Owl Vault) nem pastas do usuário.
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import os
 from collections.abc import Callable, Iterator
+from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -17,36 +19,50 @@ from typing import Any
 import pytest
 
 from owl_vault.application import lockers
+from owl_vault.application import profile as profile_mod
 from owl_vault.application.common import read_zone_id
 from owl_vault.application.lockers import (
     ABERTA,
     ABERTURA_INCOMPLETA,
     ABRINDO,
     APAGANDO,
+    DESCARTANDO,
     DESKTOP_INI,
     FILE_ATTRIBUTE_NOT_CONTENT_INDEXED,
     HELP_NAME,
     ICON_NAME,
     MANTIDO,
+    RESTAURANDO,
     SHORTCUT_NAME,
     TRANCADA,
     TRANCANDO,
     VAULT_DIR,
+    FolderMovedError,
+    FolderUnavailableError,
     LockerManager,
     LockOutcome,
 )
-from owl_vault.application.profile import FolderRecord, ProfileSession, ProfileStore
+from owl_vault.application.profile import (
+    KEK_RECUPERADA,
+    KEK_TROCADA,
+    FolderRecord,
+    ProfileSession,
+    ProfileStore,
+)
 from owl_vault.application.progress import CancelToken, NullProgress, ProgressSink
 from owl_vault.application.protection import ProtectedPaths
-from owl_vault.application.restore import MARKER_NAME
+from owl_vault.application.restore import MARKER_NAME, RESTORE_LOCK_NAME
 from owl_vault.crypto.kdf import TESTING_PARAMS, TESTING_POLICY
 from owl_vault.domain.errors import (
     AuthenticationError,
     CancelledError,
+    InsufficientSpaceError,
+    OwlVaultError,
     PreflightError,
     StateError,
+    UnsafePathError,
 )
-from owl_vault.storage import faults, shell, winfs
+from owl_vault.storage import acl, faults, shell, winfs
 from tests.conftest import tree_digest, write_tree
 
 SM = "senha mestra sintética 2026"
@@ -249,9 +265,13 @@ def test_atalho_abrir_com_owl_vault(env: Env) -> None:
     data = lnk.read_bytes()
     assert data[:4] == b"\x4c\x00\x00\x00"  # cabeçalho de um .lnk
     assert f"--abrir {rec.id}".encode("utf-16-le") in data
-    assert ICON_NAME.encode("utf-16-le") in data
     low = data.lower()
     assert b"notepad.exe" in low or "notepad.exe".encode("utf-16-le") in low
+    # o ícone é o do próprio programa: o atalho não leva o caminho da pasta nem das mães
+    assert ICON_NAME.encode("utf-16-le") not in data
+    for text in (str(p), p.name, env.base.name):
+        assert text.encode("utf-16-le") not in data and text.encode("mbcs") not in data
+    assert shell.shortcut_matches(str(lnk), LAUNCHER[0], f"--abrir {rec.id}")
     assert not attrs(lnk) & HIDDEN  # o atalho fica visível
 
     out = mgr.unlock(rec.id)
@@ -555,11 +575,6 @@ def test_trancar_pasta_aberta_com_arquivo_em_uso_recusa(env: Env) -> None:
     assert env.mgr.lock(rec.id).complete
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: lock() cria a área temporária <pai>\\.owlvault-<id> ANTES da pré-verificação "
-    "e não a remove quando ela falha; protect() tira a pasta da lista e a área fica órfã.",
-)
 def test_arquivo_aberto_entre_conferir_e_proteger(env: Env) -> None:
     p = make_folder(env.base)
     before = tree_digest(p)
@@ -583,11 +598,6 @@ def test_cancelar_durante_a_cifragem_nao_apaga_nada(env: Env) -> None:
     assert env.reopen().folders == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: protect() cancelado/que falha em create_vault tira a pasta da lista, mas a "
-    "área temporária <pai>\\.owlvault-<id> (com a pasta do teste de restauração) fica órfã.",
-)
 def test_cancelar_durante_a_cifragem_nao_deixa_area_temporaria(env: Env) -> None:
     p = make_folder(env.base)
     cancel = CancelToken()
@@ -692,15 +702,11 @@ def test_queda_durante_a_exclusao(env: Env, monkeypatch: pytest.MonkeyPatch, res
     assert tree_digest(p) == before
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: queda entre mover o cofre novo para P\\.owlvault e gravar 'trancada' (espaço "
-    "reservado, regra de ouro) deixa o índice em 'apagando' apontando para o cofre na área "
-    "temporária: 'Continuar trancando' e 'Desfazer' falham para sempre.",
-)
 def test_queda_depois_de_mover_o_cofre_para_a_pasta(
     env: Env, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Logo depois do rename para P\\.owlvault o índice já diz 'trancada' (gravado ANTES do
+    espaço reservado); o espaço reservado é refeito ao iniciar."""
     p = make_folder(env.base)
     before = tree_digest(p)
     with monkeypatch.context() as m:
@@ -710,15 +716,129 @@ def test_queda_depois_de_mover_o_cofre_para_a_pasta(
 
     mgr = env.reopen()
     [rec] = mgr.folders
-    assert rec.state == APAGANDO
+    assert rec.state == TRANCADA
     assert os.listdir(p) == [VAULT_DIR]  # originais apagados, cofre já dentro de P
-    mgr.reconcile_on_start()
+    current = rec.vault("atual")
+    assert current is not None and roles(rec) == ["atual"]
+    assert winfs.strip_extended(current.location) == str(p / VAULT_DIR)
+    with pytest.raises(StateError):
+        mgr.continue_lock(rec.id)  # não há mais nada interrompido
 
-    out = mgr.continue_lock(rec.id)
+    assert mgr.reconcile_on_start() == []
 
-    assert out.complete and rec.state == TRANCADA
+    assert set(os.listdir(p)) == PLACEHOLDER_NAMES  # espaço reservado refeito
+    assert mgr.view(rec).issue == ""
     assert mgr.unlock(rec.id).complete
     assert tree_digest(p) == before
+
+
+@pytest.mark.parametrize("resolve", ["continuar", "desfazer", "iniciar"])
+def test_perfil_preso_com_o_cofre_ja_dentro_da_pasta(
+    env: Env, monkeypatch: pytest.MonkeyPatch, resolve: str
+) -> None:
+    """Perfis já presos (versão anterior): 'apagando' com o 'novo' inexistente e P\\.owlvault com
+    o mesmo vault_id ⇒ o trancamento é concluído (Continuar, Desfazer ou ao iniciar)."""
+    p = make_folder(env.base)
+    before = tree_digest(p)
+    real = winfs.rename_dir
+    fired: list[str] = []
+
+    def rename_then_crash(path: str, target: str) -> None:
+        real(path, target)
+        if not fired:
+            fired.append(target)
+            raise Crash  # o processo morre logo depois de mover o cofre para P
+
+    with monkeypatch.context() as m:
+        m.setattr(winfs, "rename_dir", rename_then_crash)
+        with pytest.raises(Crash):
+            protect(env.mgr, p)
+
+    mgr = env.reopen()
+    [rec] = mgr.folders
+    novo = rec.vault("novo")
+    assert rec.state == APAGANDO and novo is not None
+    assert not os.path.lexists(novo.location)
+    assert os.listdir(p) == [VAULT_DIR]
+
+    if resolve == "continuar":
+        out = mgr.continue_lock(rec.id)
+        assert out.complete and rec.state == TRANCADA
+        assert set(os.listdir(p)) == PLACEHOLDER_NAMES
+        assert mgr.unlock(rec.id).complete
+    elif resolve == "desfazer":
+        res = mgr.undo_lock(rec.id)
+        assert res.complete and rec.state == ABERTA
+    else:
+        notes = mgr.reconcile_on_start()
+        assert len(notes) == 1 and "concluído" in notes[0]
+        assert rec.state == TRANCADA and roles(rec) == ["atual"]
+        assert set(os.listdir(p)) == PLACEHOLDER_NAMES
+        again = env.reopen().session.index.folder(rec.id)
+        assert again is not None and again.state == TRANCADA
+        assert mgr.unlock(rec.id).complete
+    assert tree_digest(p) == before
+
+
+def test_espaco_reservado_que_falha_nao_impede_trancar(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = make_folder(env.base)
+    before = tree_digest(p)
+
+    def fail(*_a: object, **_k: object) -> None:
+        raise OSError(5, "acesso negado (simulado)")
+
+    with monkeypatch.context() as m:
+        m.setattr(LockerManager, "_write_placeholder", fail)
+        out = protect(env.mgr, p)
+    rec = out.record
+
+    assert out.complete and rec.state == TRANCADA
+    assert os.listdir(p) == [VAULT_DIR]
+    assert "tenta de novo" in rec.attention
+    assert env.reopen().session.index.folder(rec.id) is not None
+    assert env.mgr.repair_placeholders(rec.id) == []
+    assert set(os.listdir(p)) == PLACEHOLDER_NAMES
+    assert env.mgr.unlock(rec.id).complete
+    assert tree_digest(p) == before
+
+
+def test_regra_de_ouro_que_falha_no_meio_e_retomada_ao_iniciar(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = make_folder(env.base)
+    rec = protect(env.mgr, p).record
+    env.mgr.unlock(rec.id)
+    prev = rec.vault("anterior")
+    assert prev is not None
+    expected = tree_digest(p)
+    real = LockerManager._remove_vault_tree
+    calls: list[str] = []
+
+    def fail_once(self: LockerManager, vault_dir: str, r: FolderRecord) -> None:
+        calls.append(vault_dir)
+        if len(calls) == 1:
+            raise PermissionError(32, "arquivo em uso (simulado)", vault_dir)
+        real(self, vault_dir, r)
+
+    with monkeypatch.context() as m:
+        m.setattr(LockerManager, "_remove_vault_tree", fail_once)
+        out = env.mgr.lock(rec.id)
+        assert out.complete and rec.state == TRANCADA and not out.kept_previous
+        assert roles(rec) == sorted(["atual", DESCARTANDO])
+        assert os.path.isdir(prev.location)  # nada apagado ainda
+        assert set(os.listdir(p)) == PLACEHOLDER_NAMES
+
+    mgr = env.reopen()
+    r = mgr.session.index.folder(rec.id)
+    assert r is not None and sorted(v.role for v in r.vaults) == sorted(["atual", DESCARTANDO])
+    assert mgr.reconcile_on_start() == []
+    assert sorted(v.role for v in r.vaults) == ["atual"]
+    assert not os.path.lexists(prev.location)
+    assert staging_dirs(env.base) == []
+    assert mgr.unlock(r.id).complete
+    assert tree_digest(p) == expected
 
 
 def test_queda_em_trancando_descarta_cofre_novo(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -813,7 +933,8 @@ def test_queda_no_meio_da_restauracao(env: Env) -> None:
 
     mgr = env.reopen()
     r = mgr.session.index.folder(rec.id)
-    assert r is not None and r.state == ABRINDO
+    assert r is not None and r.state == RESTAURANDO  # a fase foi gravada antes de restaurar
+    assert mgr.view(r).issue == ABRINDO
     out = mgr.unlock(r.id)
 
     assert out.complete and r.state == ABERTA
@@ -840,7 +961,7 @@ def test_restauracao_concluida_sem_gravar_o_estado(
 
     mgr = env.reopen()
     r = mgr.session.index.folder(rec.id)
-    assert r is not None and r.state == ABRINDO
+    assert r is not None and r.state == RESTAURANDO
     assert tree_digest(p) == before  # P cheio, sem marcador
     out = mgr.unlock(r.id)
 
@@ -1044,26 +1165,36 @@ def test_pasta_movida_relocate_e_forget(env: Env) -> None:
     assert env.reopen().session.index.folder(rb.id) is None
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: view() decide 'indisponível' procurando 'unidade' no texto do erro, que inclui "
-    "o nome/caminho da pasta; uma pasta movida cujo nome contém 'unidade' some do 'Procurar'.",
-)
 def test_pasta_movida_com_unidade_no_nome(env: Env) -> None:
     p = make_folder(env.base, "Backup da unidade", SMALL)
     rec = protect(env.mgr, p).record
     os.rename(p, env.base / "Outro nome")
     view = env.mgr.view(rec)
     assert (view.issue, view.action, view.available) == ("nao_encontrada", "resolver", True)
+    with pytest.raises(FolderMovedError):
+        env.mgr.unlock(rec.id)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: relocate() exige o cofre 'atual' dentro da pasta; uma pasta ABERTA renomeada "
-    "(mesmo FileId) nunca pode ser reencontrada e o cofre 'anterior' fica órfão.",
-)
+def test_indisponivel_decidido_pelo_tipo_do_erro(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
+    p = make_folder(env.base, "Pasta movida para outro lugar", SMALL)
+    rec = protect(env.mgr, p).record
+
+    def no_drive(path: str) -> winfs.Resolved:
+        raise UnsafePathError("caminho inexistente e sem pasta existente acima")
+
+    with monkeypatch.context() as m:
+        m.setattr(winfs, "resolve", no_drive)
+        view = env.mgr.view(rec)
+        with pytest.raises(FolderUnavailableError):
+            env.mgr.unlock(rec.id)
+    assert (view.issue, view.action, view.available) == ("indisponivel", "", False)
+    assert issubclass(FolderUnavailableError, StateError)
+    assert issubclass(FolderMovedError, StateError)
+
+
 def test_pasta_aberta_renomeada_pode_ser_reencontrada(env: Env) -> None:
     p = make_folder(env.base, spec=SMALL)
+    before = tree_digest(p)
     rec = protect(env.mgr, p).record
     env.mgr.unlock(rec.id)
     p2 = env.base / "Particular renomeada"
@@ -1071,6 +1202,15 @@ def test_pasta_aberta_renomeada_pode_ser_reencontrada(env: Env) -> None:
     assert env.mgr.view(rec).issue == "nao_encontrada"
     env.mgr.relocate(rec.id, str(p2))
     assert env.mgr.view(rec).issue == ""
+    assert rec.name == "Particular renomeada"
+    prev = rec.vault("anterior")
+    assert prev is not None and os.path.isdir(prev.location)
+    # o ciclo continua: trancar apaga o anterior (coberto) e abrir devolve tudo
+    assert env.mgr.lock(rec.id).complete
+    assert roles(rec) == ["atual"] and not os.path.lexists(prev.location)
+    assert staging_dirs(env.base) == []
+    assert env.mgr.unlock(rec.id).complete
+    assert tree_digest(p2) == before
 
 
 # --- recuperar ---------------------------------------------------------------------------
@@ -1103,7 +1243,10 @@ def test_recuperar_em_perfil_novo(env: Env) -> None:
     assert current is not None and original is not None
     assert current.vault_id == original.vault_id
     assert len(s2.index.keks) == 2
-    assert m2.view(r2).issue == "senha_antiga"
+    assert s2.index.keks[1].origin == KEK_RECUPERADA
+    # recuperar NÃO é "criar senha mestra nova": nenhum aviso falso
+    assert m2.view(r2).issue == ""
+    assert s2.store.unlock_with_master(SM_OUTRA).index.keks[1].origin == KEK_RECUPERADA
     with pytest.raises(StateError, match="já está na lista"):
         m2.recover(found[0], SM)
     assert set(os.listdir(p)) == PLACEHOLDER_NAMES
@@ -1193,3 +1336,681 @@ def test_esconder_e_mostrar(env: Env) -> None:
     with pytest.raises(StateError):
         env.mgr.hide(rec.id)  # pasta aberta não pode ser escondida
     assert not attrs(p) & HIDDEN and not rec.hidden
+
+
+# --- regressões da revisão adversarial (v0.3) ----------------------------------------------
+
+
+def _flip_byte(path: Path, offset_from_end: int = 20) -> None:
+    data = bytearray(path.read_bytes())
+    data[-offset_from_end] ^= 0xFF
+    path.write_bytes(bytes(data))
+
+
+def dacl_protected(path: Path) -> bool:
+    """A DACL do item é protegida (sem herança)? Lida pela API do Windows (independe do idioma)."""
+    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+    get_sec = advapi.GetFileSecurityW
+    get_sec.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    get_sec.restype = wintypes.BOOL
+    get_ctl = advapi.GetSecurityDescriptorControl
+    get_ctl.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.WORD),
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    get_ctl.restype = wintypes.BOOL
+    needed = wintypes.DWORD()
+    get_sec(str(path), 4, None, 0, ctypes.byref(needed))  # DACL_SECURITY_INFORMATION
+    buf = ctypes.create_string_buffer(needed.value)
+    assert get_sec(str(path), 4, buf, needed, ctypes.byref(needed))
+    control = wintypes.WORD()
+    revision = wintypes.DWORD()
+    assert get_ctl(buf, ctypes.byref(control), ctypes.byref(revision))
+    return bool(control.value & 0x1000)  # SE_DACL_PROTECTED
+
+
+def kept_version(
+    env: Env, name: str = "Particular", base: Path | None = None
+) -> tuple[Path, FolderRecord, str, dict[str, Any]]:
+    """Pasta TRANCADA com uma versão anterior MANTIDA (praia.jpg só existe nela)."""
+    p = make_folder(base or env.base, name)
+    original = tree_digest(p)
+    rec = protect(env.mgr, p).record
+    env.mgr.unlock(rec.id)
+    os.remove(p / "Fotos de família" / "praia.jpg")
+    out = env.mgr.lock(rec.id)
+    assert out.complete and out.kept_previous and roles(rec) == ["atual", MANTIDO]
+    return p, rec, "Fotos de família\\praia.jpg", original
+
+
+# 1. transição para 'apagando' -------------------------------------------------------------
+
+
+def test_falha_ao_gravar_apagando_desfaz_na_memoria(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A gravação de 'apagando' falha (disco do perfil cheio): nada é apagado, a memória volta
+    atrás (sem 'Continuar trancando' para um estado que não está no disco) e o 'novo' sai."""
+    p = make_folder(env.base)
+    before = tree_digest(p)
+    real_save = env.session.save
+    calls: list[int] = []
+
+    def flaky() -> None:
+        calls.append(1)
+        if len(calls) >= 3:  # 1: registrar a pasta; 2: 'trancando'; 3: 'apagando'
+            raise OSError(28, "não há espaço suficiente no disco (simulado)")
+        real_save()
+
+    with monkeypatch.context() as m:
+        m.setattr(env.session, "save", flaky)
+        with pytest.raises(OSError):
+            protect(env.mgr, p)
+        assert tree_digest(p) == before
+        assert all(r.state != APAGANDO for r in env.mgr.folders)
+        assert staging_dirs(env.base) == []  # o cofre novo foi descartado
+
+    mgr = env.reopen()
+    [rec] = mgr.folders
+    assert rec.state == TRANCANDO  # o que ficou no disco
+    with pytest.raises(StateError):
+        env.mgr.continue_lock(rec.id)
+    notes = mgr.reconcile_on_start()
+    assert len(notes) == 1 and "continua aberta" in notes[0]
+    assert rec.state == ABERTA and rec.vaults == []
+    assert tree_digest(p) == before
+    assert mgr.lock(rec.id).complete
+    assert mgr.unlock(rec.id).complete
+    assert tree_digest(p) == before
+
+
+@pytest.mark.parametrize("resolve", ["desfazer", "continuar", "sem_marcador"])
+def test_perfil_atrasado_nunca_apaga_o_cofre_novo(
+    env: Env, monkeypatch: pytest.MonkeyPatch, resolve: str
+) -> None:
+    """O disco ficou em 'trancando' (gravação perdida, cópia antiga do perfil) mas originais já
+    foram apagados: o início NÃO descarta o 'novo' — a pasta vai para 'apagando'."""
+    p = make_folder(env.base)
+    before = tree_digest(p)
+    target = p / "relatório.txt"
+    real_save = env.session.save
+    calls: list[int] = []
+
+    def stale() -> None:
+        calls.append(1)
+        if len(calls) <= 2:  # depois de 'trancando', nada mais chega ao disco
+            real_save()
+
+    with monkeypatch.context() as m:
+        m.setattr(env.session, "save", stale)
+        with held_open_on_delete(target) as sink:
+            out = protect(env.mgr, p, progress=sink)
+    rec = out.record
+    assert not out.complete and rec.state == APAGANDO
+    novo = rec.vault("novo")
+    assert novo is not None
+    assert set(os.listdir(p)) == {"relatório.txt", MARKER_NAME}
+    if resolve == "sem_marcador":
+        os.remove(p / MARKER_NAME)  # nem o marcador sobrou: o manifesto ainda denuncia
+
+    mgr = env.reopen()
+    r = mgr.session.index.folder(rec.id)
+    assert r is not None and r.state == TRANCANDO
+
+    notes = mgr.reconcile_on_start()
+
+    assert len(notes) == 1 and "começar a apagar" in notes[0]
+    assert r.state == APAGANDO and os.path.isdir(novo.location)
+    assert r.fingerprints == {}
+    assert mgr.view(r).issue == APAGANDO
+    again = env.reopen().session.index.folder(rec.id)
+    assert again is not None and again.state == APAGANDO
+    if resolve == "continuar":
+        original = target.read_bytes()
+        target.write_bytes(b"outro conteudo, de outro tamanho")
+        out2 = mgr.continue_lock(r.id)  # sem impressão digital: confere o conteúdo
+        assert not out2.complete and target.read_bytes() == b"outro conteudo, de outro tamanho"
+        assert any(x.startswith("relatório.txt:") for x in out2.pending)
+        target.write_bytes(original)
+        out3 = mgr.continue_lock(r.id)
+        assert out3.complete and r.state == TRANCADA
+        assert set(os.listdir(p)) == PLACEHOLDER_NAMES
+        assert mgr.unlock(r.id).complete
+    else:
+        res = mgr.undo_lock(r.id)
+        assert res.complete and r.state == ABERTA
+    assert tree_digest(p) == before
+
+
+def test_continuar_exige_que_o_estado_esteja_gravado(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = make_folder(env.base)
+    before = tree_digest(p)
+    with held_open_on_delete(p / "notas.bin") as sink:
+        rec = protect(env.mgr, p, progress=sink).record
+    assert rec.state == APAGANDO
+    left = set(os.listdir(p))
+
+    def broken() -> None:
+        raise OSError(28, "não há espaço suficiente no disco (simulado)")
+
+    with monkeypatch.context() as m:
+        m.setattr(env.session, "save", broken)
+        with pytest.raises(OSError):
+            env.mgr._save()  # uma gravação falhou nesta sessão
+        with pytest.raises(OSError):
+            env.mgr.continue_lock(rec.id)
+        assert set(os.listdir(p)) == left  # nada foi apagado sem gravar antes
+    assert env.mgr.continue_lock(rec.id).complete
+    assert env.mgr.unlock(rec.id).complete
+    assert tree_digest(p) == before
+
+
+# 3. primitivo único de exclusão: cofre ilegível/ausente nunca conta como vazio ------------
+
+
+def test_versao_mantida_ilegivel_nunca_e_apagada(env: Env) -> None:
+    p, rec, gone, original = kept_version(env)
+    kept = rec.vault(MANTIDO)
+    assert kept is not None
+    kdir = Path(winfs.strip_extended(kept.location))
+    for name in ("manifest.owl", "manifest.owl.bak"):
+        _flip_byte(kdir / name)
+    snapshot = tree_digest(kdir)
+
+    with pytest.raises(StateError, match="Nada foi apagado"):
+        env.mgr.kept_only_files(rec.id)
+    view = env.mgr.view(rec)
+    assert view.issue == "versao_anterior_ilegivel" and view.action == "resolver"
+    assert "0 arquivo" not in view.attention
+    for confirmed in ([], [gone]):
+        with pytest.raises(StateError):
+            env.mgr.delete_kept(rec.id, confirmed)
+    assert tree_digest(kdir) == snapshot and roles(rec) == ["atual", MANTIDO]
+
+    # remover proteção (pasta aberta) também recusa, sem apagar a versão mantida
+    assert env.mgr.unlock(rec.id).complete
+    with pytest.raises(StateError):
+        env.mgr.removal_missing(rec.id)
+    with pytest.raises(StateError):
+        env.mgr.remove_protection(rec.id, confirmed_missing=[gone])
+    assert tree_digest(kdir) == snapshot
+    assert rec in env.mgr.folders and MANTIDO in roles(rec)
+    assert not (p / gone).exists() and gone in original  # só existe na versão mantida
+    assert any(kdir.rglob("*.owlb"))  # o salvamento de emergência ainda tem os blobs
+
+
+def test_versao_mantida_ausente_nao_e_esquecida_em_silencio(env: Env) -> None:
+    _p, rec, gone, _original = kept_version(env)
+    kept = rec.vault(MANTIDO)
+    assert kept is not None
+    moved = env.root / "versao movida"
+    os.rename(winfs.strip_extended(kept.location), moved)
+
+    with pytest.raises(StateError, match="não foi encontrada"):
+        env.mgr.kept_only_files(rec.id)
+    with pytest.raises(StateError):
+        env.mgr.delete_kept(rec.id, [gone])
+    assert roles(rec) == ["atual", MANTIDO]
+    assert env.mgr.view(rec).issue == "versao_anterior_ilegivel"
+
+    # só a ação explícita esquece a referência (e nada é apagado)
+    assert env.mgr.forget_missing_kept(rec.id) == 1
+    assert roles(rec) == ["atual"]
+    assert env.mgr.view(rec).issue == ""
+    assert moved.is_dir()
+
+
+def test_versao_mantida_ilegivel_mas_presente_nao_e_esquecida(env: Env) -> None:
+    _p, rec, _gone, _original = kept_version(env)
+    kept = rec.vault(MANTIDO)
+    assert kept is not None
+    _flip_byte(Path(winfs.strip_extended(kept.location)) / "manifest.owl")
+    _flip_byte(Path(winfs.strip_extended(kept.location)) / "manifest.owl.bak")
+    assert env.mgr.forget_missing_kept(rec.id) == 0
+    assert roles(rec) == ["atual", MANTIDO]
+
+
+# 4. 'Procurar a pasta…' em todos os estados ------------------------------------------------
+
+
+def test_relocate_em_apagando(env: Env) -> None:
+    p = make_folder(env.base)
+    before = tree_digest(p)
+    with held_open_on_delete(p / "notas.bin") as sink:
+        rec = protect(env.mgr, p, progress=sink).record
+    assert rec.state == APAGANDO
+    p2 = env.base / "Particular (movida)"
+    os.rename(p, p2)
+    assert env.mgr.view(rec).issue == "nao_encontrada"
+
+    env.mgr.relocate(rec.id, str(p2))
+
+    assert env.mgr.view(rec).issue == APAGANDO
+    assert env.mgr.continue_lock(rec.id).complete
+    assert rec.state == TRANCADA and set(os.listdir(p2)) == PLACEHOLDER_NAMES
+    assert env.mgr.unlock(rec.id).complete
+    assert tree_digest(p2) == before
+
+
+def test_relocate_pai_renomeado_atualiza_a_versao_mantida(env: Env) -> None:
+    mae = env.base / "Mãe"
+    mae.mkdir()
+    _p, rec, gone, original = kept_version(env, base=mae)
+    mae2 = env.base / "Mãe renomeada"
+    os.rename(mae, mae2)
+    assert env.mgr.view(rec).issue == "nao_encontrada"
+
+    env.mgr.relocate(rec.id, str(mae2 / "Particular"))
+
+    kept = rec.vault(MANTIDO)
+    assert kept is not None and os.path.isdir(kept.location)
+    assert winfs.strip_extended(kept.location).startswith(str(mae2))
+    assert env.mgr.kept_only_files(rec.id) == [gone]
+    assert env.mgr.view(rec).issue == "versao_anterior"
+    dest = env.root / "recuperado"
+    dest.mkdir()
+    env.mgr.restore_kept(rec.id, str(dest))
+    assert tree_digest(dest / "Particular (versão anterior)") == original
+    env.mgr.delete_kept(rec.id, [gone])
+    assert roles(rec) == ["atual"]
+    assert staging_dirs(mae2) == []
+
+
+def test_relocate_em_abrindo_com_o_cofre_ainda_na_pasta(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = make_folder(env.base)
+    before = tree_digest(p)
+    rec = protect(env.mgr, p).record
+    with monkeypatch.context() as m:
+        m.setattr(LockerManager, "_move_vault_out", _raise_crash)
+        with pytest.raises(Crash):
+            env.mgr.unlock(rec.id)
+    mgr = env.reopen()
+    r = mgr.session.index.folder(rec.id)
+    assert r is not None and r.state == ABRINDO
+    p2 = env.base / "Outro nome"
+    os.rename(p, p2)
+
+    mgr.relocate(r.id, str(p2))
+
+    assert mgr.view(r).issue == ABRINDO
+    assert mgr.unlock(r.id).complete
+    assert tree_digest(p2) == before
+
+
+def test_relocate_em_abrindo_com_a_pasta_em_outro_pai(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = make_folder(env.base)
+    before = tree_digest(p)
+    rec = protect(env.mgr, p).record
+    with monkeypatch.context() as m:
+        m.setattr(LockerManager, "_finish_unlock", _raise_crash)
+        with pytest.raises(Crash):
+            env.mgr.unlock(rec.id)
+    mgr = env.reopen()
+    r = mgr.session.index.folder(rec.id)
+    assert r is not None and r.state == ABRINDO
+    outro_pai = env.base / "outro pai"
+    outro_pai.mkdir()
+    p2 = outro_pai / "Particular"
+    os.rename(p, p2)  # a área temporária fica onde estava (pai antigo)
+
+    mgr.relocate(r.id, str(p2))
+    prev = r.vault("anterior")
+    assert prev is not None and os.path.isdir(prev.location)
+    assert mgr.unlock(r.id).complete
+    assert tree_digest(p2) == before
+    # trancar de novo usa a área nova e limpa a antiga
+    assert mgr.lock(r.id).complete
+    assert staging_dirs(env.base) == [] and staging_dirs(outro_pai) == []
+    assert mgr.unlock(r.id).complete
+    assert tree_digest(p2) == before
+
+
+def test_relocate_recusa_se_um_cofre_nao_for_achado(env: Env) -> None:
+    p = make_folder(env.base, spec=SMALL)
+    rec = protect(env.mgr, p).record
+    env.mgr.unlock(rec.id)
+    staging = env.base / f".owlvault-{rec.id}"
+    hidden_away = env.root / "area sumida"
+    os.rename(staging, hidden_away)
+    p2 = env.base / "Particular 2"
+    os.rename(p, p2)
+    old_path = rec.path
+
+    with pytest.raises(StateError, match="Nada foi alterado"):
+        env.mgr.relocate(rec.id, str(p2))
+
+    assert rec.path == old_path and env.mgr.view(rec).issue == "nao_encontrada"
+    os.rename(hidden_away, staging)
+    env.mgr.relocate(rec.id, str(p2))
+    assert env.mgr.view(rec).issue == ""
+
+
+def test_esquecer_avisa_quando_ha_arquivos_fora_da_pasta(env: Env) -> None:
+    p = make_folder(env.base, spec=SMALL)
+    rec = protect(env.mgr, p).record
+    assert env.mgr.forget_warning(rec.id) == ""
+    env.mgr.unlock(rec.id)
+    assert "Recuperar uma pasta protegida" in env.mgr.forget_warning(rec.id)
+
+
+# 5. 'Desfazer' com conflito num arquivo que o Owl Vault apagou ------------------------------
+
+
+def test_desfazer_com_conflito_em_arquivo_apagado_mantem_a_versao(env: Env) -> None:
+    p = make_folder(env.base)
+    before = tree_digest(p)
+    with held_open_on_delete(p / "sub" / "a.txt") as sink:
+        rec = protect(env.mgr, p, progress=sink).record
+    assert rec.state == APAGANDO
+    apagado = p / "notas.bin"
+    assert not apagado.exists()
+    apagado.write_bytes(b"copia antiga tirada de um backup")  # mesmo caminho, outro conteudo
+
+    res = env.mgr.undo_lock(rec.id)
+
+    assert res.complete and rec.state == ABERTA
+    assert res.report is not None
+    assert any(c.startswith("notas.bin:") for c in res.report.conflicts)
+    assert roles(rec) == [MANTIDO]  # nunca 'anterior' silencioso
+    assert "notas.bin" in rec.attention
+    assert env.mgr.view(rec).issue == "versao_anterior"
+    assert env.mgr.kept_only_files(rec.id) == ["notas.bin"]
+    assert apagado.read_bytes() == b"copia antiga tirada de um backup"
+
+    out = env.mgr.lock(rec.id)  # o próximo trancamento NÃO apaga a versão guardada
+
+    assert out.complete and out.kept_previous
+    assert roles(rec) == ["atual", MANTIDO]
+    assert env.mgr.kept_only_files(rec.id) == ["notas.bin"]
+    dest = env.root / "recuperado"
+    dest.mkdir()
+    env.mgr.restore_kept(rec.id, str(dest))
+    assert tree_digest(dest / "Particular (versão anterior)") == before
+
+
+# 6. abrir: espaço conferido antes; item colocado durante a abertura ------------------------
+
+
+def test_abrir_sem_espaco_nao_tira_o_cofre_da_pasta(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = make_folder(env.base)
+    before = tree_digest(p)
+    rec = protect(env.mgr, p).record
+    with monkeypatch.context() as m:
+        m.setattr(winfs, "volume_space", lambda _p: winfs.VolumeSpace(1024, 4096))
+        with pytest.raises(InsufficientSpaceError, match="continua trancada"):
+            env.mgr.unlock(rec.id)
+    assert rec.state == TRANCADA and roles(rec) == ["atual"]
+    assert set(os.listdir(p)) == PLACEHOLDER_NAMES
+    assert staging_dirs(env.base) == []
+    again = env.reopen().session.index.folder(rec.id)
+    assert again is not None and again.state == TRANCADA
+    assert env.mgr.unlock(rec.id).complete
+    assert tree_digest(p) == before
+
+
+def test_item_colocado_durante_a_abertura_nao_conta_como_restaurado(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = make_folder(env.base)
+    before = tree_digest(p)
+    rec = protect(env.mgr, p).record
+    with monkeypatch.context() as m:
+        m.setattr(LockerManager, "_finish_unlock", _raise_crash)
+        with pytest.raises(Crash):
+            env.mgr.unlock(rec.id)
+    assert os.listdir(p) == []
+    intruso = p / "intruso.txt"
+    intruso.write_bytes(b"colocado enquanto a pasta abria")
+
+    mgr = env.reopen()
+    r = mgr.session.index.folder(rec.id)
+    assert r is not None and r.state == ABRINDO
+    with pytest.raises(StateError, match=r"intruso\.txt"):
+        mgr.unlock(r.id)
+    assert r.state == ABRINDO and r.pending == []
+    prev = r.vault("anterior")
+    assert prev is not None and os.path.isdir(prev.location)
+
+    intruso.unlink()
+    assert mgr.unlock(r.id).complete
+    assert tree_digest(p) == before
+
+
+def test_falha_antes_de_restaurar_volta_a_fase_abrindo(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = make_folder(env.base)
+    before = tree_digest(p)
+    rec = protect(env.mgr, p).record
+
+    def no_space(*_a: object, **_k: object) -> None:
+        raise OwlVaultError("Espaço insuficiente no destino (simulado).")
+
+    with monkeypatch.context() as m:
+        m.setattr(lockers, "restore_vault", no_space)
+        with pytest.raises(OwlVaultError, match="Espaço insuficiente"):
+            env.mgr.unlock(rec.id)
+    assert rec.state == ABRINDO  # a fase 'restaurando' foi desfeita: nada foi restaurado
+    again = env.reopen().session.index.folder(rec.id)
+    assert again is not None and again.state == ABRINDO
+    (p / "intruso.txt").write_bytes(b"x")
+    with pytest.raises(StateError, match="colocado"):
+        env.mgr.unlock(rec.id)
+    (p / "intruso.txt").unlink()
+    assert env.mgr.unlock(rec.id).complete
+    assert tree_digest(p) == before
+
+
+# 7. trava de restauração órfã ----------------------------------------------------------------
+
+
+def test_trava_de_restauracao_orfa_em_apagando(env: Env) -> None:
+    p = make_folder(env.base)
+    before = tree_digest(p)
+    with held_open_on_delete(p / "notas.bin") as sink:
+        rec = protect(env.mgr, p, progress=sink).record
+    assert rec.state == APAGANDO
+    (p / RESTORE_LOCK_NAME).write_bytes(b"")  # sobrou de uma queda durante 'Desfazer'
+
+    out = env.mgr.continue_lock(rec.id)
+
+    assert out.complete and rec.state == TRANCADA
+    assert set(os.listdir(p)) == PLACEHOLDER_NAMES
+    assert env.mgr.view(rec).issue == ""
+    assert env.mgr.unlock(rec.id).complete
+    assert tree_digest(p) == before
+
+
+def test_trava_de_restauracao_em_uso_vira_pendencia(env: Env) -> None:
+    p = make_folder(env.base)
+    before = tree_digest(p)
+    with held_open_on_delete(p / "notas.bin") as sink:
+        rec = protect(env.mgr, p, progress=sink).record
+    lock = p / RESTORE_LOCK_NAME
+    lock.write_bytes(b"")
+    with open(lock, "rb"):
+        out = env.mgr.continue_lock(rec.id)
+        assert not out.complete and rec.state == APAGANDO
+        assert any(x.startswith(RESTORE_LOCK_NAME) for x in out.pending)
+    assert env.mgr.continue_lock(rec.id).complete
+    assert env.mgr.unlock(rec.id).complete
+    assert tree_digest(p) == before
+
+
+def test_trava_de_restauracao_orfa_na_pasta_trancada_e_aceita(env: Env) -> None:
+    p = make_folder(env.base)
+    before = tree_digest(p)
+    rec = protect(env.mgr, p).record
+    (p / RESTORE_LOCK_NAME).write_bytes(b"")
+
+    assert env.mgr.view(rec).issue == ""
+    assert env.mgr.unlock(rec.id).complete
+    assert RESTORE_LOCK_NAME not in os.listdir(p)
+    assert tree_digest(p) == before
+
+
+# 8. espaço reservado: ACL, atalho conferido e refeito ---------------------------------------
+
+
+def test_acl_restrita_no_espaco_reservado_no_cofre_e_na_area_temporaria(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = acl.restrict_to_owner
+    calls: list[tuple[str, bool]] = []
+
+    def spy(path: str, *, directory: bool) -> bool:
+        calls.append((os.path.normcase(winfs.strip_extended(path)), directory))
+        return real(path, directory=directory)
+
+    monkeypatch.setattr(acl, "restrict_to_owner", spy)
+    mgr = new_manager(env.session, create_shortcuts=True)
+    p = make_folder(env.base)
+    rec = protect(mgr, p).record
+    staging = env.base / f".owlvault-{rec.id}"
+
+    def called(path: Path, directory: bool) -> bool:
+        return (os.path.normcase(str(path)), directory) in calls
+
+    assert called(staging, True)
+    assert called(p / VAULT_DIR, True)
+    for name in (ICON_NAME, DESKTOP_INI, HELP_NAME, SHORTCUT_NAME):
+        assert called(p / name, False), name
+    for item in (p / VAULT_DIR, p / DESKTOP_INI, p / SHORTCUT_NAME):
+        assert dacl_protected(item), item
+    mgr.unlock(rec.id)
+    assert dacl_protected(staging)  # a área temporária guarda o cofre da pasta aberta
+    assert mgr.lock(rec.id).complete
+
+
+def test_atalho_trocado_e_refeito_ao_iniciar(env: Env) -> None:
+    mgr = new_manager(env.session, create_shortcuts=True)
+    p = make_folder(env.base, spec=SMALL)
+    rec = protect(mgr, p).record
+    lnk = p / SHORTCUT_NAME
+    args = f"--abrir {rec.id}"
+    assert shell.shortcut_matches(str(lnk), LAUNCHER[0], args)
+    assert mgr.reconcile_on_start() == []  # nada trocado: nada a avisar
+
+    # outra conta troca o atalho por um que aponta para outro programa
+    lnk.unlink()
+    fake = "C:\\Windows\\System32\\cmd.exe"  # o atalho falso nunca é executado
+    shell.create_shortcut(str(lnk), fake, args, fake, "falso", "C:\\Windows\\System32")
+    assert not shell.shortcut_matches(str(lnk), LAUNCHER[0], args)
+
+    notes = mgr.reconcile_on_start()
+
+    assert len(notes) == 1 and "atalho" in notes[0]
+    assert shell.shortcut_matches(str(lnk), LAUNCHER[0], args)
+    assert mgr.repair_placeholders(rec.id) == []
+    assert set(os.listdir(p)) == PLACEHOLDER_NAMES | {SHORTCUT_NAME}
+
+
+def test_repair_placeholders_refaz_so_os_nossos_arquivos(env: Env) -> None:
+    p = make_folder(env.base, spec=SMALL)
+    rec = protect(env.mgr, p).record
+    (p / DESKTOP_INI).unlink()
+    shell.change_attributes(str(p / ICON_NAME), remove=HIDE)
+    (p / ICON_NAME).write_bytes(b"icone trocado")
+    (p / HELP_NAME).unlink()
+
+    assert env.mgr.repair_placeholders(rec.id) == []
+
+    assert set(os.listdir(p)) == PLACEHOLDER_NAMES
+    assert (p / ICON_NAME).read_bytes() == ICON
+    assert attrs(p / ICON_NAME) & HIDE == HIDE and attrs(p / DESKTOP_INI) & HIDE == HIDE
+    assert "Recuperar uma pasta protegida" in (p / HELP_NAME).read_bytes().decode("utf-8-sig")
+    assert env.mgr.unlock(rec.id).complete
+    assert env.mgr.repair_placeholders(rec.id) == []  # pasta aberta: nada é escrito
+    assert not set(os.listdir(p)) & {DESKTOP_INI, ICON_NAME, HELP_NAME}
+
+
+def test_reconcile_um_problema_nao_impede_as_outras_pastas(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    a = make_folder(env.base, "A", SMALL)
+    b = make_folder(env.base, "B", {"b.txt": b"bbb"})
+    ra = protect(env.mgr, a).record
+    protect(env.mgr, b)
+    (b / HELP_NAME).unlink()
+    real = LockerManager._write_placeholder
+
+    def fail_for_a(self: LockerManager, rec: FolderRecord) -> list[str]:
+        if rec.id == ra.id:
+            raise OSError(5, "acesso negado (simulado)")
+        return real(self, rec)
+
+    monkeypatch.setattr(LockerManager, "_write_placeholder", fail_for_a)
+    notes = env.mgr.reconcile_on_start()
+    assert len(notes) == 1 and notes[0].startswith("'A':")
+    assert set(os.listdir(b)) == PLACEHOLDER_NAMES  # a outra pasta foi conferida
+
+
+def test_area_temporaria_com_itens_desconhecidos_continua_oculta(env: Env) -> None:
+    p = make_folder(env.base, spec=SMALL)
+    rec = protect(env.mgr, p).record
+    env.mgr.unlock(rec.id)
+    staging = env.base / f".owlvault-{rec.id}"
+    (staging / "nao e nosso.txt").write_bytes(b"x")
+    assert env.mgr.lock(rec.id).complete
+    assert staging.is_dir() and attrs(staging) & HIDE == HIDE
+    assert (staging / "nao e nosso.txt").read_bytes() == b"x"
+
+
+# 9. aviso de senha mestra antiga só para KEK trocada ------------------------------------------
+
+
+def test_recuperar_com_a_mesma_senha_nao_avisa(env: Env) -> None:
+    p = make_folder(env.base, spec=SMALL)
+    protect(env.mgr, p)
+    s2 = new_profile(env.root / "perfil2", master=SM, pin=PIN_OUTRO)  # salt novo, mesma SM
+    m2 = new_manager(s2)
+    r2 = m2.recover(str(p), SM)
+    assert len(s2.index.keks) == 2 and s2.index.keks[1].origin == KEK_RECUPERADA
+    assert m2.view(r2).issue == ""
+
+
+def test_senha_mestra_trocada_avisa_ate_retrancar(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(profile_mod, "calibrate", lambda *_a, **_k: TESTING_PARAMS)
+    p = make_folder(env.base, spec=SMALL)
+    rec = protect(env.mgr, p).record
+    assert env.mgr.view(rec).issue == ""
+    env.session.change_master(SM_OUTRA)
+    assert [k.origin for k in env.session.index.keks] == [profile_mod.KEK_PERFIL, KEK_TROCADA]
+    assert env.mgr.view(rec).issue == "senha_antiga"
+    assert env.mgr.unlock(rec.id).complete
+    assert env.mgr.lock(rec.id).complete
+    assert env.mgr.view(rec).issue == ""
+
+
+# 10. unidade removível pelo tipo de unidade --------------------------------------------------
+
+
+@pytest.mark.parametrize("detected", [True, False, None])
+def test_unidade_removivel_vem_do_tipo_de_unidade(
+    env: Env, monkeypatch: pytest.MonkeyPatch, detected: bool | None
+) -> None:
+    def fake(_path: str) -> bool:
+        if detected is None:
+            raise OSError(21, "dispositivo não está pronto (simulado)")
+        return detected
+
+    monkeypatch.setattr(winfs, "is_removable_drive", fake)
+    out = protect(env.mgr, make_folder(env.base, spec=SMALL))
+    assert out.complete and out.removable is bool(detected)

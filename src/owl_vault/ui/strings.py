@@ -61,3 +61,108 @@ RESTORE_HINT = (
     "existentes nem na pasta de origem."
 )
 NOT_CANCELLABLE = "Derivando a chave da senha (não cancelável, alguns segundos)..."
+
+# --- assistente "Cópia criptografada" (visual Cofre, Estilo 5) ---------------------------
+# Os cinco textos abaixo são EXATAMENTE os da seção "Textos" de visual/ESTILO5-COFRE.md
+# (tests/test_ui_strings.py confere).
+AVISO_COPIA = (
+    "O cofre é uma cópia criptografada. A pasta original continua legível até você removê-la "
+    "— e, mesmo removida, podem restar cópias dela na Lixeira, em Versões anteriores, no "
+    "OneDrive, em backups e no índice do Windows."
+)
+SENHA_TEXTO = (
+    "É ela que abre o cofre depois. Sem ela não há recuperação: nem você, nem o Owl Vault "
+    "conseguem ler os arquivos de volta."
+)
+NOME_DICA = (
+    "O nome da pasta do cofre fica visível para qualquer pessoa que abrir o computador. "
+    "Guarde o assunto na senha, não no nome."
+)
+TESTE_NOTA = (
+    "Pasta temporária no mesmo disco da origem. Cada arquivo é restaurado ali com nome "
+    "aleatório, comparado com a origem e apagado em seguida."
+)
+FIM_TEXTO = (
+    "Cópia criptografada criada e verificada (cópia da pasta como estava em {data} {hora}). "
+    "Mantenha a origem e um backup externo até verificar o cofre, de preferência em outro "
+    "computador."
+)
+
+COPIA_TITULO_JANELA = "Owl Vault — Cópia criptografada"
+COPIA_PASSOS = ("Pastas", "Senha", "Conferência", "Criar")
+COPIA_PRIMARIO = (
+    "Continuar para a senha",
+    "Continuar para a conferência",
+    "Criar cofre agora",
+)
+COPIA_PRIMARIO_FIM = "Abrir a pasta do cofre"
+COPIA_CRIAR_OUTRO = "Criar outro cofre"
+COPIA_RETOMAR = "Retomar criação interrompida"
+COPIA_RETOMAR_AGORA = "Retomar a criação agora"
+COPIA_SECAO_LATERAL = "Escolhas do passo 1"
+
+COPIA_P1_TITULO = "Escolha as pastas"
+COPIA_P1_TEXTO = (
+    "O Owl Vault lê a pasta de origem e grava uma cópia criptografada no local do cofre. "
+    "A origem não é alterada."
+)
+COPIA_P2_TITULO = "Escolha a senha do cofre"
+COPIA_P2_RETOMAR_TITULO = "Digite a senha do cofre"
+COPIA_P2_RETOMAR_TEXTO = "Use a mesma senha de quando a criação começou."
+COPIA_P3_TITULO = "Conferência antes de criar"
+COPIA_P3_TEXTO = "Nada é gravado nesta etapa. Confira os itens e marque os avisos para continuar."
+COPIA_P3_RETOMAR_TITULO = "Conferência antes de retomar"
+COPIA_P4_TITULO = "Criando o cofre"
+COPIA_P4_TITULO_OK = "Cofre criado"
+COPIA_P4_TITULO_DIVERGENCIAS = "Cofre criado com divergências"
+COPIA_P4_TITULO_PAROU = "A criação parou"
+COPIA_P4_TEXTO = "Acompanhe o andamento abaixo. A origem é só lida."
+COPIA_P4_TEXTO_FIM = "Confira o resultado abaixo. A origem não foi alterada."
+COPIA_DICA_FIM = (
+    "E agora?",
+    "Confira o cofre em outro computador ('Conferir uma cópia') antes de decidir o que fazer "
+    "com a origem. Guarde também um backup externo.",
+)
+COPIA_ACEITE_LIMITES = "Li e entendi os limites da proteção."
+
+#: (título, texto) da dica de cada passo do assistente
+COPIA_DICAS = (
+    ("Por que o nome é genérico?", NOME_DICA),
+    (
+        "Como escolher a senha?",
+        "Uma frase com quatro ou mais palavras é fácil de lembrar e difícil de adivinhar. "
+        "Anote a senha num lugar seguro, longe do computador.",
+    ),
+    (
+        "O que é conferido?",
+        "O Owl Vault lista a origem, abre cada arquivo e calcula o espaço do cofre. "
+        "Nada é gravado nesta etapa.",
+    ),
+    (
+        "Pode demorar",
+        "Cada arquivo é criptografado, conferido e restaurado num teste. Se precisar parar, "
+        "use 'Retomar criação interrompida' depois.",
+    ),
+)
+COPIA_DICA_ABRIR = (
+    "Sempre numa pasta nova",
+    "Os arquivos voltam numa pasta nova e vazia. Nada é gravado por cima de arquivos que já "
+    "existem, nem na pasta de origem.",
+)
+COPIA_DICA_CONFERIR = (
+    "Quando conferir?",
+    "Depois de criar, de preferência em outro computador, e sempre que reconectar a mídia "
+    "do cofre.",
+)
+COPIA_MIDIA_REMOVIVEL = (
+    "Use 'Remover hardware com segurança'; depois reconecte a mídia e confira o cofre "
+    "('Conferir uma cópia') antes de remover qualquer original."
+)
+COPIA_CANCELADA = (
+    "Operação cancelada num ponto seguro. Na criação, use 'Retomar criação interrompida' "
+    "para continuar depois."
+)
+COPIA_FECHAR_TEXTO = (
+    "Parar num ponto seguro e fechar? Na criação, use 'Retomar criação interrompida' para "
+    "continuar depois."
+)

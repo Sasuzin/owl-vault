@@ -5,8 +5,11 @@
 Na primeira execução, o `OwlVault.exe` se copia para `%LOCALAPPDATA%\Programs\Owl Vault\`
 e cria o atalho **Owl Vault** no Menu Iniciar — só para o seu usuário, sem administrador. Os
 atalhos "Abrir com Owl Vault" das pastas trancadas apontam para essa cópia; não a apague.
-Ao rodar uma versão nova do `OwlVault.exe`, a cópia instalada é atualizada (se estiver aberta,
-a atualização acontece na próxima vez).
+Ao rodar uma versão **mais nova** do `OwlVault.exe`, a cópia instalada é atualizada (se estiver
+aberta, a atualização acontece na próxima vez). Uma versão igual ou mais antiga não substitui a
+instalada (a versão instalada fica em `versao.txt`, ao lado do executável). A versão e o build
+aparecem em ☰ → Sobre, no rodapé da janela e nas propriedades do arquivo (Detalhes →
+Versão do arquivo).
 
 O Windows SmartScreen pode mostrar "O Windows protegeu o computador" porque o executável não
 é assinado. Confira o SHA-256 (`Get-FileHash .\OwlVault.exe -Algorithm SHA256`) antes de clicar

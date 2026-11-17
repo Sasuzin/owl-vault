@@ -9,10 +9,17 @@ JSON em claro com partes cifradas (AES-256-GCM):
 * ``pin.blob`` = DPAPI_usuário(AES-GCM(Argon2id(PIN), PK)): caminho do PIN. O PIN dá acesso
   à PK (e por ela à KEK_SM guardada no índice), **nunca à senha mestra**.
 * ``index`` = AES-GCM(PK, JSON do índice): KEKs e a lista de pastas (caminhos, estados...).
+
+As duas cópias (principal e ``.bak``) existem desde a criação. O contador de erros do PIN é
+gravado em CADA cópia sem trocar o resto dela (o índice de uma cópia nunca é copiado por cima
+da outra antes de autenticar); o efetivo é o máximo das duas, e um PIN desativado em qualquer
+cópia está desativado. Uma sessão aberta relê o disco antes de gravar: nunca reativa um PIN
+desativado nem zera o contador (só ``set_pin`` e um desbloqueio bem-sucedido zeram).
 """
 
 from __future__ import annotations
 
+import contextlib
 import datetime as _dt
 import itertools
 import json
@@ -48,6 +55,30 @@ PRACTICE_FIRST_DAYS = 1
 PRACTICE_EVERY_DAYS = 30
 _MAX_PROFILE_BYTES = 256 * 1024 * 1024
 
+#: aviso em ``session.notes`` quando o desbloqueio precisou da cópia de segurança
+NOTE_BACKUP_USED = (
+    "O arquivo principal do perfil estava danificado; foi usada a cópia de segurança."
+)
+NOTE_MASTER_REBUILT = (
+    "A parte do perfil que abre com a senha mestra estava danificada e foi refeita."
+)
+_WEAK_PIN = "Este PIN é fácil de adivinhar. Escolha outro."
+_DPAPI_GONE = (
+    "O Windows não consegue mais usar o PIN deste computador (a senha do Windows foi "
+    "redefinida ou o Windows foi reinstalado). Digite sua senha mestra."
+)
+_PIN_DAMAGED = (
+    "O PIN deste computador está danificado. Digite sua senha mestra; depois você cria um PIN novo."
+)
+_INDEX_CORRUPT = (
+    "O perfil do Owl Vault está danificado: a lista de pastas não pôde ser lida nem no "
+    "arquivo principal nem na cópia de segurança."
+)
+_HEADER_CORRUPT = (
+    "O perfil do Owl Vault está danificado: a parte que abre com a senha mestra não pôde ser "
+    "lida nem no arquivo principal nem na cópia de segurança."
+)
+
 
 class ProfileCorruptError(FormatError):
     """O arquivo do perfil (principal e cópia de segurança) está ilegível ou não autentica.
@@ -74,7 +105,8 @@ class PinUnavailableError(AuthenticationError):
 
 
 class DpapiUnavailableError(PinUnavailableError):
-    """O Windows não consegue mais decifrar o PIN (reinstalação/senha redefinida)."""
+    """O Windows não consegue mais decifrar o PIN (reinstalação/senha redefinida) ou os dados
+    do PIN no perfil estão danificados: pede a senha mestra e depois um PIN novo."""
 
 
 def default_profile_dir() -> Path:
@@ -84,19 +116,77 @@ def default_profile_dir() -> Path:
 
 # --- validações ------------------------------------------------------------------------
 
+#: PINs muito comuns em levantamentos públicos de PINs de 6 a 10 dígitos. Vários também caem
+#: nas regras de ``_is_guessable``; a lista é a segunda linha de defesa.
+_COMMON_PINS = frozenset(
+    {
+        "123123",
+        "112233",
+        "147258",
+        "159357",
+        "159753",
+        "102030",
+        "696969",
+        "789456",
+        "456123",
+        "246810",
+        "135790",
+        "135791",
+        "147852",
+        "852456",
+        "963852",
+        "741852",
+        "258369",
+        "369258",
+        "147369",
+        "123654",
+        "789789",
+        "100200",
+        "112358",
+        "11235813",
+        "314159",
+        "31415926",
+        "271828",
+        "520131",
+        "5201314",
+        "1314520",
+        "147896",
+        "102938",
+        "1029384756",
+        "7894561230",
+        "1472583690",
+        "11223344",
+        "12341234",
+        "123321",
+        "147147",
+        "987987",
+    }
+)
+
+#: linhas, colunas e diagonais do teclado numérico (e a coluna do meio com o 0 do telefone)
+_KEYPAD_LINES = ("123", "456", "789", "147", "258", "369", "159", "357", "2580")
+_KEYPAD_SEGMENTS = frozenset(s for line in _KEYPAD_LINES for s in (line, line[::-1]))
+
 
 def validate_pin(pin: str) -> None:
-    """6 a 12 dígitos; recusa repetidos, sequências e datas óbvias."""
+    """6 a 12 dígitos; recusa PINs fáceis de adivinhar e datas óbvias.
+
+    Fáceis: todos iguais; sequências (também com a volta 9→0 da fileira do teclado e com
+    passo constante, como 135791); blocos repetidos (abab, abcabc, 12341234, aabbcc);
+    palíndromos; no máximo 2 dígitos distintos; linhas/colunas/diagonais do teclado numérico
+    emendadas (147258, 159357, 789456123); contagens (102030, 246810); e uma lista curta de
+    PINs comuns.
+    """
     if not re.fullmatch(r"[0-9]{6,12}", pin or ""):
         raise OwlVaultError("O PIN deve ter de 6 a 12 números.")
-    if len(set(pin)) == 1:
-        raise OwlVaultError("Este PIN é fácil de adivinhar. Escolha outro.")
     digits = [int(c) for c in pin]
     steps = {b - a for a, b in itertools.pairwise(digits)}
-    if steps in ({1}, {-1}):
-        raise OwlVaultError("Este PIN é fácil de adivinhar. Escolha outro.")
+    if len(set(pin)) == 1 or steps in ({1}, {-1}):
+        raise OwlVaultError(_WEAK_PIN)
     if _looks_like_date(pin):
         raise OwlVaultError("Não use datas como PIN. Escolha outro.")
+    if _is_guessable(pin):
+        raise OwlVaultError(_WEAK_PIN)
 
 
 def _looks_like_date(pin: str) -> bool:
@@ -111,6 +201,68 @@ def _looks_like_date(pin: str) -> bool:
             return True
         except ValueError:
             continue
+    return False
+
+
+def _is_guessable(pin: str) -> bool:
+    n = len(pin)
+    if pin in _COMMON_PINS or len(set(pin)) <= 2 or pin == pin[::-1]:
+        return True
+    digits = [int(c) for c in pin]
+    # passo constante "no mostrador" (1234567890, 0987654321, 135791, 7890123)
+    if len({(b - a) % 10 for a, b in itertools.pairwise(digits)}) == 1:
+        return True
+    # bloco repetido, mesmo que a última repetição fique pela metade (abab, abcabc, 1231231)
+    for k in range(1, n // 2 + 1):
+        if all(pin[i] == pin[i - k] for i in range(k, n)):
+            return True
+    # cada dígito repetido em seguida (aabbcc, 11223344, 998877)
+    if min(len(list(g)) for _, g in itertools.groupby(pin)) >= 2:
+        return True
+    return _keypad_path(pin) or _counting(pin)
+
+
+def _keypad_path(pin: str) -> bool:
+    """Linhas/colunas/diagonais do teclado numérico emendadas (147258, 789456123, 159357);
+    o último pedaço pode ser só o começo de uma delas (1472583)."""
+
+    def fits(i: int) -> bool:
+        if i == len(pin):
+            return True
+        rest = pin[i:]
+        if i > 0 and any(s.startswith(rest) for s in _KEYPAD_SEGMENTS):
+            return True
+        return any(pin.startswith(s, i) and fits(i + len(s)) for s in _KEYPAD_SEGMENTS)
+
+    return fits(0)
+
+
+def _counting(pin: str) -> bool:
+    """Números emendados em progressão aritmética, com 3 termos ou mais: 102030 (10 20 30),
+    246810 (2 4 6 8 10), 9101112, 302010, 100200300. Passos grandes e "quebrados" (como
+    58 39 20) não contam: não são um padrão que alguém tente."""
+    n = len(pin)
+    for i in range(1, n - 1):
+        first = pin[:i]
+        if len(first) > 1 and first[0] == "0":
+            break
+        for j in range(i + 1, n):
+            second = pin[i:j]
+            if len(second) > 1 and second[0] == "0":
+                break
+            a, b = int(first), int(second)
+            d = b - a
+            if d == 0 or not (abs(d) <= 10 or (d % 10 == 0 and a % d == 0)):
+                continue
+            out, term, terms = first + second, b, 2
+            while len(out) < n:
+                term += d
+                if term < 0:
+                    break
+                out += str(term)
+                terms += 1
+            if terms >= 3 and out == pin:
+                return True
     return False
 
 
@@ -199,11 +351,19 @@ class FolderRecord:
         )
 
 
+#: origem de uma KEK no índice: a senha mestra do perfil; uma senha mestra substituída por
+#: "Criar nova senha mestra"; ou a senha de uma pasta trazida por "Recuperar".
+KEK_PERFIL = "perfil"
+KEK_TROCADA = "trocada"
+KEK_RECUPERADA = "recuperada"
+
+
 @dataclass
 class KekEntry:
     salt: bytes
     params: KdfParams
     kek: bytes = field(repr=False)
+    origin: str = KEK_PERFIL
 
 
 @dataclass
@@ -226,6 +386,7 @@ class Index:
                     "iterations": k.params.iterations,
                     "parallelism": k.params.parallelism,
                     "kek": k.kek.hex(),
+                    "origin": k.origin,
                 }
                 for k in self.keks
             ],
@@ -239,8 +400,9 @@ class Index:
                 bytes.fromhex(k["salt"]),
                 KdfParams(int(k["memory_kib"]), int(k["iterations"]), int(k["parallelism"])),
                 bytes.fromhex(k["kek"]),
+                str(k.get("origin", KEK_PERFIL if i == 0 else KEK_TROCADA)),
             )
-            for k in o["keks"]
+            for i, k in enumerate(o["keks"])
         ]
         return Index(keks=keks, folders=[FolderRecord.from_obj(f) for f in o.get("folders", [])])
 
@@ -260,7 +422,7 @@ def _seal(key: bytes, plaintext: bytes, aad: bytes) -> dict[str, str]:
 def _open(key: bytes, box: dict[str, str], aad: bytes) -> bytes:
     try:
         return AESGCM(key).decrypt(bytes.fromhex(box["nonce"]), bytes.fromhex(box["ct"]), aad)
-    except (InvalidTag, KeyError, ValueError) as exc:
+    except (InvalidTag, KeyError, TypeError, ValueError) as exc:
         raise AuthenticationError("perfil: falha de autenticação") from exc
 
 
@@ -270,6 +432,50 @@ def _params_obj(p: KdfParams) -> dict[str, int]:
 
 def _params_from(o: dict[str, Any]) -> KdfParams:
     return KdfParams(int(o["memory_kib"]), int(o["iterations"]), int(o["parallelism"]))
+
+
+def _dump(obj: dict[str, Any]) -> bytes:
+    return json.dumps(obj, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+
+
+def _parse(data: bytes) -> dict[str, Any]:
+    obj = json.loads(data.decode("utf-8"))
+    if not isinstance(obj, dict) or obj.get("kind") != PROFILE_KIND:
+        raise FormatError("arquivo de perfil inválido")
+    if obj.get("version") != PROFILE_VERSION:
+        raise FormatError("versão de perfil não suportada")
+    if not isinstance(obj.get("profile_id"), str) or not obj["profile_id"]:
+        raise FormatError("arquivo de perfil inválido")
+    return obj
+
+
+#: o que torna uma cópia "ilegível" (cai para a outra); erro de acesso NÃO está aqui
+_UNREADABLE = (FileNotFoundError, FormatError, ValueError, UnicodeDecodeError, RecursionError)
+
+
+def _as_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _pin_failures(o: dict[str, Any]) -> int:
+    """Contador de uma cópia; um valor adulterado/ilegível conta como esgotado."""
+    try:
+        return max(0, int(o.get("pin_failures", 0)))
+    except (TypeError, ValueError, OverflowError):
+        return MAX_PIN_FAILURES
+
+
+def _pin_state(obj: dict[str, Any], other: dict[str, Any] | None) -> tuple[Any, int]:
+    """(caixa do PIN utilizável ou None, contador efetivo). Efetivo = máximo das cópias; um PIN
+    desativado em QUALQUER cópia (ou com o contador esgotado) está desativado."""
+    copies = [obj] if other is None else [obj, other]
+    failures = max(_pin_failures(c) for c in copies)
+    if failures >= MAX_PIN_FAILURES or any(c.get("pin") is None for c in copies):
+        return None, failures
+    return obj.get("pin"), failures
 
 
 class ProfileStore:
@@ -282,6 +488,8 @@ class ProfileStore:
         self.path = self.dir / "perfil.owlp"
         self.bak = self.dir / "perfil.owlp.bak"
         self.policy = policy
+        #: a última ``read_raw`` precisou da cópia de segurança (principal ausente/ilegível)
+        self.last_read_used_backup = False
 
     def exists(self) -> bool:
         return self.path.exists() or self.bak.exists()
@@ -300,55 +508,82 @@ class ProfileStore:
                     raise
                 time.sleep(delay)
                 delay = min(delay * 2, 1.0)
-        obj = json.loads(data.decode("utf-8"))
-        if not isinstance(obj, dict) or obj.get("kind") != PROFILE_KIND:
-            raise FormatError("arquivo de perfil inválido")
-        if obj.get("version") != PROFILE_VERSION:
-            raise FormatError("versão de perfil não suportada")
-        return obj
+        return _parse(data)
+
+    def _read_or_none(self, path: Path) -> dict[str, Any] | None:
+        try:
+            return self._read_one(path)
+        except _UNREADABLE:
+            return None
+
+    def _read_copies(self) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """(principal, .bak), cada um None se ausente/ilegível. Erro de acesso sobe."""
+        return self._read_or_none(self.path), self._read_or_none(self.bak)
+
+    def _read_pair(self) -> tuple[dict[str, Any], dict[str, Any] | None, bool]:
+        """(cópia em uso, a outra cópia do MESMO perfil se legível, usou o .bak?)."""
+        primary, backup = self._read_copies()
+        if primary is None:
+            if backup is None:
+                raise ProfileCorruptError("perfil ausente ou ilegível")
+            return backup, None, True
+        if backup is not None and backup.get("profile_id") != primary["profile_id"]:
+            backup = None
+        return primary, backup, False
 
     def read_raw(self) -> tuple[dict[str, Any], dict[str, Any] | None]:
         """(principal ou .bak, a outra cópia se legível). Nunca cai para o .bak por erro de
-        acesso — só por arquivo ausente/corrompido."""
-        primary: dict[str, Any] | None = None
-        backup: dict[str, Any] | None = None
-        try:
-            primary = self._read_one(self.path)
-        except FileNotFoundError:
-            primary = None
-        except (FormatError, ValueError, UnicodeDecodeError):
-            primary = None
-        try:
-            backup = self._read_one(self.bak)
-        except (FileNotFoundError, FormatError, ValueError, UnicodeDecodeError):
-            backup = None
-        if primary is None and backup is None:
-            raise ProfileCorruptError("perfil ausente ou ilegível")
-        if primary is None:
-            assert backup is not None
-            return backup, None
-        return primary, backup
+        acesso — só por arquivo ausente/corrompido (``last_read_used_backup`` diz se caiu)."""
+        obj, other, used_backup = self._read_pair()
+        self.last_read_used_backup = used_backup
+        return obj, other
 
     # -- gravação
-    def write(self, obj: dict[str, Any]) -> None:
-        """tmp + flush + os.replace; a versão anterior vira o .bak."""
-        self.dir.mkdir(parents=True, exist_ok=True)
-        data = json.dumps(obj, ensure_ascii=True, separators=(",", ":")).encode("ascii")
-        tmp = self.dir / f"perfil.owlp.{secrets.token_hex(8)}.tmp"
-        with open(tmp, "xb") as fh:
-            fh.write(data)
-            fh.flush()
-            os.fsync(fh.fileno())
+    def _tmp_write(self, name: str, data: bytes) -> Path:
+        tmp = self.dir / f"{name}.{secrets.token_hex(8)}.tmp"
+        with open(tmp, "xb") as fh:  # "x": nunca reaproveita (nem apaga) um arquivo que existe
+            try:
+                fh.write(data)
+                fh.flush()
+                os.fsync(fh.fileno())
+            except BaseException:
+                fh.close()
+                with contextlib.suppress(OSError):
+                    tmp.unlink()
+                raise
+        return tmp
+
+    def _install(self, tmp: Path, dest: Path) -> None:
         try:
-            if self.path.exists():
-                old = self.path.read_bytes()
-                btmp = self.dir / f"perfil.owlp.bak.{secrets.token_hex(8)}.tmp"
-                with open(btmp, "xb") as fh:
-                    fh.write(old)
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                winfs.retry_on_sharing(lambda: os.replace(btmp, self.bak))
-            winfs.retry_on_sharing(lambda: os.replace(tmp, self.path))
+            winfs.retry_on_sharing(lambda: os.replace(tmp, dest))
+        finally:
+            if tmp.exists():
+                with contextlib.suppress(OSError):
+                    tmp.unlink()
+
+    def _write_one(self, path: Path, obj: dict[str, Any]) -> None:
+        """Grava UMA cópia (tmp + flush + os.replace), sem mexer na outra."""
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self._install(self._tmp_write(path.name, _dump(obj)), path)
+
+    def write(self, obj: dict[str, Any]) -> None:
+        """tmp + flush + os.replace; a versão anterior vira o .bak (só se for legível: um
+        principal danificado nunca toma o lugar de um .bak bom)."""
+        self.dir.mkdir(parents=True, exist_ok=True)
+        tmp = self._tmp_write(self.path.name, _dump(obj))
+        try:
+            try:
+                old: bytes | None = self.path.read_bytes()
+            except FileNotFoundError:
+                old = None
+            if old is not None:
+                try:
+                    _parse(old)
+                except _UNREADABLE:
+                    old = None
+            if old is not None:
+                self._install(self._tmp_write(self.bak.name, old), self.bak)
+            self._install(tmp, self.path)
         finally:
             if tmp.exists():
                 tmp.unlink()
@@ -357,12 +592,33 @@ class ProfileStore:
         """Grava o mesmo conteúdo nas DUAS cópias (contador de PIN, desativação do PIN)."""
         self.write(obj)
         data = self.path.read_bytes()
-        btmp = self.dir / f"perfil.owlp.bak.{secrets.token_hex(8)}.tmp"
-        with open(btmp, "xb") as fh:
-            fh.write(data)
-            fh.flush()
-            os.fsync(fh.fileno())
-        winfs.retry_on_sharing(lambda: os.replace(btmp, self.bak))
+        self._install(self._tmp_write(self.bak.name, data), self.bak)
+
+    def _store_counter(
+        self,
+        obj: dict[str, Any],
+        other: dict[str, Any] | None,
+        used_backup: bool,
+        failures: int,
+        *,
+        disable: bool = False,
+        reset: bool = False,
+    ) -> None:
+        """Grava o contador do PIN (e a desativação) em CADA cópia legível, preservando o resto
+        de cada uma: o índice/cabeçalho de uma cópia nunca vai por cima da outra antes de
+        autenticar. Uma cópia ilegível não conta (o efetivo vem da legível) e fica como está
+        até um desbloqueio bem-sucedido regravar as duas."""
+
+        def updated(o: dict[str, Any]) -> dict[str, Any]:
+            c = dict(o)
+            c["pin_failures"] = 0 if reset else max(_pin_failures(o), failures)
+            if disable:
+                c["pin"] = None
+            return c
+
+        if other is not None:
+            self._write_one(self.bak, updated(other))
+        self._write_one(self.bak if used_backup else self.path, updated(obj))
 
     # -- criação
     def create(self, master: str, pin: str, *, params: KdfParams | None = None) -> ProfileSession:
@@ -394,7 +650,7 @@ class ProfileStore:
         }
         session = ProfileSession(self, obj, pk, index)
         session.set_pin(pin, save=False)
-        session.save()
+        session._commit(both=True, merge=False)  # já nasce com a cópia de segurança
         return session
 
     # -- desbloqueio
@@ -407,69 +663,113 @@ class ProfileStore:
         return _dt.date.today() >= due
 
     def pin_available(self) -> bool:
-        obj, _ = self.read_raw()
-        return obj.get("pin") is not None
-
-    def unlock_with_master(self, master: str) -> ProfileSession:
+        """Há PIN utilizável? Não, se QUALQUER cópia o desativou ou se o contador efetivo
+        (máximo das duas cópias) chegou ao limite — o mesmo critério de ``unlock_with_pin``."""
         obj, other = self.read_raw()
+        box, _ = _pin_state(obj, other)
+        return box is not None
+
+    def _open_with_master(
+        self, master: str, obj: dict[str, Any], other: dict[str, Any] | None
+    ) -> tuple[bytes, bool]:
+        """PK pelo ``wrap_sm`` do principal ou, se ele não autenticar, pelo do .bak.
+        Devolve (PK, veio do .bak?)."""
         mem = winfs.memory_status()
         avail = mem.available_commit if mem else None
-        kdf = obj["kdf"]
-        params = _params_from(kdf)
-        validate_params(params, self.policy)
-        salt = bytes.fromhex(kdf["salt"])
-        kek = derive_kek(master, salt, params, self.policy, avail)
-        try:
-            pk = _open(kek, obj["wrap_sm"], _aad(obj["profile_id"], "sm"))
-        except AuthenticationError as exc:
-            raise AuthenticationError("Senha mestra incorreta.") from exc
+        aad = _aad(str(obj["profile_id"]), "sm")
+        derived: dict[tuple[bytes, KdfParams], bytes] = {}
+        tried = False
+        problem: Exception | None = None
+        for header in (obj, other):
+            if header is None:
+                continue
+            try:
+                kdf = header["kdf"]
+                params = _params_from(kdf)
+                validate_params(params, self.policy)
+                salt = bytes.fromhex(kdf["salt"])
+                if len(salt) != SALT_SIZE:
+                    raise FormatError("salt do perfil com tamanho inválido")
+                box = header["wrap_sm"]
+            except (KeyError, TypeError, ValueError, FormatError) as exc:
+                problem = exc
+                continue
+            kek = derived.get((salt, params))
+            if kek is None:
+                kek = derive_kek(master, salt, params, self.policy, avail)
+                derived[(salt, params)] = kek
+            tried = True
+            try:
+                return _open(kek, box, aad), header is not obj
+            except AuthenticationError:
+                continue
+        if not tried:
+            raise ProfileCorruptError(_HEADER_CORRUPT) from problem
+        raise AuthenticationError("Senha mestra incorreta.")
+
+    def unlock_with_master(self, master: str) -> ProfileSession:
+        obj, other, used_backup = self._read_pair()
+        pk, header_from_backup = self._open_with_master(master, obj, other)
         session = ProfileSession(self, obj, pk, None)
-        session.load_index(fallback=other)
+        if used_backup or header_from_backup:
+            session._note_backup()
+        session.load_index(fallback=other)  # ProfileCorruptError se nenhuma cópia autenticar
+        session._heal_header(other)
         today = _dt.date.today()
         obj["practice_due"] = (today + _dt.timedelta(days=PRACTICE_EVERY_DAYS)).isoformat()
+        # a SM devolve as tentativas do PIN (nas DUAS cópias), mas não reativa um PIN
+        # desativado: isso só com set_pin
+        if _pin_state(obj, other)[0] is None:
+            obj["pin"] = None
         obj["pin_failures"] = 0
-        session.save()
+        session._commit(both=True, merge=False)
         return session
 
     def unlock_with_pin(self, pin: str) -> ProfileSession:
-        obj, other = self.read_raw()
-        failures = max(int(obj.get("pin_failures", 0)), int((other or {}).get("pin_failures", 0)))
-        pin_box = obj.get("pin")
-        if pin_box is None or failures >= MAX_PIN_FAILURES:
+        obj, other, used_backup = self._read_pair()
+        box, failures = _pin_state(obj, other)
+        if box is None:
             raise PinUnavailableError("O PIN está desativado. Use a senha mestra.")
+        profile_id = str(obj["profile_id"])
         try:
-            inner = dpapi.unprotect(bytes.fromhex(pin_box["blob"]), obj["profile_id"].encode())
+            blob = bytes.fromhex(box["blob"])
+            salt = bytes.fromhex(box["salt"])
+            params = _params_from(box)
+            validate_params(params, self.policy)
+            if len(salt) != SALT_SIZE:
+                raise FormatError("salt do PIN com tamanho inválido")
+        except (KeyError, TypeError, ValueError, FormatError) as exc:
+            raise DpapiUnavailableError(_PIN_DAMAGED) from exc
+        try:
+            inner = dpapi.unprotect(blob, profile_id.encode())
         except AuthenticationError as exc:
-            raise DpapiUnavailableError(
-                "O Windows não consegue mais usar o PIN deste computador (a senha do Windows foi "
-                "redefinida ou o Windows foi reinstalado). Digite sua senha mestra."
-            ) from exc
-        # conta a tentativa ANTES de derivar (nas duas cópias)
-        obj["pin_failures"] = failures + 1
-        self.write_both(obj)
+            raise DpapiUnavailableError(_DPAPI_GONE) from exc
+        # conta a tentativa ANTES de derivar, em cada cópia e sem trocar o resto dela
+        attempt = failures + 1
+        self._store_counter(obj, other, used_backup, attempt)
         mem = winfs.memory_status()
-        params = _params_from(pin_box)
-        validate_params(params, self.policy)
-        kpin = derive_kek(
-            pin,
-            bytes.fromhex(pin_box["salt"]),
-            params,
-            self.policy,
-            mem.available_commit if mem else None,
-        )
+        kpin = derive_kek(pin, salt, params, self.policy, mem.available_commit if mem else None)
         try:
-            box = json.loads(inner.decode("ascii"))
-            pk = _open(kpin, box, _aad(obj["profile_id"], "pin"))
+            pk = _open(kpin, json.loads(inner.decode("ascii")), _aad(profile_id, "pin"))
         except (AuthenticationError, ValueError) as exc:
-            remaining = MAX_PIN_FAILURES - (failures + 1)
+            remaining = MAX_PIN_FAILURES - attempt
             if remaining <= 0:
-                obj["pin"] = None
-                self.write_both(obj)
+                self._store_counter(obj, other, used_backup, attempt, disable=True)
             raise PinError(max(0, remaining)) from exc
-        obj["pin_failures"] = 0
         session = ProfileSession(self, obj, pk, None)
-        session.load_index(fallback=other)
-        self.write_both(obj)
+        if used_backup:
+            session._note_backup()
+        try:
+            session.load_index(fallback=other)
+        except ProfileCorruptError:
+            # o PIN estava certo: a tentativa não conta (só o contador é regravado; as cópias
+            # danificadas ficam como estão)
+            self._store_counter(obj, other, used_backup, 0, reset=True)
+            raise
+        session._heal_header(other)
+        obj["pin_failures"] = 0
+        # re-sela o índice que está em memória (autêntico, mesmo vindo do .bak) nas DUAS cópias
+        session._commit(both=True, merge=False)
         return session
 
 
@@ -484,6 +784,9 @@ class ProfileSession:
         self._pk: bytes | None = pk
         self._index = index
         self.notes: list[str] = []
+        #: o desbloqueio precisou da cópia de segurança (índice, cabeçalho ou arquivo inteiro)
+        self.used_backup = False
+        self._pin_seen: Any = obj.get("pin")  # o PIN que esta sessão sabe estar no disco
 
     @property
     def profile_id(self) -> str:
@@ -500,18 +803,73 @@ class ProfileSession:
             raise OwlVaultError("perfil travado")
         return self._pk
 
+    def _note(self, text: str) -> None:
+        if text not in self.notes:
+            self.notes.append(text)
+
+    def _note_backup(self) -> None:
+        self.used_backup = True
+        self._note(NOTE_BACKUP_USED)
+
     def load_index(self, fallback: dict[str, Any] | None) -> None:
+        """Abre o índice do principal ou, se não autenticar, o do ``fallback`` (.bak).
+        Nenhum autentica com a PK certa ⇒ ``ProfileCorruptError`` (nunca "senha incorreta")."""
         pk = self._require_pk()
-        try:
-            data = _open(pk, self.obj["index"], _aad(self.profile_id, "index"))
-        except (AuthenticationError, TypeError) as exc:
-            if fallback is None or fallback.get("profile_id") != self.profile_id:
-                raise AuthenticationError("o índice do perfil está corrompido") from exc
-            data = _open(pk, fallback["index"], _aad(self.profile_id, "index"))
-            self.notes.append(
-                "O arquivo principal do perfil estava danificado; foi usada a cópia de segurança."
-            )
-        self._index = Index.from_obj(json.loads(data.decode("utf-8")))
+        aad = _aad(self.profile_id, "index")
+        sources = [self.obj]
+        if (
+            fallback is not None
+            and fallback is not self.obj
+            and fallback.get("profile_id") == self.profile_id
+        ):
+            sources.append(fallback)
+        for n, src in enumerate(sources):
+            try:
+                data = _open(pk, src["index"], aad)
+                index = Index.from_obj(json.loads(data.decode("utf-8")))
+            except (AuthenticationError, AttributeError, KeyError, TypeError, ValueError):
+                continue
+            self._index = index
+            if n:
+                self._note_backup()
+            return
+        raise ProfileCorruptError(_INDEX_CORRUPT)
+
+    def _heal_header(self, other: dict[str, Any] | None) -> None:
+        """Garante que ``kdf``/``wrap_sm`` abrem com a KEK atual do índice (autenticado) antes
+        de gravar as duas cópias: usa o cabeçalho do .bak se só ele estiver bom, ou refaz o
+        ``wrap_sm`` quando o ``kdf`` confere. Assim um cabeçalho danificado nunca se espalha."""
+        pk = self._require_pk()
+        if not self.index.keks:
+            return
+        k = self.index.keks[0]
+        aad = _aad(self.profile_id, "sm")
+
+        def kdf_ok(h: dict[str, Any]) -> bool:
+            try:
+                kdf = h["kdf"]
+                return bytes.fromhex(kdf["salt"]) == k.salt and _params_from(kdf) == k.params
+            except (KeyError, TypeError, ValueError):
+                return False
+
+        def good(h: dict[str, Any]) -> bool:
+            if not kdf_ok(h):
+                return False
+            try:
+                return _open(k.kek, h["wrap_sm"], aad) == pk
+            except (AuthenticationError, KeyError, TypeError):
+                return False
+
+        if good(self.obj):
+            return
+        if other is not None and other.get("profile_id") == self.profile_id and good(other):
+            self.obj["kdf"] = dict(other["kdf"])
+            self.obj["wrap_sm"] = dict(other["wrap_sm"])
+            self._note_backup()
+            return
+        if kdf_ok(self.obj):
+            self.obj["wrap_sm"] = _seal(k.kek, pk, aad)
+            self._note(NOTE_MASTER_REBUILT)
 
     def key_source(self) -> KeySource:
         k = self.index.keks[0]
@@ -520,12 +878,47 @@ class ProfileSession:
     def key_sources(self) -> list[KeySource]:
         return [KeySource(salt=k.salt, params=k.params, kek=k.kek) for k in self.index.keks]
 
-    def save(self) -> None:
+    def _merge_pin_state(self, disk: list[dict[str, Any]]) -> None:
+        """Uma sessão antiga nunca reativa um PIN desativado, nem zera o contador, nem desfaz um
+        PIN trocado por outra sessão: nesses campos o disco manda (contador = máximo)."""
+        if not disk:
+            return
+        failures = max([_pin_failures(self.obj)] + [_pin_failures(c) for c in disk])
+        if any(c.get("pin") is None for c in disk):
+            self.obj["pin"] = None
+        else:
+            current = disk[0].get("pin")
+            if current != self._pin_seen and self.obj.get("pin") == self._pin_seen:
+                # outra sessão criou um PIN novo: vale o do disco, com o contador dele
+                self.obj["pin"] = current
+                failures = max(_pin_failures(c) for c in disk if c.get("pin") == current)
+        self.obj["pin_failures"] = failures
+
+    def _commit(self, *, both: bool, merge: bool) -> None:
         pk = self._require_pk()
-        self.obj["generation"] = int(self.obj.get("generation", 0)) + 1
-        payload = json.dumps(self.index.to_obj(), ensure_ascii=False).encode("utf-8")
+        index = self.index
+        primary, backup = self.store._read_copies()
+        disk = [
+            c for c in (primary, backup) if c is not None and c.get("profile_id") == self.profile_id
+        ]
+        if merge:
+            self._merge_pin_state(disk)
+        generations = [_as_int(self.obj.get("generation"))]
+        generations += [_as_int(c.get("generation")) for c in disk]
+        self.obj["generation"] = max(generations) + 1
+        payload = json.dumps(index.to_obj(), ensure_ascii=False).encode("utf-8")
         self.obj["index"] = _seal(pk, payload, _aad(self.profile_id, "index"))
-        self.store.write(self.obj)
+        if both:
+            self.store.write_both(self.obj)
+        else:
+            self.store.write(self.obj)
+        self._pin_seen = self.obj.get("pin")
+
+    def save(self) -> None:
+        """Re-sela o índice e grava (a versão anterior vira o .bak). Relê o disco antes: o
+        contador do PIN fica no máximo (memória, principal, .bak) e um PIN desativado no
+        disco continua desativado."""
+        self._commit(both=False, merge=True)
 
     def set_pin(self, pin: str, *, save: bool = True) -> None:
         validate_pin(pin)
@@ -541,9 +934,9 @@ class ProfileSession:
         self.obj["pin"] = {"salt": salt.hex(), **_params_obj(params), "blob": blob.hex()}
         self.obj["pin_failures"] = 0
         if save:
-            self.save()
-            # o PIN antigo não pode continuar valendo no .bak
-            self.store.write_both(self.obj)
+            # PIN novo e contador zerado DE PROPÓSITO, nas duas cópias (o PIN antigo não pode
+            # continuar valendo no .bak)
+            self._commit(both=True, merge=False)
 
     def change_master(self, new_master: str) -> None:
         """Cria uma senha mestra nova (a antiga continua guardada no índice para abrir os
@@ -555,11 +948,13 @@ class ProfileSession:
         params = calibrate(avail, mem.total_physical if mem else None)
         salt = os.urandom(SALT_SIZE)
         kek = derive_kek(new_master, salt, params, self.store.policy, avail)
-        self.index.keks.insert(0, KekEntry(salt, params, kek))
+        for old in self.index.keks:
+            if old.origin == KEK_PERFIL:
+                old.origin = KEK_TROCADA
+        self.index.keks.insert(0, KekEntry(salt, params, kek, KEK_PERFIL))
         self.obj["kdf"] = {"salt": salt.hex(), **_params_obj(params)}
         self.obj["wrap_sm"] = _seal(kek, pk, _aad(self.profile_id, "sm"))
-        self.save()
-        self.store.write_both(self.obj)
+        self._commit(both=True, merge=True)
 
     def close(self) -> None:
         self._pk = None

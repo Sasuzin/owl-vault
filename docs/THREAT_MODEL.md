@@ -180,10 +180,22 @@ guardá-las cifradas dentro dela (`P\.owlvault`, um cofre v1). Detalhes normativ
 | B2 | Alguém com acesso à **sua conta** com o app travado | Não abre pastas trancadas sem PIN/senha mestra. Pode tentar PINs: 5 tentativas por cópia do perfil, cada uma custa um Argon2id; quem copia/restaura o arquivo do perfil consegue mais tentativas — o PIN é fraco por natureza (6–12 dígitos) e isso está escrito na tela de limites |
 | B3 | Alguém com acesso à sua conta com o app **destravado** ou pasta **aberta** | Fora do escopo: lê tudo o que estiver aberto. Mitigação: travamento automático (5 min, Win+L, suspensão) e "Trancar e sair" |
 | B4 | Malware na sua conta | Fora do escopo (§4) |
+| B6 | Outra conta comum do computador com permissão de escrita na pasta (pastas criadas direto na raiz de C: ou de D: herdam "Usuários autenticados: Modificar") | Não consegue trocar o atalho nem ler a área temporária: esses itens recebem permissões só da conta dona (+SYSTEM/Administradores). Pode renomear/mover a pasta trancada: o Owl Vault reconhece a pasta pelo identificador do NTFS e pelo cofre dentro dela |
 | B5 | Itens colocados numa pasta trancada | Não são apagados nem cifrados; a pasta vai para "Precisa de atenção" e a abertura espera o usuário movê-los |
 
 ### Limites conhecidos
 
+* O atalho "Abrir com Owl Vault" contém o caminho do programa instalado (com o nome da conta
+  do Windows) e o código da pasta; não contém nome do computador, série do volume, LinkInfo
+  nem o caminho da pasta (o ícone é o do próprio executável).
+* A DACL restrita (conta atual + SYSTEM + Administradores, sem herança) na área temporária
+  `.owlvault-<código>`, em `P\.owlvault` e no espaço reservado é **melhor esforço**: se o
+  Windows recusar a troca, esses itens ficam com as permissões herdadas da pasta-mãe (que podem
+  dar escrita a "Usuários autenticados", ver B6) e o Owl Vault segue sem erro.
+* O atalho é conferido a cada início e antes de atender um pedido vindo dele; se estiver
+  diferente, é refeito e o app avisa. Entre a troca e a conferência, porém, quem clicar no
+  atalho trocado executa o que estiver nele — por isso "Como abrir esta pasta.txt" orienta a
+  abrir pelo Menu Iniciar.
 * O nome da pasta trancada é visível; "Esconder do Explorer" usa atributos oculto+sistema e
   não é criptografia.
 * Trancar não apaga rastros do Windows nem sobrescreve setores do SSD (§4, §5).

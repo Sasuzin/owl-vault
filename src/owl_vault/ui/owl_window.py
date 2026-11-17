@@ -1,28 +1,46 @@
-"""Janela principal da v2: pastas protegidas (UI_SPEC_V2).
+"""Janela principal da v2 no visual "Cofre": pastas protegidas (UI_SPEC_V2, ESTILO5-COFRE).
 
-Fluxo: assistente (1ª vez) → PIN → lista "Pastas protegidas". Operações longas rodam numa
-thread (``JobRunner``) com a tela de progresso modal; o perfil destravado fica só em memória e
-é descartado ao bloquear (5 min sem uso, Win+L, suspensão ou ☰ > Bloquear agora).
+Estrutura: QWidget central sem margens = conteúdo (margens 32/20/32/24: marca e ☰ no topo, as
+telas num QStackedWidget) + rodapé na largura toda (cada tela tem o seu ``Rodape``; os dois
+QStackedWidget trocam juntos). Fluxo: assistente (1ª vez) → PIN → lista "Pastas protegidas";
+"Proteger uma pasta" é um assistente na própria janela (``protect_flow``). As demais operações
+longas mostram a ``ProgressDialog``. Todo trabalho pesado roda numa thread (``JobRunner``), um
+por vez; o perfil destravado fica só em memória e é descartado ao bloquear (5 min sem uso,
+Win+L, suspensão ou ☰ > Bloquear agora).
 """
 
 from __future__ import annotations
 
 import ctypes
+import os
 import re
 import sys
 import time
 from collections.abc import Callable
 from ctypes import wintypes
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Slot
 from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QShowEvent
-from PySide6.QtWidgets import QApplication, QDialog, QMainWindow, QMenu, QStackedWidget, QWidget
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QFrame,
+    QHBoxLayout,
+    QMainWindow,
+    QMenu,
+    QSizePolicy,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
+)
 
-from owl_vault import __version__
+from owl_vault import version_label
 from owl_vault.application.lockers import (
     ABERTA,
+    MANTIDO,
     TRANCADA,
     VAULT_DIR,
     LockerManager,
@@ -34,6 +52,7 @@ from owl_vault.application.profile import (
     DpapiUnavailableError,
     PinError,
     PinUnavailableError,
+    ProfileCorruptError,
     ProfileSession,
     ProfileStore,
 )
@@ -46,19 +65,19 @@ from owl_vault.domain.errors import (
     CancelledError,
     OwlVaultError,
     PreflightError,
+    StateError,
 )
 from owl_vault.storage import winfs
 from owl_vault.ui.common import (
     ProgressDialog,
     choose_folder,
-    fmt_duration,
     hidpi,
     open_in_explorer,
     short_list,
 )
+from owl_vault.ui.componentes import BotaoMais, Marca, sombra, transparente
 from owl_vault.ui.folder_dialogs import (
     ChangePinDialog,
-    ConfirmProtectDialog,
     NewSecretDialog,
     PickDialog,
     SecretDialog,
@@ -66,9 +85,17 @@ from owl_vault.ui.folder_dialogs import (
     inform,
     limits_dialog,
 )
-from owl_vault.ui.icon import WORD_PURPLE, ico_bytes, logo_image, owl_icon
-from owl_vault.ui.pages import HomePage, SetupPage, UnlockPage
-from owl_vault.ui.theme import apply_theme, save_theme, saved_theme
+from owl_vault.ui.icon import ico_bytes, logo_image, owl_icon
+from owl_vault.ui.pages import (
+    VISIVEIS,
+    HomePage,
+    Pagina,
+    ProfileProblemPage,
+    SetupPage,
+    UnlockPage,
+)
+from owl_vault.ui.protect_flow import ProtectPage
+from owl_vault.ui.theme import apply_theme, current_tokens, save_theme, saved_theme
 from owl_vault.ui.workers import JobRunner, QtProgress
 
 IDLE_LOCK_SECONDS = 5 * 60
@@ -77,8 +104,23 @@ WTS_SESSION_LOCK = 0x7
 WM_POWERBROADCAST = 0x0218
 PBT_APMSUSPEND = 0x4
 FOLDER_ID_RE = re.compile(r"[0-9a-f]{32}")
+#: origem de um pedido "abrir <id>": a linha de comando (o atalho iniciou o app) ou uma
+#: mensagem da instância única (o app já estava rodando) — esta pede confirmação com o nome
+ORIGEM_LINHA = "linha"
+ORIGEM_MENSAGEM = "mensagem"
+BUSY_TEXT = "Espere a operação atual terminar."
+#: avisos de versão anterior mantida: a pasta aberta continua utilizável
+KEPT_ISSUES = ("versao_anterior", "versao_anterior_ilegivel")
 
 ErrorHandler = Callable[[BaseException], bool]
+
+
+@dataclass
+class _Job:
+    dialog: ProgressDialog | None
+    on_done: Callable[[Any], None]
+    on_error: ErrorHandler | None
+    after: Callable[[], None] | None
 
 
 class _InputWatcher(QObject):
@@ -109,10 +151,10 @@ class OwlWindow(QMainWindow):
         profile_dir: Path | None = None,
     ) -> None:
         super().__init__()
-        self.setWindowTitle("Owl Vault")
+        self.setWindowTitle(f"Owl Vault {version_label()}")
         self.setWindowIcon(owl_icon())
-        self.resize(820, 640)
-        self.setMinimumSize(560, 460)
+        self.resize(980, 760)
+        self.setMinimumSize(760, 580)
         self.launcher = launcher
         self.policy = policy
         self.store = ProfileStore(profile_dir, policy)
@@ -121,16 +163,20 @@ class OwlWindow(QMainWindow):
         self.pending_open = (
             open_request if open_request and FOLDER_ID_RE.fullmatch(open_request) else None
         )
+        self._pending_source = ORIGEM_LINHA
         self._icon = ico_bytes()
-        self._job: (
-            tuple[ProgressDialog | None, Callable[[Any], None], ErrorHandler | None] | None
-        ) = None
+        self._job: _Job | None = None
         self._lock_after_job = False
+        self._quit_after_job = False
+        self._quit_sequence = False
+        self._after_unlock_pending = False
+        self._recovering = False
         self._skip_practice = False
         self._needs_new_pin = False
         self._wants_new_master = False
         self._wants_recover = False
         self._quitting = False
+        self._visible_count = 0
         self._wts_registered = False
         self._copy_window: QWidget | None = None
 
@@ -138,19 +184,32 @@ class OwlWindow(QMainWindow):
         self.runner.done.connect(self._job_done)
         self.runner.error.connect(self._job_failed)
 
-        self.pages = QStackedWidget()
         self.setup_page = SetupPage()
         self.setup_page.finished.connect(self._create_profile)
         self.unlock_page = UnlockPage()
         self.unlock_page.submitted.connect(self._submit_unlock)
         self.unlock_page.new_master_requested.connect(self._request_new_master)
         self.unlock_page.use_pin_once.connect(self._use_pin_once)
-        self.home = HomePage(self._build_menu())
-        self.home.protect_clicked.connect(self._protect)
+        self.problem_page = ProfileProblemPage()
+        self.problem_page.recover_requested.connect(self._recover_corrupt_profile)
+        self.problem_page.retry_requested.connect(self._start)
+        self.home = HomePage()
+        self.home.protect_clicked.connect(lambda: self._protect())
         self.home.lock_all_clicked.connect(self._lock_all)
-        for p in (self.setup_page, self.unlock_page, self.home):
-            self.pages.addWidget(p)
-        self.setCentralWidget(self.pages)
+        self.protect_page = ProtectPage(self.runner)
+        self.protect_page.back_to_list.connect(self._back_to_list)
+        self.protect_page.check_requested.connect(self._protect_check)
+        self.protect_page.lock_requested.connect(self._protect_lock)
+        self._all_pages: list[Pagina] = [
+            self.setup_page,
+            self.unlock_page,
+            self.problem_page,
+            self.home,
+            self.protect_page,
+        ]
+
+        self.menu = self._build_menu()
+        self._build_layout()
 
         self._watcher = _InputWatcher()
         app = QApplication.instance()
@@ -162,14 +221,65 @@ class OwlWindow(QMainWindow):
         self._idle.start()
         self._start()
 
+    # ------------------------------------------------------------------ estrutura
+    def _build_layout(self) -> None:
+        central = QWidget()
+        root = QVBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        conteudo = QWidget()
+        cl = QVBoxLayout(conteudo)
+        cl.setContentsMargins(32, 20, 32, 24)
+        cl.setSpacing(20)
+        topo, tl = transparente(QHBoxLayout)
+        tl.addWidget(Marca())
+        tl.addStretch(1)
+        self.menu_button = BotaoMais(self.menu, "Menu", "☰")
+        tl.addWidget(self.menu_button)
+        cl.addWidget(topo)
+        self.pages = QStackedWidget()
+        self.pages.setObjectName("transparente")
+        for p in self._all_pages:
+            self.pages.addWidget(p)
+        cl.addWidget(self.pages, 1)
+        root.addWidget(conteudo, 1)
+        self.rodapes = QStackedWidget()
+        self.rodapes.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        for p in self._all_pages:
+            self.rodapes.addWidget(p.rodape)
+        root.addWidget(self.rodapes)
+        self.setCentralWidget(central)
+
+    def _show_page(self, page: Pagina) -> None:
+        self.pages.setCurrentWidget(page)
+        self.rodapes.setCurrentWidget(page.rodape)
+        self._update_menu()
+        alvo = page.campo_inicial()
+        if alvo is not None:
+            alvo.setFocus()
+
+    def _current_page(self) -> Pagina | None:
+        page = self.pages.currentWidget()
+        return page if isinstance(page, Pagina) else None
+
+    def _status(self, text: str = "", estado: str = "") -> None:
+        page = self._current_page()
+        if page is not None:
+            page.status(text, estado)
+
     # ------------------------------------------------------------------ menu ☰
     def _build_menu(self) -> QMenu:
         menu = QMenu(self)
-        menu.addAction("Recuperar uma pasta protegida…", self._recover)
-        menu.addAction("Cópia criptografada de uma pasta…", self._open_copy_tool)
-        menu.addSeparator()
-        menu.addAction("Alterar PIN…", self._change_pin)
-        menu.addAction("Bloquear agora", self.lock_now)
+        self._session_actions: list[QAction] = []
+
+        def only_unlocked(action: QAction) -> None:
+            self._session_actions.append(action)
+
+        only_unlocked(menu.addAction("Recuperar uma pasta protegida…", lambda: self._recover()))
+        only_unlocked(menu.addAction("Cópia criptografada de uma pasta…", self._open_copy_tool))
+        only_unlocked(menu.addSeparator())
+        only_unlocked(menu.addAction("Alterar PIN…", self._change_pin))
+        only_unlocked(menu.addAction("Bloquear agora", self.lock_now))
         menu.addSeparator()
         menu.addAction("Limites da proteção", lambda: limits_dialog(self))
         theme = menu.addMenu("Tema")
@@ -181,13 +291,23 @@ class OwlWindow(QMainWindow):
             group.addAction(act)
             theme.addAction(act)
         menu.addAction("Sobre o Owl Vault", self._about)
+        menu.aboutToShow.connect(self._update_menu)
         return menu
+
+    def _update_menu(self) -> None:
+        unlocked = self.session is not None
+        for act in self._session_actions:
+            act.setVisible(unlocked)
 
     def _set_theme(self, key: str) -> None:
         save_theme(key)
         app = QApplication.instance()
         if isinstance(app, QApplication):
             apply_theme(app, key)
+        # a sombra dos cartões é um efeito (QSS não tem box-shadow): refaz com o token novo
+        for w in self.findChildren(QFrame):
+            if w.objectName() in ("cartao", "cartaoLateral"):
+                sombra(w)
 
     def _about(self) -> None:
         from PySide6.QtWidgets import QMessageBox  # noqa: PLC0415
@@ -196,8 +316,9 @@ class OwlWindow(QMainWindow):
         box.setWindowTitle("Sobre o Owl Vault")
         box.setIconPixmap(hidpi(lambda px: logo_image(px), 132))
         box.setTextFormat(Qt.TextFormat.RichText)
+        roxo = current_tokens()["accent-text"]
         box.setText(
-            f'<b>Owl <span style="color:{WORD_PURPLE.name()}">Vault</span></b> {__version__}'
+            f'<b>Owl <span style="color:{roxo}">Vault</span></b> {version_label()}'
             "<br>Pastas protegidas por criptografia no seu computador.<br>"
             "AES-256-GCM e Argon2id. Sem nuvem, sem telemetria.<br>"
             "Não houve auditoria independente."
@@ -207,18 +328,27 @@ class OwlWindow(QMainWindow):
     # ------------------------------------------------------------------ início / desbloqueio
     def _start(self) -> None:
         if not self.store.exists():
-            self.pages.setCurrentWidget(self.setup_page)
+            self.setup_page.start()
+            self._show_page(self.setup_page)
         else:
             self._show_unlock()
+
+    def _show_profile_problem(self, *, corrupt: bool, detail: str = "") -> None:
+        self.problem_page.configure(corrupt=corrupt, detail=detail)
+        self._show_page(self.problem_page)
 
     def _show_unlock(self, error: str = "") -> None:
         try:
             pin_ok = self.store.pin_available()
             practice = self.store.practice_due() and not self._skip_practice
-        except (OwlVaultError, OSError, ValueError, KeyError) as exc:
-            pin_ok, practice = False, False
-            error = error or f"O perfil do Owl Vault está danificado: {exc}"
+        except OSError as exc:  # antivírus/backup segurando o arquivo: não é perfil danificado
+            self._show_profile_problem(corrupt=False, detail=str(exc.strerror or exc))
+            return
+        except (OwlVaultError, ValueError, KeyError, TypeError):  # ProfileCorruptError & cia.
+            self._show_profile_problem(corrupt=True)
+            return
         opening = self.pending_open is not None
+        button = "Abrir" if opening else "Entrar"
         if self._wants_new_master:
             self.unlock_page.configure(
                 master=False,
@@ -242,19 +372,49 @@ class OwlWindow(QMainWindow):
                 text="O PIN está desativado. Use a senha mestra.",
                 allow_switch=False,
                 error=error,
+                button=button,
             )
         else:
             self.unlock_page.configure(
                 master=False,
                 title="Abrir pasta protegida" if opening else "Digite seu PIN",
                 error=error,
+                button=button,
             )
-        self.pages.setCurrentWidget(self.unlock_page)
+        self._show_page(self.unlock_page)
+
+    def _recover_corrupt_profile(self) -> None:
+        """Perfil ilegível: guarda os arquivos danificados ao lado e recria com recuperação."""
+        try:
+            self._set_aside_profile()
+        except OSError as exc:
+            self.problem_page.fail(
+                f"Não foi possível guardar o arquivo danificado: {exc.strerror or exc}. Feche "
+                "outros programas e tente de novo."
+            )
+            return
+        self.setup_page.start(recuperar=True)
+        self._show_page(self.setup_page)
+
+    def _set_aside_profile(self) -> list[Path]:
+        """Renomeia ``perfil.owlp``/``.bak`` para ``*.danificado-<data>`` (nunca apaga)."""
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        moved: list[Path] = []
+        for p in (self.store.path, self.store.bak):
+            if not p.exists():
+                continue
+            target = p.with_name(f"{p.name}.danificado-{stamp}")
+            n = 2
+            while target.exists():
+                target = p.with_name(f"{p.name}.danificado-{stamp}-{n}")
+                n += 1
+            os.rename(p, target)
+            moved.append(target)
+        return moved
 
     @Slot(str, str, bool)
     def _create_profile(self, master: str, pin: str, wants_recover: bool) -> None:
         self._wants_recover = wants_recover
-        self.setup_page.set_busy(True, "Preparando a proteção (alguns segundos)…")
 
         def job(_p: QtProgress, _c: CancelToken) -> ProfileSession:
             return self.store.create(master, pin)
@@ -264,7 +424,10 @@ class OwlWindow(QMainWindow):
             self.setup_page.show_failure(str(exc))
             return True
 
-        self._run(job, self._unlocked, on_error=failed)
+        if not self._run(job, self._unlocked, on_error=failed, status=None):
+            self.setup_page.show_failure(BUSY_TEXT)
+            return
+        self.setup_page.set_busy(True, "Preparando a proteção (alguns segundos)…")
 
     @Slot(str, bool)
     def _submit_unlock(self, secret: str, master: bool) -> None:
@@ -273,9 +436,13 @@ class OwlWindow(QMainWindow):
                 return self.store.unlock_with_master(secret)
             return self.store.unlock_with_pin(secret)
 
-        self._run(job, self._unlocked, on_error=self._unlock_failed)
+        if not self._run(job, self._unlocked, on_error=self._unlock_failed, status=None):
+            self.unlock_page.fail(BUSY_TEXT)
 
     def _unlock_failed(self, exc: BaseException) -> bool:
+        if isinstance(exc, ProfileCorruptError):
+            self._show_profile_problem(corrupt=True)
+            return True
         if isinstance(exc, PinError):
             if exc.remaining > 0:
                 self.unlock_page.fail(
@@ -287,7 +454,12 @@ class OwlWindow(QMainWindow):
             return True
         if isinstance(exc, DpapiUnavailableError):
             self._needs_new_pin = True
-            self.unlock_page.configure(master=True, text=str(exc), allow_switch=False)
+            self.unlock_page.configure(
+                master=True,
+                text=str(exc),
+                allow_switch=False,
+                button=self.unlock_page.button_text,
+            )
             return True
         if isinstance(exc, PinUnavailableError):
             self._show_unlock(str(exc))
@@ -295,6 +467,12 @@ class OwlWindow(QMainWindow):
         if isinstance(exc, AuthenticationError):
             self.unlock_page.fail(
                 "Senha mestra incorreta." if self.unlock_page.master else str(exc)
+            )
+            return True
+        if isinstance(exc, OSError):
+            self.unlock_page.fail(
+                f"Não foi possível ler o perfil agora ({exc.strerror or exc}). Feche outros "
+                "programas e tente de novo."
             )
             return True
         self.unlock_page.fail(str(exc))
@@ -315,6 +493,8 @@ class OwlWindow(QMainWindow):
             session, icon_bytes=self._icon, launcher=self.launcher, policy=self.policy
         )
         self._skip_practice = False
+        self._quitting = False
+        self._visible_count = 0  # destravado, quem sabe das pastas é o índice
         self._watcher.last = time.monotonic()
         notes = list(session.notes)
         try:
@@ -323,24 +503,70 @@ class OwlWindow(QMainWindow):
             notes.append(str(exc))
         self._refresh()
         self.home.set_notice(" ".join(notes))
-        self.pages.setCurrentWidget(self.home)
+        self._show_page(self.home)
         QTimer.singleShot(0, self._after_unlock)
 
     def _after_unlock(self) -> None:
-        if self.session is None:
+        """Pendências do desbloqueio, UMA por vez: cada etapa chama a próxima quando o próprio
+        trabalho (ou o diálogo dela) termina — nunca duas operações ao mesmo tempo."""
+        if self.session is None or self.mgr is None or self._quitting:
+            self._after_unlock_pending = False
             return
+        if self.runner.busy:
+            self._after_unlock_pending = True  # _after_job retoma
+            return
+        self._after_unlock_pending = False
+        nxt = self._continue_after_unlock
         if self._needs_new_pin:
             self._needs_new_pin = False
-            self._new_pin_after_master()
+            self._new_pin_after_master(then=nxt)
+            return
         if self._wants_new_master:
             self._wants_new_master = False
-            self._new_master()
+            self._new_master(then=nxt)
+            return
         if self._wants_recover:
             self._wants_recover = False
-            self._recover()
+            self._recovering = True  # o pedido do atalho espera a recuperação terminar
+            self._recover(then=nxt)
+            return
+        recovered, self._recovering = self._recovering, False
         if self.pending_open:
             fid, self.pending_open = self.pending_open, None
-            self._open_folder(fid)
+            source, self._pending_source = self._pending_source, ORIGEM_LINHA
+            self._open_pending(fid, source, recovered=recovered)
+
+    def _continue_after_unlock(self) -> None:
+        QTimer.singleShot(0, self._after_unlock)
+
+    def _open_pending(self, folder_id: str, source: str, *, recovered: bool = False) -> None:
+        if self.session is None:
+            return
+        rec = self.session.index.folder(folder_id)
+        if rec is None:
+            if recovered:  # o atalho antigo aponta para o registro de antes da recuperação
+                self.home.set_notice(
+                    "As pastas recuperadas estão na lista. Use 'Abrir' na pasta que você quer."
+                )
+                return
+            self._not_in_list()
+            return
+        self._check_shortcut(folder_id)
+        # o PIN digitado na tela de desbloqueio não vale como "sim" para um pedido que chegou por
+        # mensagem (outro processo): confirma com o nome da pasta antes de abrir
+        if (
+            source == ORIGEM_MENSAGEM
+            and ask(
+                self,
+                f"Abrir '{rec.name}'?",
+                "O atalho 'Abrir com Owl Vault' desta pasta foi usado. Se não foi você, clique "
+                "em Cancelar.",
+                [("Abrir", "open"), ("Cancelar", "cancel")],
+            )
+            != "open"
+        ):
+            return
+        self._open_folder(folder_id)
 
     def _replace_session(self, new: ProfileSession) -> None:
         old = self.session
@@ -350,12 +576,40 @@ class OwlWindow(QMainWindow):
         if old is not None and old is not new:
             old.close()
 
+    def _sync_pin_state(self) -> None:
+        """Depois de um PIN errado com o app destravado: o disco tem o contador (e talvez o PIN
+        desativado) mais novo que a sessão em memória; sem isto, o próximo ``save()`` gravaria
+        o PIN de volta com o contador zerado."""
+        s = self.session
+        if s is None:
+            return
+        try:
+            obj, other = self.store.read_raw()
+        except (OwlVaultError, OSError, ValueError):
+            return
+        if obj.get("profile_id") != s.obj.get("profile_id"):
+            return
+
+        def failures(o: dict[str, Any] | None) -> int:
+            try:
+                return int((o or {}).get("pin_failures", 0) or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        s.obj["pin"] = obj.get("pin")
+        s.obj["pin_failures"] = max(failures(obj), failures(other), failures(s.obj))
+
     # ------------------------------------------------------------------ bloqueio
     def lock_now(self) -> None:
         if self.runner.busy:
             self._lock_after_job = True
             return
         self._lock_after_job = False
+        self._quit_sequence = False
+        self._after_unlock_pending = False
+        popup = QApplication.activePopupWidget()
+        if popup is not None:
+            popup.close()
         for _ in range(8):
             modal = QApplication.activeModalWidget()
             if modal is None or modal is self:
@@ -364,22 +618,34 @@ class OwlWindow(QMainWindow):
                 modal.reject()
             else:
                 modal.close()
+        if self.mgr is not None:
+            # só a CONTAGEM (sem nomes) fica em memória, para o aviso ao sair (T11)
+            try:
+                self._visible_count = sum(1 for r in self.mgr.folders if r.state in VISIVEIS)
+            except OwlVaultError:
+                self._visible_count = 0
         if self.session is not None:
             self.session.close()
         self.session = None
         self.mgr = None
         self.home.clear()
+        self.protect_page.clear()
         if self.store.exists():
             self._show_unlock()
+        else:
+            self._update_menu()
 
     def _idle_check(self) -> None:
-        if self.session is None or self.runner.busy:
+        if self.session is None or self.runner.busy or self._quit_sequence:
             return
         if time.monotonic() - self._watcher.last >= IDLE_LOCK_SECONDS:
             self.lock_now()
 
     def showEvent(self, event: QShowEvent) -> None:
         super().showEvent(event)
+        if self._quitting and self.session is None:
+            self._quitting = False  # nunca reaparece "meio encerrada" (sem sessão, com a lista)
+            self._start()
         if not self._wts_registered and sys.platform == "win32":
             try:
                 ctypes.windll.wtsapi32.WTSRegisterSessionNotification(
@@ -420,6 +686,9 @@ class OwlWindow(QMainWindow):
     @Slot(str)
     def handle_message(self, text: str) -> None:
         """``abrir <id>`` (atalho da pasta) ou ``mostrar``."""
+        if self._quitting:
+            self._quitting = False
+            self._start()
         self.showNormal()
         self.raise_()
         self.activateWindow()
@@ -427,29 +696,79 @@ class OwlWindow(QMainWindow):
         if len(parts) == 2 and parts[0] == "abrir" and FOLDER_ID_RE.fullmatch(parts[1]):
             self.request_open(parts[1])
 
-    def request_open(self, folder_id: str) -> None:
+    def request_open(self, folder_id: str, source: str = ORIGEM_MENSAGEM) -> None:
         if self.runner.busy:
             inform(self, "Aguarde", "Espere a operação atual terminar e use o atalho de novo.")
             return
         if self.session is None or self.mgr is None:
             self.pending_open = folder_id
+            self._pending_source = source
             if self.store.exists():
                 self._show_unlock()
             return
         rec = self.session.index.folder(folder_id)
-        name = rec.name if rec else "pasta protegida"
-        self._confirm_identity(f"Abrir '{name}'", "", "Abrir", lambda: self._open_folder(folder_id))
+        if rec is None:
+            self._not_in_list()  # nada a proteger aqui: explica sem pedir o PIN
+            return
+        self._confirm_identity(
+            f"Abrir '{rec.name}'", "", "Abrir", lambda: self._open_from_shortcut(folder_id)
+        )
+
+    def _open_from_shortcut(self, folder_id: str) -> None:
+        self._check_shortcut(folder_id)
+        self._open_folder(folder_id)
+
+    def _check_shortcut(self, folder_id: str) -> None:
+        """Pedido vindo do atalho 'Abrir com Owl Vault': confere o espaço reservado da pasta
+        trancada (o atalho é refeito se estiver diferente do esperado) e avisa."""
+        if self.mgr is None:
+            return
+        try:
+            notes = self.mgr.repair_placeholders(folder_id)
+        except (OwlVaultError, OSError):
+            return  # pasta fora do lugar ou sem dados: o próprio 'Abrir' explica
+        if notes:
+            inform(self, "O atalho desta pasta foi refeito", " ".join(notes))
+
+    def _not_in_list(self) -> None:
+        choice = ask(
+            self,
+            "Esta pasta não está na lista",
+            "Esta pasta não está na lista deste computador. Se você reinstalou o Windows ou o "
+            "Owl Vault, recupere-a com a mesma senha mestra.",
+            [("Recuperar uma pasta protegida…", "recover"), ("Fechar", "close")],
+        )
+        if choice == "recover":
+            self._recover()
 
     def _confirm_identity(
-        self, title: str, text: str, button: str, then: Callable[[], None], error: str = ""
+        self,
+        title: str,
+        text: str,
+        button: str,
+        then: Callable[[], None],
+        error: str = "",
+        *,
+        perigo: bool = False,
     ) -> None:
-        """Pede o PIN (ou a senha mestra) de novo e troca a sessão pela nova."""
+        """Pede o PIN (ou a senha mestra) de novo e troca a sessão pela nova. ``perigo``: o
+        botão de ação é destrutivo (ex.: 'Remover proteção')."""
+        if self.runner.busy:
+            self._status(BUSY_TEXT, "erro")
+            return
         try:
             pin_ok = self.store.pin_available()
         except (OwlVaultError, OSError, ValueError, KeyError):
             pin_ok = False
         dlg = SecretDialog(
-            self, title, text, button, master=not pin_ok, allow_master=pin_ok, error=error
+            self,
+            title,
+            text,
+            button,
+            master=not pin_ok,
+            allow_master=pin_ok,
+            error=error,
+            perigo=perigo,
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
@@ -466,17 +785,24 @@ class OwlWindow(QMainWindow):
             then()
 
         def failed(exc: BaseException) -> bool:
+            if isinstance(exc, AuthenticationError):  # inclui PinError e PIN desativado
+                self._sync_pin_state()
             if isinstance(exc, PinError):
                 msg = (
                     f"PIN incorreto. Restam {exc.remaining} tentativa(s)."
                     if exc.remaining
                     else "PIN incorreto muitas vezes. Use a senha mestra."
                 )
+            elif isinstance(exc, PinUnavailableError):
+                msg = str(exc)
             elif isinstance(exc, AuthenticationError):
                 msg = "Senha mestra incorreta." if master else str(exc)
             else:
                 return False
-            QTimer.singleShot(0, lambda: self._confirm_identity(title, text, button, then, msg))
+            QTimer.singleShot(
+                0,
+                lambda: self._confirm_identity(title, text, button, then, msg, perigo=perigo),
+            )
             return True
 
         self._run(job, done, on_error=failed, title="Conferindo…", cancellable=False)
@@ -492,45 +818,83 @@ class OwlWindow(QMainWindow):
         mode: str = "generic",
         note: str = "",
         cancellable: bool = True,
-    ) -> None:
+        after: Callable[[], None] | None = None,
+        status: str | None = "Trabalhando…",
+    ) -> bool:
+        """Inicia ``job`` na thread. Recusa (devolve False, sem tocar no trabalho em curso) se
+        já houver outro rodando. ``after`` roda depois de ``on_done``/``on_error``; ``status``
+        vai para o rodapé da tela atual (None: a própria tela já mostra o que está fazendo)."""
+        if self.runner.busy:
+            self._status(BUSY_TEXT, "erro")
+            return False
         dlg = None
         if title is not None:
             dlg = ProgressDialog(
                 self, title, self.runner, mode=mode, note=note, cancellable=cancellable
             )
-        self._job = (dlg, on_done, on_error)
         self._block_shutdown(True)
-        self.runner.start(job)
+        try:
+            self.runner.start(job)
+        except RuntimeError:
+            self._block_shutdown(False)
+            if dlg is not None:
+                dlg.deleteLater()
+            self._status(BUSY_TEXT, "erro")
+            return False
+        self._job = _Job(dlg, on_done, on_error, after)
+        if status is not None:
+            self._status(status, "trabalhando")
         if dlg is not None:
             dlg.open()
+        return True
+
+    def _take_job(self) -> _Job | None:
+        job, self._job = self._job, None
+        self._block_shutdown(False)
+        # o fim de uma operação longa conta como uso: o resultado não some logo em seguida
+        self._watcher.last = time.monotonic()
+        self._status()
+        if job is not None and job.dialog is not None:
+            job.dialog.finish()
+        return job
 
     @Slot(object)
     def _job_done(self, result: object) -> None:
-        assert self._job is not None
-        dlg, on_done, _ = self._job
-        self._job = None
-        self._block_shutdown(False)
-        if dlg is not None:
-            dlg.finish()
-        on_done(result)
-        self._after_job()
+        job = self._take_job()
+        try:
+            if job is not None:
+                job.on_done(result)
+                if job.after is not None:
+                    job.after()
+        finally:
+            self._after_job()
 
     @Slot(object)
     def _job_failed(self, exc: object) -> None:
-        assert self._job is not None
-        dlg, _, on_error = self._job
-        self._job = None
-        self._block_shutdown(False)
-        if dlg is not None:
-            dlg.finish()
-        assert isinstance(exc, BaseException)
-        if on_error is None or not on_error(exc):
-            self._default_error(exc)
-        self._after_job()
+        job = self._take_job()
+        try:
+            assert isinstance(exc, BaseException)
+            if job is None or job.on_error is None or not job.on_error(exc):
+                self._default_error(exc)
+            if job is not None and job.after is not None:
+                job.after()
+        finally:
+            self._after_job()
 
     def _after_job(self) -> None:
-        if self._lock_after_job and not self.runner.busy:
+        if self._quit_after_job:
+            if self.runner.busy:  # on_done encadeou outro trabalho: pede para parar também
+                self.runner.cancel()
+                return
+            self._quit_after_job = False
+            self.close()  # caminho normal (T11 se ainda houver pasta aberta)
+            return
+        if self.runner.busy:
+            return
+        if self._lock_after_job:
             QTimer.singleShot(0, self.lock_now)
+        elif self._after_unlock_pending:
+            QTimer.singleShot(0, self._after_unlock)
 
     def _default_error(self, exc: BaseException) -> None:
         if isinstance(exc, CancelledError):
@@ -581,7 +945,7 @@ class OwlWindow(QMainWindow):
     def _on_row_action(self, folder_id: str, action: str) -> None:
         if self.mgr is None or self.runner.busy:
             return
-        handlers: dict[str, Callable[[str], None]] = {
+        handlers: dict[str, Callable[[str], object]] = {
             "abrir": self._open_folder,
             "trancar": self._lock_folder,
             "resolver": self._resolve,
@@ -598,58 +962,75 @@ class OwlWindow(QMainWindow):
         if fn is not None:
             fn(folder_id)
 
+    def _back_to_list(self) -> None:
+        if self.session is None:
+            return
+        self._refresh()
+        self._show_page(self.home)
+
     # ------------------------------------------------------------------ proteger (T5)
     def _protect(self, path: str | None = None) -> None:
+        """Abre o assistente "Proteger uma pasta" (passo 1; com ``path``, já confere)."""
         if self.mgr is None or self.runner.busy:
             return
-        if path is None:
-            path = choose_folder(self, "Escolha a pasta que você quer proteger")
-            if not path:
-                return
-        mgr = self.mgr
-        chosen = path
+        self.protect_page.start(first_time=not self.mgr.folders)
+        self._show_page(self.protect_page)
+        if path:
+            self.protect_page.set_path(path)
+            self._protect_check(path)
 
-        def job(p: QtProgress, c: CancelToken) -> ProtectCheck:
-            return mgr.check_protect(chosen, p, c)
-
-        def failed(exc: BaseException) -> bool:
-            if isinstance(exc, PreflightError):
-                items = exc.blockers or [str(exc)]
-                choice = ask(
-                    self,
-                    "Não é possível proteger esta pasta",
-                    items[0],
-                    [("Tentar de novo", "retry"), ("Fechar", "close")],
-                    details=items[1:6] + ([f"e mais {len(items) - 6}"] if len(items) > 6 else []),
-                )
-                if choice == "retry":
-                    QTimer.singleShot(0, lambda: self._protect(chosen))
-                return True
-            return False
-
-        self._run(job, self._confirm_protect, on_error=failed, title="Conferindo a pasta…")
-
-    def _confirm_protect(self, check: object) -> None:
-        assert isinstance(check, ProtectCheck)
+    @Slot(str)
+    def _protect_check(self, path: str) -> None:
         if self.mgr is None:
             return
-        dlg = ConfirmProtectDialog(
-            self, check.name, check.files, check.total_bytes, first_time=not self.mgr.folders
-        )
-        if dlg.exec() != QDialog.DialogCode.Accepted or self.mgr is None:
+        mgr = self.mgr
+        page = self.protect_page
+
+        def job(p: QtProgress, c: CancelToken) -> ProtectCheck:
+            return mgr.check_protect(path, p, c)
+
+        def done(check: object) -> None:
+            assert isinstance(check, ProtectCheck)
+            page.show_check(check)
+
+        def failed(exc: BaseException) -> bool:
+            if isinstance(exc, CancelledError):
+                page.check_cancelled()
+            elif isinstance(exc, PreflightError):
+                page.show_blockers(exc.blockers or [str(exc)])
+            elif isinstance(exc, (OwlVaultError, OSError)):
+                page.show_blockers([str(exc)])
+            else:
+                page.show_blockers([f"{type(exc).__name__}: {exc}"])
+            return True
+
+        page.checking()
+        if not self._run(job, done, on_error=failed, status=None):
+            page.show_blockers([BUSY_TEXT])
+
+    def _protect_lock(self) -> None:
+        page = self.protect_page
+        check = page.check
+        if check is None or self.mgr is None:
             return
         mgr = self.mgr
 
         def job(p: QtProgress, c: CancelToken) -> LockOutcome:
             return mgr.protect(check, p, c)
 
-        self._run(
-            job,
-            self._lock_done,
-            title=f"Trancando '{check.name}'",
-            mode="lock",
-            note="Não use esta pasta até terminar.",
-        )
+        def done(out: object) -> None:
+            assert isinstance(out, LockOutcome)
+            page.finish(out)
+            self._lock_done(out, resolve=False)
+
+        def failed(exc: BaseException) -> bool:
+            page.fail(exc)
+            self._refresh()
+            return True
+
+        page.locking()
+        if not self._run(job, done, on_error=failed, status=None):
+            page.fail(OwlVaultError(BUSY_TEXT))
 
     # ------------------------------------------------------------------ trancar (T7)
     def _lock_folder(
@@ -659,9 +1040,12 @@ class OwlWindow(QMainWindow):
         hide_after: bool = False,
         then: Callable[[], None] | None = None,
         on_error: ErrorHandler | None = None,
-    ) -> None:
-        if self.mgr is None:
-            return
+        on_abort: Callable[[], None] | None = None,
+    ) -> bool:
+        """Tranca uma pasta aberta. Devolve False se nada foi iniciado (``on_abort`` também
+        roda se o trancamento parar antes do fim)."""
+        if self.mgr is None or self.runner.busy:
+            return False
         mgr = self.mgr
         name = self._rec_name(folder_id)
         try:
@@ -679,7 +1063,7 @@ class OwlWindow(QMainWindow):
                 details=missing if n > 5 else (),
             )
             if choice != "go" or self.mgr is None:
-                return
+                return False
 
         def job(p: QtProgress, c: CancelToken) -> LockOutcome:
             return mgr.lock(folder_id, p, c, accept_missing=missing)
@@ -694,8 +1078,10 @@ class OwlWindow(QMainWindow):
             self._lock_done(out)
             if out.complete and then is not None:
                 then()
+            elif not out.complete and on_abort is not None:
+                on_abort()
 
-        self._run(
+        return self._run(
             job,
             done,
             on_error=on_error,
@@ -704,7 +1090,7 @@ class OwlWindow(QMainWindow):
             note="Não use esta pasta até terminar.",
         )
 
-    def _lock_done(self, out: object) -> None:
+    def _lock_done(self, out: object, *, resolve: bool = True) -> None:
         assert isinstance(out, LockOutcome)
         self._refresh()
         name = out.record.name
@@ -715,7 +1101,7 @@ class OwlWindow(QMainWindow):
             if out.kept_previous:
                 msg += " Uma versão anterior com arquivos que não estão na pasta foi mantida."
             self.home.set_notice(msg)
-        else:
+        elif resolve:
             QTimer.singleShot(0, lambda: self._resolve(out.record.id))
 
     def _lock_all(self) -> None:
@@ -725,29 +1111,49 @@ class OwlWindow(QMainWindow):
         self._lock_sequence(ids, None)
 
     def _lock_sequence(
-        self, ids: list[str], then: Callable[[], None] | None, on_error: ErrorHandler | None = None
+        self,
+        ids: list[str],
+        then: Callable[[], None] | None,
+        on_error: Callable[[str, BaseException], bool] | None = None,
+        on_abort: Callable[[], None] | None = None,
     ) -> None:
         if not ids:
             if then is not None:
                 then()
             return
         first, rest = ids[0], ids[1:]
-        self._lock_folder(
+        err = self._bind_error(on_error, first) if on_error is not None else None
+        started = self._lock_folder(
             first,
-            then=lambda: QTimer.singleShot(0, lambda: self._lock_sequence(rest, then, on_error)),
-            on_error=on_error,
+            then=lambda: QTimer.singleShot(
+                0, lambda: self._lock_sequence(rest, then, on_error, on_abort)
+            ),
+            on_error=err,
+            on_abort=on_abort,
         )
+        if not started and on_abort is not None:
+            on_abort()
+
+    @staticmethod
+    def _bind_error(handler: Callable[[str, BaseException], bool], folder_id: str) -> ErrorHandler:
+        def err(exc: BaseException) -> bool:
+            return handler(folder_id, exc)
+
+        return err
 
     # ------------------------------------------------------------------ abrir (T6)
     def _open_folder(self, folder_id: str) -> None:
         if self.mgr is None or self.session is None:
             return
+        if self.runner.busy:
+            self._status(BUSY_TEXT, "erro")
+            return
         rec = self.session.index.folder(folder_id)
         if rec is None:
-            inform(self, "Pasta não encontrada", "Esta pasta não está na lista do Owl Vault.")
+            self._not_in_list()
             return
         view = self.mgr.view(rec)
-        if rec.state == ABERTA and view.issue in ("", "versao_anterior"):
+        if rec.state == ABERTA and view.issue in ("", *KEPT_ISSUES):
             open_in_explorer(rec.path)
             return
         if view.issue in (
@@ -791,7 +1197,7 @@ class OwlWindow(QMainWindow):
 
     # ------------------------------------------------------------------ resolver (T8)
     def _resolve(self, folder_id: str) -> None:
-        if self.mgr is None or self.session is None:
+        if self.mgr is None or self.session is None or self.runner.busy:
             return
         mgr = self.mgr
         rec = self.session.index.folder(folder_id)
@@ -830,7 +1236,7 @@ class OwlWindow(QMainWindow):
             elif choice == "undo":
                 self._run(
                     lambda p, c: mgr.undo_lock(folder_id, p, c),
-                    lambda _o: self._refresh_with(f"'{name}' continua aberta."),
+                    lambda out: self._undo_done(out, name),
                     title=f"Devolvendo os arquivos de '{name}'",
                     mode="unlock",
                 )
@@ -862,8 +1268,13 @@ class OwlWindow(QMainWindow):
             ):
                 self._open_folder(folder_id)
         elif issue == "trancando":
-            mgr.reconcile_on_start()
+            try:
+                notes = mgr.reconcile_on_start()
+            except (OwlVaultError, OSError) as exc:
+                notes = [str(exc)]
             self._refresh()
+            if notes:
+                self.home.set_notice(" ".join(notes))
         elif issue == "itens_extras":
             choice = ask(
                 self,
@@ -885,18 +1296,31 @@ class OwlWindow(QMainWindow):
             if choice == "forget":
                 self._forget(folder_id)
         elif issue == "nao_encontrada":
+            text = view.attention
+            if rec.state != TRANCADA:
+                text += (
+                    " Se você renomeou ou moveu a pasta aberta, clique em 'Procurar a pasta…' e "
+                    "escolha-a no lugar novo (precisa ser a mesma pasta, na mesma unidade)."
+                )
             choice = ask(
                 self,
                 f"'{name}' não foi encontrada",
-                view.attention,
+                text,
                 [("Procurar a pasta…", "find"), ("Tirar da lista", "forget")],
             )
             if choice == "find":
                 self._relocate(folder_id)
             elif choice == "forget":
                 self._forget(folder_id)
+        elif issue == "versao_anterior_ilegivel":
+            self._resolve_unreadable_kept(folder_id)
         elif issue == "versao_anterior":
-            files = mgr.kept_only_files(folder_id)
+            try:
+                files = mgr.kept_only_files(folder_id)
+            except StateError:  # ficou ilegível ou sumiu depois da lista: nunca conta como vazia
+                self._refresh()
+                self._resolve_unreadable_kept(folder_id)
+                return
             choice = ask(
                 self,
                 f"Versão anterior de '{name}'",
@@ -908,6 +1332,7 @@ class OwlWindow(QMainWindow):
                 ],
                 details=files,
                 primary="restore",
+                perigo="delete",
             )
             if choice == "restore":
                 self._restore_kept(folder_id)
@@ -927,6 +1352,7 @@ class OwlWindow(QMainWindow):
                         details=files,
                         details_open=True,
                         primary="cancel",
+                        perigo="delete",
                     )
                     == "delete"
                 ):
@@ -948,6 +1374,74 @@ class OwlWindow(QMainWindow):
                 self._open_folder(folder_id)
         else:
             self._refresh()
+
+    def _undo_done(self, out: object, name: str) -> None:
+        """Fim do 'Desfazer': mostra o que não voltou (falhas) e os conflitos em caminhos que
+        o Owl Vault tinha apagado (a versão guardada deles foi MANTIDA)."""
+        assert isinstance(out, UnlockOutcome)
+        self._refresh()
+        report = out.report
+        if not out.complete:
+            inform(
+                self,
+                f"Nem todos os arquivos voltaram para '{name}'",
+                out.record.attention
+                or "Alguns arquivos não puderam ser devolvidos. A cópia protegida deles continua "
+                "guardada.",
+                report.failed if report is not None else (),
+            )
+            return
+        if out.record.attention and any(v.role == MANTIDO for v in out.record.vaults):
+            inform(
+                self,
+                f"'{name}' continua aberta",
+                out.record.attention,
+                report.conflicts if report is not None else (),
+            )
+            return
+        self.home.set_notice(f"'{name}' continua aberta.")
+
+    def _resolve_unreadable_kept(self, folder_id: str) -> None:
+        """Versão anterior MANTIDA ilegível ou ausente: nunca é apagada nem tratada como vazia.
+        Só dá para tentar recuperá-la (ou o salvamento de emergência) ou, se a pasta dela sumiu,
+        esquecê-la."""
+        if self.mgr is None or self.session is None:
+            return
+        mgr = self.mgr
+        rec = self.session.index.folder(folder_id)
+        if rec is None:
+            return
+        name = rec.name
+        gone = [v for v in rec.vaults if v.role == MANTIDO and not os.path.lexists(v.location)]
+        view = mgr.view(rec)
+        text = view.attention or (
+            f"A versão anterior de '{name}' que foi mantida não pôde ser lida. Nada foi apagado."
+        )
+        buttons: list[tuple[str, str]] = []
+        if len(gone) < sum(1 for v in rec.vaults if v.role == MANTIDO):
+            buttons.append(("Tentar recuperar em outra pasta…", "restore"))
+        if gone:
+            text += (
+                f" {len(gone)} versão(ões) anterior(es) não existe(m) mais no disco (a pasta "
+                "oculta foi apagada fora do Owl Vault)."
+            )
+            buttons.append(("Esquecer a versão que sumiu", "forget_kept"))
+        buttons.append(("Fechar", "close"))
+        choice = ask(self, f"Versão anterior de '{name}'", text, buttons)
+        if choice == "restore":
+            self._restore_kept(folder_id)
+        elif choice == "forget_kept":
+            try:
+                n = mgr.forget_missing_kept(folder_id)
+            except (OwlVaultError, OSError) as exc:
+                inform(self, "Não foi possível esquecer a versão anterior", str(exc))
+                n = 0
+            self._refresh()
+            if n:
+                self.home.set_notice(
+                    f"{n} versão(ões) anterior(es) de '{name}' que não existia(m) mais saiu(íram) "
+                    "da lista. Nada foi apagado."
+                )
 
     def _restore_kept(self, folder_id: str) -> None:
         if self.mgr is None:
@@ -978,13 +1472,40 @@ class OwlWindow(QMainWindow):
         if self.mgr is None:
             return
         path = choose_folder(self, f"Onde está a pasta '{self._rec_name(folder_id)}'?")
-        if not path:
+        if not path or self.mgr is None:
             return
         try:
             self.mgr.relocate(folder_id, path)
         except (OwlVaultError, OSError) as exc:
             inform(self, "Não é esta pasta", str(exc))
         self._refresh()
+
+    def _forget_text(self, folder_id: str) -> str:
+        rec = self.session.index.folder(folder_id) if self.session is not None else None
+        if rec is None or rec.state == TRANCADA:
+            warning = ""
+            if rec is not None and self.mgr is not None:
+                try:  # cofre fora da pasta (área temporária): 'Recuperar' não o acharia
+                    warning = self.mgr.forget_warning(folder_id)
+                except (OwlVaultError, OSError):
+                    warning = ""
+            if warning:
+                return f"Nada será apagado. {warning}"
+            return (
+                "Nada será apagado. Para voltar a usar a pasta, use ☰ > Recuperar uma pasta "
+                "protegida."
+            )
+        where = winfs.strip_extended(winfs.parent_of(rec.path))
+        text = (
+            "Nada será apagado. Os arquivos legíveis continuam na pasta; para trancá-la de novo, "
+            "use '+ Proteger uma pasta…'. A cópia criptografada anterior fica na pasta oculta "
+            f"'.owlvault-{rec.id}', em {where}."
+        )
+        if any(v.role == MANTIDO for v in rec.vaults):
+            text += (
+                " Atenção: os arquivos da versão anterior mantida só existem nessa cópia oculta."
+            )
+        return text
 
     def _forget(self, folder_id: str) -> None:
         if self.mgr is None:
@@ -994,12 +1515,12 @@ class OwlWindow(QMainWindow):
             ask(
                 self,
                 f"Tirar '{name}' da lista?",
-                "Nada será apagado. Para voltar a usar a pasta, "
-                "use ☰ > Recuperar uma pasta protegida.",
+                self._forget_text(folder_id),
                 [("Tirar da lista", "go"), ("Cancelar", "cancel")],
                 primary="cancel",
             )
             == "go"
+            and self.mgr is not None
         ):
             self.mgr.forget(folder_id)
             self._refresh()
@@ -1046,6 +1567,7 @@ class OwlWindow(QMainWindow):
             return
         vault_dir = winfs.join(rec.path, VAULT_DIR)
         policy = self.policy
+        name = rec.name
 
         def job(p: QtProgress, c: CancelToken) -> VerifyReport:
             return verify_vault(
@@ -1058,7 +1580,7 @@ class OwlWindow(QMainWindow):
                 inform(
                     self,
                     "Tudo certo",
-                    f"Os {report.files_ok} arquivo(s) de '{rec.name}' estão íntegros.",
+                    f"Os {report.files_ok} arquivo(s) de '{name}' estão íntegros.",
                 )
             elif report.ok:
                 inform(
@@ -1072,12 +1594,12 @@ class OwlWindow(QMainWindow):
                 inform(
                     self,
                     "Problemas encontrados",
-                    f"{len(report.bad)} arquivo(s) de '{rec.name}' estão danificados. Se você "
+                    f"{len(report.bad)} arquivo(s) de '{name}' estão danificados. Se você "
                     "tem uma cópia da pasta trancada (backup), use-a.",
                     report.bad,
                 )
 
-        self._run(job, done, title=f"Verificando '{rec.name}'")
+        self._run(job, done, title=f"Verificando '{name}'")
 
     # ------------------------------------------------------------------ remover proteção (T10)
     def _remove(self, folder_id: str) -> None:
@@ -1090,6 +1612,7 @@ class OwlWindow(QMainWindow):
             "arquivos.",
             "Remover proteção",
             lambda: self._remove_confirmed(folder_id),
+            perigo=True,
         )
 
     def _remove_confirmed(self, folder_id: str) -> None:
@@ -1138,9 +1661,12 @@ class OwlWindow(QMainWindow):
                 details=missing,
                 details_open=True,
                 primary="cancel",
+                perigo="go",
             )
             != "go"
         ):
+            return
+        if self.mgr is None:
             return
         try:
             self.mgr.remove_protection(folder_id, confirmed_missing=missing)
@@ -1152,9 +1678,17 @@ class OwlWindow(QMainWindow):
         self.home.set_notice(f"A proteção de '{name}' foi removida. A pasta agora é comum.")
 
     # ------------------------------------------------------------------ recuperar (T12)
-    def _recover(self) -> None:
+    def _recover(self, then: Callable[[], None] | None = None) -> None:
+        started = False
+        try:
+            started = self._recover_steps(then)
+        finally:
+            if not started and then is not None:
+                then()
+
+    def _recover_steps(self, then: Callable[[], None] | None) -> bool:
         if self.mgr is None or self.runner.busy:
-            return
+            return False
         if (
             ask(
                 self,
@@ -1165,19 +1699,19 @@ class OwlWindow(QMainWindow):
             )
             != "go"
         ):
-            return
+            return False
         path = choose_folder(self, "Escolha a pasta protegida (ou onde ela ficava)")
         if not path or self.mgr is None:
-            return
+            return False
         mgr = self.mgr
         try:
             found = mgr.find_recoverable(path)
         except (OwlVaultError, OSError) as exc:
             inform(self, "Não foi possível procurar", str(exc))
-            return
+            return False
         if not found:
             inform(self, "Nada encontrado", "Não há pasta protegida pelo Owl Vault aqui.")
-            return
+            return False
         if len(found) > 1:
             pick = PickDialog(
                 self,
@@ -1186,10 +1720,10 @@ class OwlWindow(QMainWindow):
                 [winfs.name_of(f) for f in found],
             )
             if pick.exec() != QDialog.DialogCode.Accepted:
-                return
+                return False
             found = [found[i] for i in pick.checked()]
             if not found:
-                return
+                return False
         dlg = SecretDialog(
             self,
             "Senha mestra",
@@ -1199,7 +1733,7 @@ class OwlWindow(QMainWindow):
             allow_master=False,
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
+            return False
         secret = dlg.take()
 
         def job(_p: QtProgress, _c: CancelToken) -> tuple[list[str], list[str]]:
@@ -1228,7 +1762,7 @@ class OwlWindow(QMainWindow):
             else:
                 inform(self, "Nenhuma pasta recuperada", "Confira a senha mestra.", bad)
 
-        self._run(job, done, title="Recuperando…", cancellable=False)
+        return self._run(job, done, title="Recuperando…", cancellable=False, after=then)
 
     # ------------------------------------------------------------------ PIN e senha mestra
     def _change_pin(self) -> None:
@@ -1254,6 +1788,8 @@ class OwlWindow(QMainWindow):
             self.home.set_notice("PIN alterado.")
 
         def failed(exc: BaseException) -> bool:
+            if isinstance(exc, AuthenticationError):
+                self._sync_pin_state()
             if isinstance(exc, PinError):
                 inform(
                     self,
@@ -1263,6 +1799,9 @@ class OwlWindow(QMainWindow):
                     else "O PIN foi desativado. Use 'Esqueci o PIN' com a senha mestra.",
                 )
                 return True
+            if isinstance(exc, PinUnavailableError):
+                inform(self, "PIN desativado", str(exc))
+                return True
             if isinstance(exc, AuthenticationError):
                 inform(self, "Não conferiu", "Senha mestra incorreta." if master else str(exc))
                 return True
@@ -1270,46 +1809,59 @@ class OwlWindow(QMainWindow):
 
         self._run(job, done, on_error=failed, title="Salvando o PIN…", cancellable=False)
 
-    def _new_pin_after_master(self) -> None:
-        session = self.session
-        if session is None:
-            return
-        dlg = NewSecretDialog(
-            self,
-            master=False,
-            title="Crie um PIN novo",
-            text="O PIN antigo não funciona mais neste computador.",
-        )
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
-        pin = dlg.take()
-        self._run(
-            lambda _p, _c: session.set_pin(pin),
-            lambda _r: self.home.set_notice("PIN criado."),
-            title="Salvando o PIN…",
-            cancellable=False,
-        )
+    def _new_pin_after_master(self, then: Callable[[], None] | None = None) -> None:
+        started = False
+        try:
+            session = self.session
+            if session is None:
+                return
+            dlg = NewSecretDialog(
+                self,
+                master=False,
+                title="Crie um PIN novo",
+                text="O PIN antigo não funciona mais neste computador.",
+            )
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            pin = dlg.take()
+            started = self._run(
+                lambda _p, _c: session.set_pin(pin),
+                lambda _r: self.home.set_notice("PIN criado."),
+                title="Salvando o PIN…",
+                cancellable=False,
+                after=then,
+            )
+        finally:
+            if not started and then is not None:
+                then()
 
-    def _new_master(self) -> None:
-        session = self.session
-        if session is None:
-            return
-        dlg = NewSecretDialog(
-            self,
-            master=True,
-            title="Criar nova senha mestra",
-            text="As pastas trancadas continuam abrindo normalmente com o PIN. Para que elas também "
-            "abram com a senha nova em outro computador, abra e tranque cada uma de novo.",
-        )
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
-        sm = dlg.take()
-        self._run(
-            lambda _p, _c: session.change_master(sm),
-            lambda _r: self._refresh_with("Nova senha mestra criada."),
-            title="Salvando a senha mestra…",
-            cancellable=False,
-        )
+    def _new_master(self, then: Callable[[], None] | None = None) -> None:
+        started = False
+        try:
+            session = self.session
+            if session is None:
+                return
+            dlg = NewSecretDialog(
+                self,
+                master=True,
+                title="Criar nova senha mestra",
+                text="As pastas trancadas continuam abrindo normalmente com o PIN. Para que elas "
+                "também abram com a senha nova em outro computador, abra e tranque cada uma de "
+                "novo.",
+            )
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            sm = dlg.take()
+            started = self._run(
+                lambda _p, _c: session.change_master(sm),
+                lambda _r: self._refresh_with("Nova senha mestra criada."),
+                title="Salvando a senha mestra…",
+                cancellable=False,
+                after=then,
+            )
+        finally:
+            if not started and then is not None:
+                then()
 
     # ------------------------------------------------------------------ cópia (T14)
     def _open_copy_tool(self) -> None:
@@ -1321,11 +1873,21 @@ class OwlWindow(QMainWindow):
         self._copy_window.raise_()
         self._copy_window.activateWindow()
 
+    def _close_copy_window(self) -> bool:
+        """Fecha a Cópia criptografada junto com a janela principal (False = ela recusou, por
+        estar trabalhando: aí a principal também continua aberta)."""
+        w = self._copy_window
+        if w is None:
+            return True
+        if w.isVisible() and not w.close():
+            return False
+        self._copy_window = None
+        w.deleteLater()
+        return True
+
     # ------------------------------------------------------------------ sair (T11)
     def closeEvent(self, event: QCloseEvent) -> None:
         if self._quitting:
-            if self._copy_window is not None:
-                self._copy_window.close()
             event.accept()
             return
         if self.runner.busy:
@@ -1339,57 +1901,124 @@ class OwlWindow(QMainWindow):
                 )
                 == "stop"
             ):
-                self.runner.cancel()
-                self.runner.done.connect(lambda _r: self._quit_now())
-                self.runner.error.connect(lambda _e: self._quit_now())
+                if self.runner.busy:
+                    self.runner.cancel()
+                    self._quit_after_job = True  # _after_job fecha (uma vez só)
+                else:  # terminou enquanto a pergunta estava aberta: fluxo normal
+                    QTimer.singleShot(0, self.close)
             event.ignore()
             return
-        opened = [r for r in self.mgr.folders if r.state == ABERTA] if self.mgr else []
-        if not opened:
-            self._quit()
-            event.accept()
+        if self.mgr is None:
+            n = self._visible_count
+            if n and self.store.exists():
+                choice = ask(
+                    self,
+                    "Sair do Owl Vault?",
+                    (
+                        "Há 1 pasta aberta e visível."
+                        if n == 1
+                        else f"Há {n} pastas abertas e visíveis."
+                    )
+                    + " Digite o PIN para trancar.",
+                    [("Sair sem trancar", "quit"), ("Cancelar", "cancel")],
+                    primary="cancel",
+                )
+                if choice != "quit":
+                    event.ignore()
+                    return
+            self._accept_close(event)
             return
-        lines = [f"{r.name}" for r in opened]
+        folders = self.mgr.folders
+        opened = [r for r in folders if r.state == ABERTA]
+        attention = [r for r in folders if r.state in VISIVEIS and r.state != ABERTA]
+        if not opened and not attention:
+            self._accept_close(event)
+            return
+        lines = [r.name for r in opened] + [
+            f"{r.name} — precisa de atenção; não dá para trancar automaticamente" for r in attention
+        ]
+        buttons = [("Trancar e sair", "lock")] if opened else []
+        buttons += [("Sair sem trancar", "quit"), ("Cancelar", "cancel")]
         choice = ask(
             self,
             "Sair do Owl Vault?",
             "Estas pastas estão abertas e visíveis:",
-            [("Trancar e sair", "lock"), ("Sair sem trancar", "quit"), ("Cancelar", "cancel")],
+            buttons,
             details=lines,
             details_open=True,
+            primary="lock" if opened else "cancel",
         )
         if choice == "quit":
-            self._quit()
-            event.accept()
+            self._accept_close(event)
             return
         event.ignore()
         if choice == "lock":
+            self._quit_sequence = True
+            self._lock_sequence(
+                [r.id for r in opened],
+                self._quit_now,
+                on_error=self._quit_lock_failed,
+                on_abort=self._end_quit_sequence,
+            )
 
-            def failed(exc: BaseException) -> bool:
-                again = ask(
-                    self,
-                    "Não deu para trancar",
-                    str(exc),
-                    [("Tentar de novo", "retry"), ("Sair sem trancar", "quit")],
-                )
-                if again == "retry":
-                    QTimer.singleShot(0, self.close)
-                else:
-                    QTimer.singleShot(0, self._quit_now)
-                return True
+    def _accept_close(self, event: QCloseEvent) -> None:
+        if not self._close_copy_window():
+            event.ignore()
+            return
+        self._quit()
+        event.accept()
 
-            self._lock_sequence([r.id for r in opened], self._quit_now, failed)
+    def _end_quit_sequence(self) -> None:
+        self._quit_sequence = False
+
+    def _quit_lock_failed(self, folder_id: str, exc: BaseException) -> bool:
+        """Erro no "Trancar e sair": mostra o motivo; só sai com "Sair sem trancar"."""
+        self._quit_sequence = False
+        name = self._rec_name(folder_id)
+        details: list[str] = []
+        if isinstance(exc, PreflightError):
+            items = exc.blockers or [str(exc)]
+            text = f"{items[0]} Depois, clique em Tentar de novo."
+            details = items[1:6] + ([f"e mais {len(items) - 6}"] if len(items) > 6 else [])
+        elif isinstance(exc, CancelledError):
+            text = "O trancamento parou num ponto seguro. A pasta continua aberta."
+        else:
+            text = str(exc) or type(exc).__name__
+        again = ask(
+            self,
+            f"Não deu para trancar '{name}'",
+            text,
+            [("Tentar de novo", "retry"), ("Sair sem trancar", "quit")],
+            details=details,
+            primary="retry",
+        )
+        if again == "retry":
+            QTimer.singleShot(0, self.close)
+        elif again == "quit":
+            QTimer.singleShot(0, self._quit_now)
+        else:  # Esc/X no aviso: NÃO sai — volta ao app com as pastas como estão
+            self._refresh()
+            self.home.set_notice("As pastas continuam abertas. Tranque-as antes de sair.")
+        return True
 
     def _quit(self) -> None:
         self._quitting = True
+        self._quit_after_job = False
+        self._quit_sequence = False
         if self.session is not None:
             self.session.close()
             self.session = None
         self.mgr = None
+        self.home.clear()
+        self.protect_page.clear()
+        self.unlock_page.configure(master=False)
+        self._show_page(self.unlock_page)
 
     def _quit_now(self) -> None:
+        self._quit_sequence = False
+        if not self._close_copy_window():
+            self._refresh()
+            self.home.set_notice("Feche a janela da Cópia criptografada para sair.")
+            return
         self._quit()
         self.close()
-
-
-_ = fmt_duration

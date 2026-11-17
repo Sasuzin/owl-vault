@@ -48,6 +48,23 @@ Vazamentos aceitos: quantidade de arquivos, **tamanho exato** de cada arquivo, d
 arquivos do cofre, tamanho aproximado do manifesto, parâmetros do Argon2id. Detalhes em
 [docs/FORMAT.md](docs/FORMAT.md) e [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
 
+## Proteções da pasta trancada no Windows (0.3)
+
+* **Permissões**: o espaço reservado (atalho, `desktop.ini`, ícone, instruções), a pasta oculta
+  `.owlvault` e a área temporária `.owlvault-<código>` recebem permissões só para a sua conta,
+  SYSTEM e Administradores (sem herança). Outra conta comum do computador não consegue trocar o
+  atalho "Abrir com Owl Vault" nem ler as cópias temporárias do teste de restauração. É uma
+  defesa a mais: a proteção dos dados continua sendo a criptografia.
+* **Atalho conferido**: ao iniciar e antes de abrir uma pasta, o Owl Vault confere o alvo e os
+  argumentos do atalho dentro de cada pasta trancada e o recria se tiver sido alterado.
+* **Atalho sem rastros da máquina**: o `.lnk` é gravado sem LinkInfo (série do volume) e sem
+  o bloco de rastreio (nome do computador, MAC). Ele ainda contém o caminho do programa
+  instalado, que inclui o nome da sua conta do Windows.
+* **Instância única**: o canal local só aceita mensagens de processos da mesma conta do
+  Windows, e um pedido "abrir" vindo por ele nunca abre uma pasta sem o PIN e sem mostrar o nome
+  da pasta.
+* **Instalação**: um `OwlVault.exe` mais antigo (ou igual) não substitui o instalado.
+
 ## Garantias operacionais
 
 * Cópia criptografada (v1): a origem é aberta somente para leitura, negando escrita a outros
