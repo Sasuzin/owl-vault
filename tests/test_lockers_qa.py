@@ -37,6 +37,7 @@ from owl_vault.application.progress import NullProgress
 from owl_vault.application.restore import MARKER_NAME
 from owl_vault.domain.errors import OwlVaultError, StateError, UnsafePathError
 from owl_vault.storage import acl, faults, shell, winfs
+from owl_vault.storage.layout import COMPLETE_NAME
 from tests.conftest import tree_digest
 from tests.test_lockers import (
     HIDDEN,
@@ -1142,3 +1143,154 @@ def test_pedaco_do_desfazer_que_nao_sai_tem_texto_proprio(
     out = mgr.continue_lock(rid)
 
     assert out.complete and rec.state == TRANCADA and not part.exists()
+
+
+# --- vd3-1: queda entre o 'novo' COM divergência ficar pronto e a gravação de DESCARTANDO -----
+
+_DIV_SPEC: dict[str, Any] = {
+    "a.txt": b"A" * 300,
+    "notas.bin": bytes(range(256)) * 3,
+    "sub": {"c.txt": b"C" * 120},
+}
+
+
+def _user_touches_notas(p: Path, acao: str, got: dict[str, Any]) -> OnStage:
+    """No 'Teste de restauração' o usuário renomeia ou apaga ``notas.bin`` (divergência)."""
+
+    def user() -> None:
+        if acao == "renomear":
+            os.rename(p / "notas.bin", p / "notas2.bin")
+        else:
+            os.remove(p / "notas.bin")
+        got["depois"] = tree_digest(p)
+
+    return OnStage("Teste de restauração", user)
+
+
+def _novo_concluido(rec: FolderRecord) -> bool:
+    """O 'novo' do trancamento interrompido existe e tem o registro de conclusão gravado."""
+    novo = rec.vault("novo")
+    return novo is not None and os.path.lexists(winfs.join(novo.location, COMPLETE_NAME))
+
+
+def _assert_inicio_volta_a_aberta(env: Env, mgr: LockerManager, rec: FolderRecord) -> None:
+    """O início descarta o 'novo' com divergência: pasta ABERTA, nada apagado nem trazido."""
+    notes = mgr.reconcile_on_start()  # início do app (ou o 'Resolver' da linha)
+    assert not any("começar a apagar" in n for n in notes), notes  # antes: APAGANDO (falso)
+    assert len(notes) == 1 and "antes de apagar arquivos" in notes[0], notes
+    assert rec.state == ABERTA and "novo" not in roles(rec) and rec.attention == ""
+    assert _no_new_vault(env, rec.id)
+    disk = env.reopen().session.index.folder(rec.id)
+    assert disk is not None and disk.state == ABERTA
+
+
+class _DiesOnDiscardSave:
+    """O processo morre (``Crash``) ao gravar o papel DESCARTANDO do 'novo', ANTES de gravar."""
+
+    def __init__(self, env: Env) -> None:
+        self.real = env.session.save
+        self.mgr = env.mgr
+        self.fired = 0
+
+    def __call__(self) -> None:
+        if any(v.role == lockers.DESCARTANDO for r in self.mgr.folders for v in r.vaults):
+            self.fired += 1
+            raise Crash
+        self.real()
+
+
+@pytest.mark.parametrize("acao", ["renomear", "apagar"])
+@pytest.mark.parametrize("primeira", [True, False])
+def test_queda_antes_de_descartar_novo_com_divergencia_volta_a_aberta(
+    env: Env, monkeypatch: pytest.MonkeyPatch, acao: str, primeira: bool
+) -> None:
+    p = make_folder(env.base, spec=_DIV_SPEC)
+    rid = ""
+    if not primeira:
+        rid = protect(env.mgr, p).record.id
+        assert env.mgr.unlock(rid).complete
+    got: dict[str, Any] = {}
+    sink = _user_touches_notas(p, acao, got)
+    save = _DiesOnDiscardSave(env)
+    with monkeypatch.context() as m:
+        m.setattr(env.session, "save", save)
+        with pytest.raises(Crash):
+            if primeira:
+                env.mgr.protect(env.mgr.check_protect(str(p)), sink)
+            else:
+                env.mgr.lock(rid, sink)
+    assert save.fired == 1
+    assert tree_digest(p) == got["depois"]  # nada foi apagado por este trancamento
+
+    mgr = env.reopen()  # o processo morreu: relê o perfil do disco
+    [rec] = mgr.folders
+    assert rec.state == TRANCANDO and _novo_concluido(rec)
+    assert MARKER_NAME not in os.listdir(p)
+
+    _assert_inicio_volta_a_aberta(env, mgr, rec)
+
+    assert tree_digest(p) == got["depois"]
+    # "Tente de novo": tranca e abre sem trazer de volta (nem duplicar) notas.bin
+    out = mgr.lock(rec.id, accept_missing=[] if primeira else ["notas.bin"])
+    assert out.complete and rec.state == TRANCADA
+    assert mgr.unlock(rec.id).complete
+    assert tree_digest(p) == got["depois"]  # antes: notas.bin e notas2.bin / notas.bin de volta
+
+
+class _DeadAfterCompletion:
+    """Queda FIEL: a ``n``-ésima operação de disco (ponto de falha ou gravação do perfil) depois
+    de ``complete.owl`` do 'novo' ser gravado morre, e todas as seguintes também."""
+
+    def __init__(self, n: int, env: Env) -> None:
+        self.n = n
+        self.real_checkpoint = faults.checkpoint
+        self.real_save = env.session.save
+        self.after: list[str] = []
+        self.armed = False
+        self.dead = False
+
+    def _tick(self, op: str) -> None:
+        if self.dead:
+            raise Crash
+        if self.armed:
+            self.after.append(op)
+            if len(self.after) == self.n:
+                self.dead = True
+                raise Crash
+        elif op == "complete.rename":
+            self.armed = True  # o registro de conclusão é renomeado logo depois deste ponto
+
+    def checkpoint(self, op: str) -> None:
+        self._tick(op)
+        self.real_checkpoint(op)
+
+    def save(self) -> None:
+        self._tick("perfil")
+        self.real_save()
+
+
+# 1..5: a limpeza do diário/teste dentro de create_vault; 6: a gravação de DESCARTANDO
+@pytest.mark.parametrize("n", range(1, 7))
+def test_queda_na_janela_depois_do_novo_com_divergencia(
+    env: Env, monkeypatch: pytest.MonkeyPatch, n: int
+) -> None:
+    p = make_folder(env.base, spec=_DIV_SPEC)
+    rid = protect(env.mgr, p).record.id
+    assert env.mgr.unlock(rid).complete
+    got: dict[str, Any] = {}
+    dies = _DeadAfterCompletion(n, env)
+    with monkeypatch.context() as m:
+        m.setattr(faults, "checkpoint", dies.checkpoint)
+        m.setattr(env.session, "save", dies.save)
+        with pytest.raises(Crash):
+            env.mgr.lock(rid, _user_touches_notas(p, "apagar", got))
+    assert dies.dead and dies.after[-1] in ("remove", "perfil"), dies.after
+    assert tree_digest(p) == got["depois"]
+
+    mgr = env.reopen()
+    rec = mgr.session.index.folder(rid)
+    assert rec is not None and rec.state == TRANCANDO and _novo_concluido(rec)
+
+    _assert_inicio_volta_a_aberta(env, mgr, rec)
+
+    assert tree_digest(p) == got["depois"]  # notas.bin continua apagada, como o usuário quis

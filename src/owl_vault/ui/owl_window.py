@@ -1520,6 +1520,11 @@ class OwlWindow(QMainWindow):
         self._refresh()
         if seq.falhas:
             title, text, details = self._failure_summary(seq)
+            if seq.desistiu:  # "Cancelar" no T7: o resumo não cita a pasta do T7 nem as outras
+                text = (
+                    "Você cancelou o trancamento, e as pastas que ainda faltavam continuam "
+                    "abertas. " + text
+                )
             if seq.trancadas:
                 text = f"{seq.trancadas} pasta(s) foram trancadas. " + text
             ask(self, title, text, [("Fechar", "close")], details=details, details_open=True)
@@ -2672,15 +2677,28 @@ class OwlWindow(QMainWindow):
         event.accept()
 
     def _quit_sequence_end(self, seq: _Sequencia) -> None:
-        """Fim do "Trancar e sair". Tudo trancado: sai. Senão, um resumo de quais pastas
-        ficaram de fora e por quê; o app só sai sem trancar se o usuário escolher isso."""
+        """Fim do "Trancar e sair". Tudo trancado: sai. "Cancelar" no T7: volta ao app, sem
+        sair. Senão, um resumo de quais pastas ficaram de fora e por quê; o app só sai sem
+        trancar se o usuário escolher isso."""
         if self.mgr is None:
             self._quit_sequence = False
             return
         self._refresh()
-        if seq.desistiu and not seq.falhas:  # "Cancelar" no T7: volta ao app, sem sair
+        if seq.desistiu:
+            # "Cancelar" (ou Enter/Esc) no T7 é desistir da SAÍDA: volta ao app, haja falhas ou
+            # não. Um resumo aqui só citaria as falhas de antes (as pastas que precisam de
+            # atenção entram nele desde o T11) e o "Sair sem trancar" sairia deixando abertas a
+            # pasta do T7 e as que nem foram tentadas, sem ninguém ver os nomes delas
             self._quit_sequence = False
-            self.home.set_notice("Nem todas as pastas foram trancadas. Tranque-as antes de sair.")
+            msg = "Nem todas as pastas foram trancadas. Tranque-as antes de sair."
+            if self._visible_folders()[1]:
+                msg = (
+                    "Nem todas as pastas foram trancadas. Tranque-as antes de sair; nas que "
+                    "precisam de atenção, use 'Resolver…'."
+                )
+            if seq.trancadas:
+                msg = f"{seq.trancadas} pasta(s) foram trancadas. " + msg
+            self.home.set_notice(msg)
             return
         if not seq.falhas:
             self._quit_now(seq.conhecidas)

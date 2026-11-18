@@ -4065,6 +4065,107 @@ def test_trancar_e_sair_com_pasta_que_precisa_de_atencao_so_sai_se_pedirem(
         assert len([p for p in tela.perguntas if p["title"] == "Sair do Owl Vault?"]) == 1
 
 
+def _tres_abertas_com_atencao(
+    win: OwlWindow, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[list[Path], list[FolderRecord]]:
+    """A (o T7 pergunta), B (renomeada: precisa de atenção) e C (dá para trancar), abertas."""
+    pa, ra = _protegida(win, tmp_path / "pastas", "Pasta A", 3)
+    pb, rb = _protegida(win, tmp_path / "pastas", "Pasta B", 3)
+    pc, rc = _protegida(win, tmp_path / "pastas", "Pasta C", 3)
+    mgr = win.mgr
+    assert mgr is not None
+    for r in (ra, rb, rc):
+        mgr.unlock(r.id)
+    local_b = pb.with_name("Pasta B renomeada")
+    pb.rename(local_b)
+    real_missing = mgr.missing_since_open
+    monkeypatch.setattr(
+        mgr,
+        "missing_since_open",
+        lambda fid: ["doc 1.txt"] if fid == ra.id else real_missing(fid),
+    )
+    win._refresh()
+    return [pa, local_b, pc], [ra, rb, rc]
+
+
+@gui
+@pytest.mark.parametrize("resposta", ["enter", "esc", "bloqueio"])
+def test_t7_cancelado_no_trancar_e_sair_com_pasta_de_atencao_volta_ao_app(
+    abrir_tela: Callable[..., Tela],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resposta: str,
+) -> None:
+    """V3-JAN-1: 'Trancar e sair' com A (o T7 pergunta), B (precisa de atenção) e C. Cancelar
+    (Enter/Esc) no T7 de A levava a um resumo que só citava B, e 'Sair sem trancar' saía
+    deixando A e C legíveis (C nem foi tentada). Cancelar no T7 é desistir da SAÍDA: o app
+    volta ao uso, sem resumo e sem 'Sair sem trancar'. Bloqueado no T7: nada de nomes."""
+    tela = abrir_tela()
+    win = _pronta(tela)
+    pastas, recs = _tres_abertas_com_atencao(win, tmp_path, monkeypatch)
+    legiveis = [_legiveis(p) for p in pastas]
+    assert all(legiveis)
+
+    def bloqueia() -> str:
+        win.lock_now()  # bloqueia com o T7 na tela (a caixa de verdade é rejeitada)
+        return ""
+
+    t7: Any = {"enter": _enter(tela), "esc": "", "bloqueio": bloqueia}[resposta]
+    tela.respostas["Sair do Owl Vault?"] = "lock"
+    tela.respostas["Trancar 'Pasta A'?"] = t7
+    # se o resumo aparecer, a pessoa clica no botão que sai deixando as pastas legíveis
+    tela.respostas["Não deu para trancar"] = "quit"
+    tela.respostas["2 pastas não foram trancadas"] = "quit"
+    assert not win.close()
+    _espera_fila(win, lambda: not win._quit_sequence)
+    _descarta()
+    t11 = tela.pergunta("Sair do Owl Vault?")
+    assert t11["details"][:2] == ["Pasta A", "Pasta C"]
+    assert t11["details"][2].startswith("Pasta B — precisa de atenção")
+    assert tela.pergunta("Trancar 'Pasta A'?")["primary"] == "cancel"
+    # nenhum resumo nem "Sair sem trancar" depois do T7: só as duas perguntas
+    assert [p["title"] for p in tela.perguntas] == ["Sair do Owl Vault?", "Trancar 'Pasta A'?"]
+    assert not win._quitting and not win._quit_sequence
+    assert [r.state for r in recs] == [ABERTA, ABERTA, ABERTA]
+    assert [_legiveis(p) for p in pastas] == legiveis  # nada foi trancado nem apagado
+    if resposta == "bloqueio":  # tela travada: nenhum nome de pasta à vista
+        assert win.session is None and win.mgr is None
+        assert win.pages.currentWidget() is win.unlock_page
+        assert not any(f"Pasta {x}" in win.home.notice.text() for x in "ABC")
+    else:
+        assert win.session is not None
+        assert win.pages.currentWidget() is win.home
+        aviso = win.home.notice.text()
+        assert aviso.startswith("Nem todas as pastas foram trancadas.")
+        assert "'Resolver…'" in aviso  # B precisa de atenção: a saída fica na lista
+
+
+@gui
+def test_t7_cancelado_no_trancar_agora_com_pasta_de_atencao_avisa_que_faltaram_pastas(
+    abrir_tela: Callable[..., Tela], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """V3-JAN-1 (faixa 'Trancar agora'): Cancelar no T7 de A, com B precisando de atenção. O
+    resumo dizia só "Não deu para trancar 'Pasta B'", calado sobre A e C, que ficaram abertas."""
+    tela = abrir_tela()
+    win = _pronta(tela)
+    pastas, recs = _tres_abertas_com_atencao(win, tmp_path, monkeypatch)
+    legiveis = [_legiveis(p) for p in pastas]
+    win._lock_all()
+    _espera_fila(win, lambda: len(tela.perguntas) >= 2)
+    _descarta()
+    assert [p["title"] for p in tela.perguntas] == [
+        "Trancar 'Pasta A'?",
+        "Não deu para trancar 'Pasta B'",
+    ]
+    resumo = tela.pergunta("Não deu para trancar 'Pasta B'")
+    assert resumo["buttons"] == ["close"]
+    assert resumo["text"].startswith(
+        "Você cancelou o trancamento, e as pastas que ainda faltavam continuam abertas."
+    )
+    assert [r.state for r in recs] == [ABERTA, ABERTA, ABERTA]
+    assert [_legiveis(p) for p in pastas] == legiveis
+
+
 def _modal_e_ausencia(win: OwlWindow, sessao: list[object]) -> None:
     """Uma pergunta modal de verdade na tela e 10 min sem uso: roda o timer de inatividade."""
     caixa = QDialog(win)

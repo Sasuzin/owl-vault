@@ -218,7 +218,10 @@ class _DialogoCofre(QDialog):
     def _botoes(self, botoes: Sequence[QPushButton]) -> None:
         """Linha de botões à direita (fora da rolagem: sempre à vista); se não cabem, um
         embaixo do outro, na largura toda. Numa tela baixa em que a coluna não cabe junto com
-        o corpo mínimo, ficam em duas colunas (os botões nunca saem da tela)."""
+        o corpo mínimo, ficam em duas colunas, na ordem de leitura (os botões nunca saem da
+        tela): dois a dois quando cabem lado a lado, e um rótulo longo demais fica sozinho, na
+        linha toda (em 731x384, a 175%, a coluna de 4 botões deixava 'Fechar' atrás da barra
+        de tarefas)."""
         # a sobra de altura do corpo vai para baixo, nunca para dentro do título e do texto
         self.corpo.addStretch(1)
         self._cartao.addSpacing(ESPACO_ANTES_DOS_BOTOES)
@@ -232,7 +235,7 @@ class _DialogoCofre(QDialog):
                 linha.addWidget(b)
             linha.setSpacing(VAO_BOTOES)
             box = linha
-        elif self._coluna_cabe(botoes) or not self._grade_cabe(botoes):
+        elif self._coluna_cabe(botoes) or (linhas := self._linhas_da_grade(botoes)) is None:
             coluna = QVBoxLayout()
             for b in botoes:
                 b.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -243,14 +246,19 @@ class _DialogoCofre(QDialog):
             grade = QGridLayout()
             grade.setHorizontalSpacing(VAO_BOTOES)
             grade.setVerticalSpacing(VAO_BOTOES)
-            for i, b in enumerate(botoes):
-                b.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-                if i == len(botoes) - 1 and i % 2 == 0:
-                    grade.addWidget(b, i // 2, 0, 1, 2)  # o último, sozinho, na largura toda
-                else:
-                    grade.addWidget(b, i // 2, i % 2)
-            largura = max(b.sizeHint().width() for b in botoes)
-            for coluna_i in (0, 1):  # as duas colunas com a mesma largura
+            for i, botoes_da_linha in enumerate(linhas):
+                for j, b in enumerate(botoes_da_linha):
+                    b.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+                    if len(botoes_da_linha) == 1:
+                        grade.addWidget(b, i, 0, 1, 2)  # sozinho, na largura toda
+                    else:
+                        grade.addWidget(b, i, j)
+            if self._grade_cabe(botoes):  # as duas colunas com a mesma largura
+                larguras = [max(b.sizeHint().width() for b in botoes)] * 2
+            else:  # cada coluna da largura do maior botão que fica nela
+                pares = [par for par in linhas if len(par) == 2]
+                larguras = [max(par[j].sizeHint().width() for par in pares) for j in (0, 1)]
+            for coluna_i, largura in enumerate(larguras):
                 grade.setColumnStretch(coluna_i, 1)
                 grade.setColumnMinimumWidth(coluna_i, largura)
             box = grade
@@ -279,13 +287,47 @@ class _DialogoCofre(QDialog):
         coluna = sum(b.sizeHint().height() for b in botoes) + VAO_BOTOES * (len(botoes) - 1)
         return self._cromo_vertical() + CORPO_MINIMO + coluna <= area.height() - FOLGA_MOLDURA
 
-    def _grade_cabe(self, botoes: Sequence[QPushButton]) -> bool:
-        """Duas colunas de botões cabem na largura da tela?"""
+    def _largura_util(self) -> int | None:
+        """Largura que os botões podem ocupar sem o diálogo passar da largura da tela."""
         area = area_util(self.parentWidget() or self)
         if area is None:
+            return None
+        return area.width() - FOLGA_LARGURA - 2 * MARGEM - 2 * 24
+
+    def _grade_cabe(self, botoes: Sequence[QPushButton]) -> bool:
+        """Duas colunas iguais (da largura do maior botão) cabem na largura da tela?"""
+        util = self._largura_util()
+        if util is None:
             return False
-        largura = 2 * max(b.sizeHint().width() for b in botoes) + VAO_BOTOES
-        return largura + 2 * MARGEM + 2 * 24 <= area.width() - FOLGA_LARGURA
+        return 2 * max(b.sizeHint().width() for b in botoes) + VAO_BOTOES <= util
+
+    def _linhas_da_grade(self, botoes: Sequence[QPushButton]) -> list[list[QPushButton]] | None:
+        """Os botões em linhas de um ou dois, na ordem de leitura (e de Tab).
+
+        Dois vizinhos dividem a linha se as duas colunas, cada uma da largura do maior botão
+        que fica nela, ainda cabem na largura da tela; senão o primeiro fica sozinho, na linha
+        toda (um rótulo longo não alarga a coluna dos outros). ``None``: nenhum par cabe, e a
+        grade seria a própria coluna.
+        """
+        util = self._largura_util()
+        if util is None:
+            return None
+        larguras = [b.sizeHint().width() for b in botoes]
+        linhas: list[list[QPushButton]] = []
+        esquerda = direita = 0
+        i = 0
+        while i < len(botoes):
+            if i + 1 < len(botoes):
+                nova_esquerda = max(esquerda, larguras[i])
+                nova_direita = max(direita, larguras[i + 1])
+                if nova_esquerda + VAO_BOTOES + nova_direita <= util:
+                    esquerda, direita = nova_esquerda, nova_direita
+                    linhas.append([botoes[i], botoes[i + 1]])
+                    i += 2
+                    continue
+            linhas.append([botoes[i]])
+            i += 1
+        return linhas if len(linhas) < len(botoes) else None
 
 
 # --- escolha (T5c, T7, T8, T9, T11...) --------------------------------------------------

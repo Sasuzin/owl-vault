@@ -14,7 +14,17 @@ import os
 import time
 from collections.abc import Callable, Sequence
 
-from PySide6.QtCore import QEvent, QObject, QRect, QSettings, QSize, Qt, SignalInstance, Slot
+from PySide6.QtCore import (
+    QEvent,
+    QObject,
+    QPoint,
+    QRect,
+    QSettings,
+    QSize,
+    Qt,
+    SignalInstance,
+    Slot,
+)
 from PySide6.QtGui import (
     QCloseEvent,
     QColor,
@@ -30,6 +40,7 @@ from PySide6.QtGui import (
     QTextCursor,
 )
 from PySide6.QtWidgets import (
+    QApplication,
     QDialog,
     QFileDialog,
     QFrame,
@@ -129,6 +140,8 @@ CORPO_MINIMO = 120
 CORPO_APERTADO = 64
 #: altura máxima de um QWidget no Qt (QWIDGETSIZE_MAX): a Rolagem sem teto
 SEM_TETO = 16777215
+#: folga em volta do campo focado que a ``Rolagem`` traz para a vista
+MARGEM_DO_FOCO = 8
 
 
 def area_util(window: QWidget) -> QRect | None:
@@ -251,7 +264,9 @@ def _invalida(lay: QLayout) -> None:
 class Rolagem(QScrollArea):
     """Rolagem vertical sem moldura que pede a altura do conteúdo na largura dada (como um
     texto com quebra de linha). Numa tela baixa a janela a encolhe (``fit_to_content`` põe um
-    teto nela) e o conteúdo rola."""
+    teto nela) e o conteúdo rola. O campo do conteúdo que ganha o foco pelo Tab, vindo dos
+    botões (``_mostra_foco``) ou de dentro dela (``focusNextPrevChild``), é trazido para a
+    vista (``_traz_para_vista``)."""
 
     def __init__(self, content: QWidget) -> None:
         super().__init__()
@@ -262,6 +277,63 @@ class Rolagem(QScrollArea):
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # o Tab vai direto aos campos
         self.setWidget(content)
         content.installEventFilter(self)
+        app = QApplication.instance()
+        if isinstance(app, QApplication):
+            # método do próprio objeto: o Qt desfaz a conexão quando a Rolagem é destruída
+            app.focusChanged.connect(self._mostra_foco)
+
+    @Slot(QWidget, QWidget)
+    def _mostra_foco(self, antes: QWidget | None, agora: QWidget | None) -> None:
+        """Rola até o widget do conteúdo que ganhou o foco vindo de FORA da Rolagem, na mesma
+        janela (o Tab que sai dos botões): inteiro, se cabe na vista; senão, o começo dele.
+        O Qt só rola quando o Tab anda DENTRO da QScrollArea (``focusNextPrevChild``); o Tab
+        que vinha dos botões deixava o campo focado (a lista "Detalhes") fora da vista, e um
+        Enter ali escolhia o botão primário sem a pessoa ver onde estava.
+
+        Não rola: no foco inicial de um diálogo (``antes`` em outra janela: o diálogo abre no
+        topo, com o título e o texto à vista), na volta à janela (``antes`` vazio: a pessoa
+        pode ter rolado para ler) e com um botão do mouse apertado (o foco veio de um clique:
+        o conteúdo pularia debaixo do ponteiro e o clique cairia fora do botão). O cursor de
+        um texto não é seguido: numa lista rolada por dentro ele fica fora dela e levaria o
+        corpo para longe da lista."""
+        if agora is None or antes is None:
+            return
+        if QGuiApplication.mouseButtons() != Qt.MouseButton.NoButton:
+            return
+        conteudo = self.widget()
+        if conteudo is None or agora is conteudo or not conteudo.isAncestorOf(agora):
+            return
+        if antes.window() is not agora.window() or conteudo.isAncestorOf(antes):
+            return  # outra janela (foco inicial) ou Tab dentro da Rolagem (focusNextPrevChild)
+        self._traz_para_vista(agora)
+
+    def focusNextPrevChild(self, next: bool) -> bool:
+        """Tab DENTRO da Rolagem: a mesma regra de ``_traz_para_vista``. O do QScrollArea
+        (``ensureWidgetVisible``) segue o cursor de um texto, que numa lista rolada por dentro
+        fica fora dela, e levava o corpo para longe da lista focada."""
+        if not QWidget.focusNextPrevChild(self, next):
+            return False
+        agora = QApplication.focusWidget()
+        if agora is not None:
+            self._traz_para_vista(agora)
+        return True
+
+    def _traz_para_vista(self, agora: QWidget) -> None:
+        """Rola até ``agora`` (se é do conteúdo): inteiro, se cabe na vista; senão, o começo."""
+        conteudo = self.widget()
+        if conteudo is None or agora is conteudo or not conteudo.isAncestorOf(agora):
+            return
+        topo = agora.mapTo(conteudo, QPoint(0, 0)).y()
+        base = topo + agora.height()
+        de = -conteudo.y()  # o trecho do conteúdo à vista: [de, de + vista)
+        vista = self.viewport().height()
+        if topo >= de and base <= de + vista:
+            return  # já está inteiro à vista
+        barra = self.verticalScrollBar()
+        if agora.height() + 2 * MARGEM_DO_FOCO <= vista and topo >= de:
+            barra.setValue(base + MARGEM_DO_FOCO - vista)  # abaixo da vista: inteiro, embaixo
+        else:
+            barra.setValue(topo - MARGEM_DO_FOCO)  # acima, ou mais alto que a vista: o começo
 
     def hasHeightForWidth(self) -> bool:
         return True

@@ -101,6 +101,16 @@ ajuste) e o commit, em ☰ → Sobre, no rodapé e nas propriedades do `OwlVault
   restaurando, trancamento interrompido), como o "Trancar e sair".
 * Se a gravação do fim de um "Desfazer" falha, dá para clicar em "Desfazer" de novo sem
   reiniciar o app.
+* "Trancar e sair": Cancelar na pergunta sobre arquivos apagados volta ao Owl Vault mesmo com
+  pasta precisando de atenção, em vez de oferecer "Sair sem trancar" e deixar abertas pastas
+  que nem foram tentadas.
+* Se o computador desligar logo depois de um trancamento que não deu certo porque a pasta
+  mudou, ao reabrir a pasta volta aberta, sem o aviso falso de que arquivos começaram a ser
+  apagados.
+* Em telas pequenas com escala alta (175%), os botões da "Versão anterior" ficam em duas
+  colunas e nenhum some atrás da barra de tarefas.
+* O Tab que chega a uma lista ou campo do corpo de um diálogo rola até ele, mesmo com a lista
+  rolada por dentro; os diálogos continuam abrindo no topo.
 
 ## 0.2.0 — 2026-11-17
 

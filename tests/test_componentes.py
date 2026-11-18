@@ -11,7 +11,7 @@ from collections.abc import Callable, Iterator
 
 import pytest
 from PySide6 import QtGui
-from PySide6.QtCore import QCoreApplication, QEvent, QPoint, QRect, Qt
+from PySide6.QtCore import SIGNAL, QCoreApplication, QEvent, QPoint, QRect, Qt
 from PySide6.QtGui import QColor, QImage, QPalette, QTextDocument
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from owl_vault.ui import common
 from owl_vault.ui import componentes as C
 from owl_vault.ui.theme import apply_theme, current_tokens
 
@@ -498,3 +499,187 @@ def test_sombra_do_cartao_acompanha_a_troca_de_tema(
         C._SombraDoTema, C._SombraDoTema.NOME, Qt.FindChildOption.FindDirectChildrenOnly
     )
     assert len(ganchos) == 1
+
+
+# =========================================================================== v3-visual-2: foco
+
+
+def _rolagem_baixa(
+    guarda: Callable[[QWidget], QWidget], alvo: QWidget, *, antes: int = 300
+) -> tuple[QWidget, common.Rolagem, QPushButton]:
+    """Janela com uma ``Rolagem`` baixa (120 px) e o botão FORA dela, embaixo, como nos
+    diálogos. ``alvo`` fica no conteúdo, ``antes`` px abaixo do topo (fora da vista)."""
+    w, lay = _janela(guarda, 480)
+    conteudo, cl = C.transparente()
+    cl.setSpacing(0)
+    cl.setContentsMargins(0, 0, 0, 0)
+    calco = QLabel("texto longo do diálogo")
+    calco.setFixedHeight(antes)
+    cl.addWidget(calco)
+    cl.addWidget(alvo)
+    cl.addSpacing(200)
+    rolagem = common.Rolagem(conteudo)
+    rolagem.setFixedHeight(120)
+    lay.addWidget(rolagem)
+    botao = C.botao("Fechar")
+    lay.addWidget(botao)
+    lay.addStretch(1)
+    QWidget.setTabOrder(botao, alvo)
+    w.show()
+    w.activateWindow()
+    _pump()
+    botao.setFocus(Qt.FocusReason.TabFocusReason)
+    _pump()
+    rolagem.verticalScrollBar().setValue(0)  # o foco inicial (no conteúdo) já pode ter rolado
+    _pump()
+    return w, rolagem, botao
+
+
+def _visivel(rolagem: common.Rolagem, alvo: QWidget) -> int:
+    """Quantos px de altura de ``alvo`` aparecem no viewport da Rolagem."""
+    vista = rolagem.viewport()
+    y = alvo.mapTo(vista, QPoint(0, 0)).y()
+    return max(0, min(vista.height(), y + alvo.height()) - max(0, y))
+
+
+@pytest.mark.parametrize("como", ["tab", "setFocus"])
+def test_rolagem_traz_para_a_vista_o_campo_focado_vindo_de_fora(
+    tema: str, qapp: QApplication, guarda: Callable[[QWidget], QWidget], como: str
+) -> None:
+    """O Tab que entrava na Rolagem vindo dos botões (fora dela) não rolava: a lista
+    "Detalhes" ficava com o foco fora da vista (Resolver "apagando" em 1366x768 a 125%)."""
+    lista = C.lista_detalhes([f"arquivo-{i}.txt" for i in range(3)], altura=80)
+    _w, rolagem, botao = _rolagem_baixa(guarda, lista)
+    assert botao.hasFocus()
+    assert rolagem.verticalScrollBar().value() == 0
+    assert _visivel(rolagem, lista) == 0  # começa fora da vista
+    if como == "tab":
+        QTest.keyClick(botao, Qt.Key.Key_Tab)
+    else:
+        lista.setFocus(Qt.FocusReason.TabFocusReason)
+    _pump()
+    assert qapp.focusWidget() is lista
+    assert _visivel(rolagem, lista) > 0
+    assert _visivel(rolagem, lista) == lista.height()  # cabe na vista: aparece inteira
+
+
+def test_rolagem_campo_mais_alto_que_a_vista_mostra_o_comeco(
+    tema: str, qapp: QApplication, guarda: Callable[[QWidget], QWidget]
+) -> None:
+    """Uma lista mais alta que a vista: o começo dela (onde está o cursor) no alto."""
+    lista = C.lista_detalhes([f"arquivo-{i}.txt" for i in range(40)], altura=260)
+    _w, rolagem, botao = _rolagem_baixa(guarda, lista)
+    assert lista.height() > rolagem.viewport().height()
+    assert _visivel(rolagem, lista) == 0
+    QTest.keyClick(botao, Qt.Key.Key_Tab)
+    _pump()
+    assert qapp.focusWidget() is lista
+    y = lista.mapTo(rolagem.viewport(), QPoint(0, 0)).y()
+    assert 0 <= y <= common.MARGEM_DO_FOCO  # o começo da lista (e o cursor) no alto da vista
+    assert _visivel(rolagem, lista) >= rolagem.viewport().height() - common.MARGEM_DO_FOCO
+
+
+def test_rolagem_nao_pula_no_clique_e_solta_a_conexao_ao_ser_destruida(
+    tema: str, qapp: QApplication, guarda: Callable[[QWidget], QWidget]
+) -> None:
+    """Um clique num botão meio à vista não rola (o botão sairia debaixo do ponteiro e o
+    clique se perderia); destruída a Rolagem, o ``focusChanged`` não a chama mais."""
+    sinal = SIGNAL("focusChanged(QWidget*,QWidget*)")
+    antes = qapp.receivers(sinal)
+    dentro = C.botao("Ver detalhes")
+    _w, rolagem, botao = _rolagem_baixa(guarda, dentro, antes=100)  # só o alto à vista
+    assert qapp.receivers(sinal) == antes + 1
+    assert 0 < _visivel(rolagem, dentro) < dentro.height()
+    cliques: list[bool] = []
+    dentro.clicked.connect(lambda: cliques.append(True))
+    # pela janela (como o Windows entrega): o Qt sabe que o botão do mouse está apertado
+    janela = dentro.window().windowHandle()
+    assert janela is not None
+    # perto da borda da vista: se o conteúdo rolasse, o botão sairia de baixo do ponteiro
+    ponto = dentro.mapTo(
+        dentro.window(), QPoint(dentro.width() // 2, _visivel(rolagem, dentro) - 2)
+    )
+    QTest.mouseClick(janela, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, ponto)
+    _pump()
+    assert dentro.hasFocus()
+    assert cliques == [True]
+    assert rolagem.verticalScrollBar().value() == 0
+    rolagem.deleteLater()
+    _pump()
+    assert qapp.receivers(sinal) == antes
+    botao.setFocus(Qt.FocusReason.TabFocusReason)  # nada de "objeto C++ já apagado"
+    _pump()
+    assert botao.hasFocus()
+
+
+def test_rolagem_lista_rolada_por_dentro_continua_a_vista_no_tab(
+    tema: str, qapp: QApplication, guarda: Callable[[QWidget], QWidget]
+) -> None:
+    """Lista "Detalhes" rolada por dentro (o cursor fica no começo, FORA da lista): o Tab
+    vindo dos botões mostra a lista, e não o retângulo do cursor (que levava o corpo para
+    longe dela)."""
+    lista = C.lista_detalhes([f"arquivo-{i}.txt" for i in range(60)], altura=80)
+    _w, rolagem, botao = _rolagem_baixa(guarda, lista)
+    lista.verticalScrollBar().setValue(lista.verticalScrollBar().maximum())
+    _pump()
+    assert _visivel(rolagem, lista) == 0
+    QTest.keyClick(botao, Qt.Key.Key_Tab)
+    _pump()
+    assert qapp.focusWidget() is lista
+    assert _visivel(rolagem, lista) == lista.height()
+
+
+def test_rolagem_tab_dentro_dela_mostra_a_lista_rolada_por_dentro(
+    tema: str, qapp: QApplication, guarda: Callable[[QWidget], QWidget]
+) -> None:
+    """Tab que anda DENTRO da Rolagem (do botão "Detalhes" para a lista, como em "Versão
+    anterior" e "Trancar mesmo assim"): o QScrollArea seguia o cursor da lista rolada por
+    dentro (fora dela) e a lista sumia da vista."""
+    w, lay = _janela(guarda, 480)
+    conteudo, cl = C.transparente()
+    cl.setSpacing(0)
+    cl.setContentsMargins(0, 0, 0, 0)
+    calco = QLabel("texto longo do diálogo")
+    calco.setFixedHeight(300)
+    cl.addWidget(calco)
+    detalhes = C.botao("Detalhes")
+    cl.addWidget(detalhes)
+    lista = C.lista_detalhes([f"arquivo-{i}.txt" for i in range(60)], altura=80)
+    cl.addWidget(lista)
+    cl.addSpacing(200)
+    rolagem = common.Rolagem(conteudo)
+    rolagem.setFixedHeight(120)
+    lay.addWidget(rolagem)
+    lay.addStretch(1)
+    QWidget.setTabOrder(detalhes, lista)
+    w.show()
+    w.activateWindow()
+    _pump()
+    detalhes.setFocus(Qt.FocusReason.TabFocusReason)
+    _pump()
+    lista.verticalScrollBar().setValue(lista.verticalScrollBar().maximum())
+    rolagem.verticalScrollBar().setValue(300)  # o botão "Detalhes" no alto da vista
+    _pump()
+    QTest.keyClick(detalhes, Qt.Key.Key_Tab)
+    _pump()
+    assert qapp.focusWidget() is lista
+    assert _visivel(rolagem, lista) == lista.height()
+
+
+def test_rolagem_nao_rola_no_foco_inicial_nem_na_volta_a_janela(
+    tema: str, qapp: QApplication, guarda: Callable[[QWidget], QWidget]
+) -> None:
+    """O foco que chega de outra janela (o diálogo acabou de abrir) ou do nada (a janela
+    voltou a ficar ativa) não rola: o diálogo abre no topo, com o título e o texto à vista,
+    e quem rolou para ler não perde o lugar."""
+    lista = C.lista_detalhes([f"arquivo-{i}.txt" for i in range(3)], altura=80)
+    _w, rolagem, _botao = _rolagem_baixa(guarda, lista)
+    _outra, lay_outra = _janela(guarda, 200)
+    de_fora = C.botao("Na janela principal")
+    lay_outra.addWidget(de_fora)
+    barra = rolagem.verticalScrollBar()
+    assert barra.value() == 0 and _visivel(rolagem, lista) == 0
+    rolagem._mostra_foco(de_fora, lista)  # foco inicial: veio de outra janela
+    assert barra.value() == 0
+    rolagem._mostra_foco(None, lista)  # a janela voltou a ficar ativa
+    assert barra.value() == 0

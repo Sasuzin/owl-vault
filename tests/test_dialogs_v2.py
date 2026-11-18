@@ -1357,3 +1357,115 @@ def test_limites_em_tela_grande_sem_barra(
     conteudo = dlg.rolagem.widget()
     assert conteudo is not None
     assert conteudo.height() <= dlg.rolagem.viewport().height()
+
+
+# =========================================================================== v3-visual-1
+
+#: os botões do Resolver de 'versão anterior' (owl_window, ``versao_anterior``)
+BOTOES_VERSAO_ANTERIOR = [
+    ("Recuperar esses arquivos em outra pasta…", "restore"),
+    ("Apagar a versão anterior…", "delete"),
+    ("Tirar da lista", "forget"),
+    ("Fechar", "close"),
+]
+
+
+def _resolver_versao_anterior(pai: QWidget | None) -> fd.ChoiceDialog:
+    """Como o owl_window o monta: 4 botões, o primeiro com um rótulo longo (339 px), e 40
+    arquivos nos detalhes (recolhidos)."""
+    return fd.ChoiceDialog(
+        pai,
+        f"Versão anterior de '{NOME}'",
+        "Foi mantida uma versão anterior com 40 arquivo(s) que não estão na pasta.",
+        BOTOES_VERSAO_ANTERIOR,
+        details=[f"Projeto {i:02d}\\relatório {i:02d}.docx" for i in range(40)],
+        primary="restore",
+        perigo="delete",
+    )
+
+
+def _assert_botoes_dentro_da_area_util(dlg: fd.ChoiceDialog, largura: int, altura: int) -> None:
+    """A janela (com a barra de título) cabe na área útil, e cada botão fica inteiro nela,
+    sem cortar o rótulo, na ordem de leitura e de Tab dos botões; o Enter continua no
+    primário, nunca na ação destrutiva."""
+    botoes = list(dlg.buttons.values())
+    geos = _geometrias(dlg)
+    _assert_botoes_inteiros_e_separados(dlg)
+    assert dlg.height() + common.FOLGA_TITULO <= altura
+    assert dlg.width() + common.FOLGA_LARGURA <= largura
+    area = QRect(0, 0, largura, altura)
+    for b, g in zip(botoes, geos, strict=True):
+        # no melhor caso, a janela encostada no topo da área útil, embaixo da barra de título
+        na_tela = g.translated(common.FOLGA_LARGURA // 2, common.FOLGA_TITULO)
+        assert area.contains(na_tela), (b.text(), na_tela, area)
+        assert g.width() >= b.sizeHint().width(), b.text()
+        assert g.height() >= b.sizeHint().height(), b.text()
+    lidos = sorted(range(len(geos)), key=lambda i: (geos[i].y(), geos[i].x()))
+    assert lidos == list(range(len(botoes)))  # linha a linha, da esquerda para a direita
+    _assert_ordem(dlg, botoes)
+    assert dlg.buttons["restore"].isDefault()
+    assert not dlg.buttons["delete"].isDefault()
+    assert not dlg.buttons["delete"].autoDefault()
+    assert dlg.buttons["delete"].objectName() == "perigo"
+
+
+@pytest.mark.parametrize(("largura", "altura"), [(731, 384), (780, 411)], ids=["p720_175", "hd175"])
+def test_resolver_de_versao_anterior_cabe_em_tela_estreita_e_baixa(
+    tema: str,
+    guarda: Callable[..., QWidget],
+    monkeypatch: pytest.MonkeyPatch,
+    largura: int,
+    altura: int,
+) -> None:
+    """v3-visual-1: em 1280x720 e 1366x768 a 175% (escala personalizada) nem a coluna de 4
+    botões cabia na altura nem duas colunas iguais (2 x 339 px) na largura. A coluna era usada
+    e o diálogo (520x416) passava da área útil: em 731x384 'Fechar' ficava com 35 de 50 px à
+    vista. Agora os vizinhos dividem a linha, cada coluna da largura do maior botão dela."""
+    _tela(monkeypatch, largura, altura)
+    pai = guarda(QWidget())
+    pai.resize(700, 300)
+    dlg = guarda(_resolver_versao_anterior(pai))
+    assert isinstance(dlg, fd.ChoiceDialog)
+    _mostra(dlg)
+    assert isinstance(dlg.button_box, QGridLayout)
+    _assert_botoes_dentro_da_area_util(dlg, largura, altura)
+    assert dlg.rolagem.height() >= common.CORPO_APERTADO
+
+
+def test_rotulo_longo_demais_para_dividir_a_linha_fica_sozinho(
+    tema: str, guarda: Callable[..., QWidget], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Numa tela ainda mais estreita (640x440), 'Recuperar…' não divide a linha com ninguém:
+    fica sozinho, na largura toda, e os outros seguem dois a dois (o último, sozinho, também
+    na largura toda). Antes a coluna era usada e passava da área útil (416 + 40 > 440)."""
+    _tela(monkeypatch, 640, 440)
+    dlg = guarda(_resolver_versao_anterior(None))
+    assert isinstance(dlg, fd.ChoiceDialog)
+    _mostra(dlg)
+    assert isinstance(dlg.button_box, QGridLayout)
+    _assert_botoes_dentro_da_area_util(dlg, 640, 440)
+    recuperar, apagar, tirar, fechar = _geometrias(dlg)
+    assert apagar.y() == tirar.y() > recuperar.y()  # os dois do meio dividem a linha
+    assert fechar.y() > apagar.y()
+    assert recuperar.width() == fechar.width() == tirar.right() - apagar.left() + 1
+    assert dlg.rolagem.height() >= common.CORPO_APERTADO
+
+
+@pytest.mark.parametrize(
+    ("largura", "altura"), [(800, 552), (1093, 566), (1366, 720)], ids=["x800", "hd125", "hd100"]
+)
+def test_resolver_de_versao_anterior_mantem_a_coluna_quando_cabe(
+    tema: str,
+    guarda: Callable[..., QWidget],
+    monkeypatch: pytest.MonkeyPatch,
+    largura: int,
+    altura: int,
+) -> None:
+    """Onde a coluna de 4 botões cabe junto com o corpo, nada muda: um embaixo do outro."""
+    _tela(monkeypatch, largura, altura)
+    dlg = guarda(_resolver_versao_anterior(None))
+    assert isinstance(dlg, fd.ChoiceDialog)
+    _mostra(dlg)
+    assert isinstance(dlg.button_box, QVBoxLayout)
+    assert dlg.width() == fd.LARGURA
+    _assert_botoes_dentro_da_area_util(dlg, largura, altura)

@@ -1285,7 +1285,8 @@ class LockerManager:
             # mesmo que o perfil não grave DESCARTANDO (must_record=False): sem isso a pasta
             # ficaria em TRANCANDO e o 'Resolver' a julgaria pela heurística de "arquivo
             # faltando" (APAGANDO, "começou a apagar"), o que seria falso. O cabeçalho sai
-            # primeiro; no início, um 'novo' sem cabeçalho e sem marcador é descartado, e um
+            # primeiro; no início, um 'novo' sem cabeçalho e sem marcador é descartado (e um
+            # concluído COM divergências também: a queda pode vir antes de DESCARTANDO), e um
             # 'novo' que não existe some da lista.
             with contextlib.suppress(OwlVaultError, OSError):
                 self._discard_novo(rec, must_record=False, nothing_deleted=True)
@@ -2603,8 +2604,15 @@ class LockerManager:
         """O que fazer com o 'novo' de um trancamento interrompido em TRANCANDO.
 
         "descartar": nenhum original pode ter sido apagado por ele; "apagando": cofre concluído
-        e (marcador em P ou algum arquivo do manifesto falta em P) — pode ser a ÚNICA cópia;
-        "manter": não deu para conferir (nada é apagado).
+        SEM divergências e (marcador em P ou algum arquivo do manifesto falta em P) — pode ser a
+        ÚNICA cópia; "manter": não deu para conferir (nada é apagado).
+
+        Um 'novo' concluído COM divergências e sem marcador em P é descartado: ``lock()`` só
+        grava 'apagando' (e só escreve o marcador) quando ``create_vault`` deu "success", que é
+        exatamente "nenhuma divergência" no registro de conclusão. Ele nunca autorizou apagar
+        um original; um arquivo que falta em P foi tirado pelo usuário (queda entre o fim da
+        criação e a gravação de DESCARTANDO — o mesmo caso que, sem queda, ``lock()`` desfaz com
+        ``nothing_deleted``).
         """
         loc = novo.location
         marker = os.path.lexists(winfs.join(p, MARKER_NAME))
@@ -2626,6 +2634,9 @@ class LockerManager:
         except (OwlVaultError, OSError):
             return unfinished, vault_id, None
         manifest = mread.manifest
+        if info is not None and info.divergences and not marker:
+            # o teste de restauração achou divergências: 'apagando' nunca foi gravado para ele
+            return "descartar", vault_id, manifest
         missing = any(not os.path.lexists(winfs.join(p, *e.path)) for e in manifest.files)
         if info is not None:
             return ("apagando" if marker or missing else "descartar"), vault_id, manifest
@@ -2648,7 +2659,8 @@ class LockerManager:
         cancelamento ou divergência em ``create_vault``). Este processo não apagou nada, então um
         arquivo que falta em P foi tirado pelo usuário: o 'novo' é descartado e a pasta volta a
         ABERTA (§4.1.3), como a mensagem "nada foi apagado. Tente de novo" promete. A heurística
-        de "arquivo faltando" vale só para o estado TRANCANDO lido do disco (início). Um
+        de "arquivo faltando" vale só para o estado TRANCANDO lido do disco (início), e só para
+        um 'novo' concluído sem divergências (``_judge_novo``). Um
         marcador em P (que não é deste trancamento: ele limpa o antigo ao começar) ainda faz
         conferir.
         """
