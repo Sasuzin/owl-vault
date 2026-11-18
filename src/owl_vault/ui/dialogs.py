@@ -9,8 +9,8 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QMouseEvent
+from PySide6.QtCore import QEvent, Qt, Signal
+from PySide6.QtGui import QMouseEvent, QShowEvent
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 
 from owl_vault.application.preflight import CreatePlan
 from owl_vault.ui import strings as S
+from owl_vault.ui.common import Rolagem, fit_to_content
 from owl_vault.ui.componentes import (
     botao,
     botao_primario,
@@ -83,16 +84,45 @@ def _secao(lay: QVBoxLayout, title: str, items: Sequence[str]) -> None:
     lay.addWidget(lista_detalhes(items))
 
 
-class PreflightDialog(QDialog):
+class _DialogoRolavel(QDialog):
+    """Conteúdo numa ``Rolagem`` e a linha de botões embaixo, fora dela: o diálogo nunca
+    passa da área útil da tela e os botões ficam sempre à vista."""
+
+    def __init__(self, parent: QWidget | None, largura: int) -> None:
+        super().__init__(parent)
+        self.setMinimumWidth(largura)
+        self._largura = largura
+        self._externo = QVBoxLayout(self)
+        self._externo.setContentsMargins(24, 24, 24, 24)
+        self._externo.setSpacing(12)
+        conteudo, corpo = transparente()
+        corpo.setSpacing(12)
+        assert isinstance(corpo, QVBoxLayout)
+        self.corpo: QVBoxLayout = corpo
+        self.rolagem = Rolagem(conteudo)
+        self._externo.addWidget(self.rolagem, 1)
+
+    def _rodape(self, linha: QWidget) -> None:
+        self._externo.addWidget(linha)
+
+    def showEvent(self, event: QShowEvent) -> None:
+        fit_to_content(self, self._largura)
+        super().showEvent(event)
+
+    def event(self, event: QEvent) -> bool:
+        handled = super().event(event)
+        if event.type() == QEvent.Type.LayoutRequest and self.isVisible():
+            fit_to_content(self, self._largura)
+        return handled
+
+
+class PreflightDialog(_DialogoRolavel):
     """Mostra o plano; só habilita "Criar cofre" com todos os aceites marcados."""
 
     def __init__(self, plan: CreatePlan, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
+        super().__init__(parent, 640)
         self.setWindowTitle(f"{S.APP_TITLE} — pré-verificação")
-        self.setMinimumWidth(640)
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(24, 24, 24, 24)
-        lay.setSpacing(12)
+        lay = self.corpo
         lay.addWidget(titulo("Conferência antes de criar"))
         lay.addWidget(nota("\n".join(plan.summary_lines())))
         if plan.blockers:
@@ -123,14 +153,14 @@ class PreflightDialog(QDialog):
         fechar = botao("Fechar" if plan.blockers else "Cancelar")
         fechar.clicked.connect(self.reject)
         ll.addWidget(fechar)
-        lay.addWidget(linha)
+        self._rodape(linha)
 
     def _update(self) -> None:
         if self._ok is not None:
             self._ok.setEnabled(all(c.isChecked() for c in self.aceites))
 
 
-class ReportDialog(QDialog):
+class ReportDialog(_DialogoRolavel):
     def __init__(
         self,
         title: str,
@@ -138,12 +168,9 @@ class ReportDialog(QDialog):
         sections: Sequence[tuple[str, Sequence[str]]],
         parent: QWidget | None = None,
     ) -> None:
-        super().__init__(parent)
+        super().__init__(parent, 620)
         self.setWindowTitle(f"{S.APP_TITLE} — {title}")
-        self.setMinimumWidth(620)
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(24, 24, 24, 24)
-        lay.setSpacing(12)
+        lay = self.corpo
         lay.addWidget(subtitulo(headline))
         for name, items in sections:
             if items:
@@ -153,4 +180,4 @@ class ReportDialog(QDialog):
         ok = botao_primario("OK")
         ok.clicked.connect(self.accept)
         ll.addWidget(ok)
-        lay.addWidget(linha)
+        self._rodape(linha)

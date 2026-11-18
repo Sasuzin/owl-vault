@@ -10,12 +10,97 @@ O executável também mostra o **build** (número de commits do projeto, sobe so
 ajuste) e o commit, em ☰ → Sobre, no rodapé e nas propriedades do `OwlVault.exe`
 (Versão do arquivo `0.3.0.<build>`).
 
-## 0.3.0 — 2026-11-17 (em andamento)
+## 0.3.0 — 2026-11-17
 
-* Visual "Cofre" (Claude Design, Estilo 5) em todo o app: tokens de cor únicos, cartões,
-  trilha de passos, rodapé com estado, botões pílula, campos de 48 px, medidor de força.
+**Visual**
+
+* Visual "Cofre" (Claude Design, Estilo 5) em todo o app, nos temas escuro e claro (☰ → Tema):
+  tokens de cor únicos, cartões, trilha de passos, rodapé com estado, botões pílula, campos de
+  48 px, medidor de força, foco de teclado visível e Tab na ordem de leitura.
+* "Proteger uma pasta" virou um assistente na própria janela (Pasta → Conferência → Trancar),
+  com uma linha por checagem e o andamento das etapas.
 * Cópia criptografada refeita como assistente de 4 passos (Pastas → Senha → Conferência → Criar).
 * Versão e build visíveis no app e no executável; este histórico.
+
+**Segurança e dados**
+
+* Nenhum cofre é apagado se estiver ilegível, sem gravação do estado ou sem outra cópia
+  conferida; o estado "trancada" é gravado logo depois de mover o cofre para a pasta.
+* Abrir confere o espaço livre antes de tirar o cofre da pasta; "Desfazer" guarda a versão
+  quando há conflito; "Procurar a pasta…" funciona em qualquer estado.
+* PIN: o contador de tentativas fica nas duas cópias do perfil, a senha mestra não reativa um
+  PIN desativado e PINs fáceis (sequências, repetições, teclado, datas) são recusados.
+* Perfil danificado é reconhecido e leva à recuperação, sem apagar o arquivo danificado.
+* Atalho, ícone e área temporária com permissões só da sua conta; atalho conferido e refeito
+  ao iniciar; atalho sem nome do computador.
+* Instância única aceita pedidos só da mesma conta do Windows; versão mais antiga não
+  substitui a instalada.
+
+**Correções da revisão final**
+
+* "Desfazer" um trancamento interrompido decide pelo próprio arquivo o que nunca foi apagado:
+  um arquivo recriado no lugar não faz perder a versão guardada.
+* "Continuar trancando" depois de um "Desfazer" confere o conteúdo de cada arquivo antes de
+  apagá-lo.
+* Uma falha antes de começar a apagar sempre devolve a pasta aberta, e "Tente de novo" funciona.
+* A abertura nunca começa a devolver os arquivos sem gravar a etapa no perfil.
+* Uma versão anterior mantida não é mais dada como coberta por um cofre mais velho.
+* "Procurar a pasta…" recusa uma cópia trancada (backup) no lugar de uma pasta aberta e acha
+  uma pasta escondida pela pasta onde ela fica.
+* Cofre da área temporária sumido ou danificado, cofre trocado por outro e pasta sem permissão
+  viram "Precisa de atenção" com texto próprio e saída; as outras pastas continuam na lista.
+* Trancamento interrompido com a cópia nova ilegível ganhou "Deixar a pasta aberta" (nada é
+  apagado).
+* Pasta escondida que não abre continua escondida.
+* As pendências do trancamento dizem se o arquivo está em uso, se mudou ou se é um item novo
+  que não está guardado.
+* "Tirar da lista" existe em todo estado e diz onde ficam os arquivos e as cópias fora da pasta.
+* Toda linha da lista tem saída: problemas novos caem num "Resolver…" com "Procurar a pasta…" e
+  "Tirar da lista"; uma unidade com outra letra explica como procurar.
+* Sair e "Trancar agora" contam também pastas abrindo, restaurando e trancando, trancam em fila
+  e mostram um resumo do que ficou aberto.
+* Enter não escolhe mais "Trancar mesmo assim" (que apaga a cópia protegida dos arquivos que
+  sumiram).
+* Bloquear (agora, por inatividade, Win+L ou suspensão) fecha a Cópia criptografada e apaga as
+  senhas e os caminhos dela.
+* "Criar nova senha mestra" com o PIN desativado no meio pede a senha mestra; recuperar a versão
+  anterior mostra o que falhou.
+* Trocar o PIN ou a senha mestra vale nas duas cópias do perfil ou não vale; uma cópia de
+  segurança que ficou para depois é avisada.
+* O Owl Vault instalado é refeito se o executável for trocado por fora ou por um build novo com
+  o mesmo número, nunca por uma versão mais antiga.
+* O pedido de um atalho com o Owl Vault ocupado não se perde: espera a confirmação e avisa se
+  não chegar.
+* Cópia criptografada: aceites pedidos de novo a cada conferência, "Destino gravável" sem ✓
+  antes do teste, nome de cofre inválido recusado e mensagens certas para cada operação.
+* A janela principal, a Cópia criptografada e os diálogos cabem em telas de notebook (1366×768
+  a 125% e 150%), com os botões sempre à vista.
+* Visual: menus com fundo, linha da lista destacada, ícone de aviso maior, foco visível nas
+  listas, caminho longo mostrando o fim, nomes nunca viram formatação, sombras e cores
+  acompanhando a troca de tema e marca no tema em uso.
+* "1 byte" no singular e tempos arredondados certo.
+
+**Segunda revisão**
+
+* Uma falha ao gravar o perfil num trancamento que não deu certo devolve a pasta aberta, e
+  "Tente de novo" funciona.
+* "Continuar trancando" depois de uma queda no meio de um "Desfazer" apaga os pedaços que esse
+  "Desfazer" deixou, em vez de chamá-los de "item novo" sem fim.
+* "Trancar e sair" tranca as pastas que dá e mostra as que precisam de atenção, com
+  [Voltar ao Owl Vault] como padrão; com essa pergunta na tela, a inatividade bloqueia o app.
+* Bloqueio pedido durante um trabalho acontece antes do resultado: nenhum aviso com nomes,
+  nenhum Explorer aberto e nenhum erro na tela travada; no Alterar PIN, avisa que o PIN mudou.
+* Seletor de pastas aberto no bloqueio não começa nada nem guarda o caminho escolhido.
+* Os Resolvers de versão anterior e de senha mestra antiga também têm "Tirar da lista".
+* Nenhum trabalho terminado guarda a senha, o PIN ou a função que os usou, e nenhum objeto de
+  trabalho sobra na memória.
+* Diálogos limitados à tela tiram a altura só do texto (os botões não se sobrepõem); numa tela
+  baixa, os botões vão para duas colunas; avisos curtos voltaram à altura natural; a barra de
+  rolagem some quando o texto cabe.
+* "Trancar agora" põe no resumo também as pastas visíveis que não estão em "aberta" (abrindo,
+  restaurando, trancamento interrompido), como o "Trancar e sair".
+* Se a gravação do fim de um "Desfazer" falha, dá para clicar em "Desfazer" de novo sem
+  reiniciar o app.
 
 ## 0.2.0 — 2026-11-17
 

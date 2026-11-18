@@ -135,6 +135,9 @@ class ProtectPage(Pagina):
         self._done_counts = [0, 0]
         self._t0 = time.monotonic()
         self._connected = False
+        #: o app bloqueou (``clear``): um caminho que o seletor de pastas devolver depois (ele
+        #: não fecha com o bloqueio) é descartado; ``start`` desliga a marca
+        self._bloqueada = False
 
         self.trilha = TrilhaPassos(["Pasta", "Conferência", "Trancar"])
         self.stack = QStackedWidget()
@@ -414,6 +417,7 @@ class ProtectPage(Pagina):
     def start(self, *, first_time: bool) -> None:
         """Volta ao passo 1 sem nada escolhido (também usado ao bloquear: limpa os nomes)."""
         self._desconectar()
+        self._bloqueada = False
         self.first_time = first_time
         self.check = None
         self.failures = {}
@@ -446,10 +450,19 @@ class ProtectPage(Pagina):
         self._ir(0)
 
     def clear(self) -> None:
+        """Ao bloquear: limpa os nomes e passa a recusar caminhos até o próximo ``start``."""
         self.start(first_time=False)
+        self._bloqueada = True
 
     @Slot(str)
     def set_path(self, path: str) -> None:
+        if self._bloqueada:
+            # o seletor de pastas voltou depois do bloqueio: o caminho (com o nome da pasta)
+            # não fica nem no campo, nem na dica, nem aqui
+            self._path = ""
+            self.campo.definir("")
+            self._atualizar_rodape()
+            return
         self._path = path
         self.check = None
         self.failures = {}
@@ -580,9 +593,11 @@ class ProtectPage(Pagina):
         else:
             n = len(out.pending)
             self.t3.setText(f"O trancamento de '{name}' parou antes do fim")
+            # o motivo é o do gerente: "item novo colocado durante o trancamento" NÃO está
+            # guardado, então não dá para dizer sempre "seus arquivos já estão guardados"
             self.s3.setText(
-                f"Seus arquivos já estão guardados. {n} item(ns) ainda não foram apagados da "
-                "pasta. Na lista, clique em 'Resolver…' para continuar."
+                f"{n} item(ns) ainda estão na pasta. Na lista, clique em 'Resolver…' para ver o "
+                "que fazer."
             )
             self.etapa.setText("Parou num ponto seguro.")
             self._log("Parou num ponto seguro.")

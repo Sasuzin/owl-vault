@@ -158,11 +158,71 @@ COPIA_MIDIA_REMOVIVEL = (
     "Use 'Remover hardware com segurança'; depois reconecte a mídia e confira o cofre "
     "('Conferir uma cópia') antes de remover qualquer original."
 )
+#: passo 3: a conferência não grava nada, então a gravação não tem ✓ (é testada ao criar)
+COPIA_DESTINO_NAO_TESTADO = (
+    "O local do cofre existe ({fs}). A gravação ainda não foi testada: será testada no início "
+    "da criação."
+)
+COPIA_MARQUE_AVISOS = "Conferência concluída. Marque os avisos para continuar."
+COPIA_PRONTO_CRIAR = "Pronto para criar o cofre."
+COPIA_PRONTO_RETOMAR = "Pronto para retomar a criação."
+COPIA_NOME_INVALIDO = "Escolha outro nome para o cofre: {problema}."
+COPIA_NOME_NOVO_INVALIDO = "Escolha outro nome para a pasta nova: {problema}."
+COPIA_DESTINO_ILEGIVEL = "Não foi possível olhar a pasta de destino: {motivo}"
+COPIA_DIGITE_DE_NOVO = "A senha foi apagada da tela por segurança. Digite-a de novo."
+#: texto final quando o motor só limpou um cofre já concluído (a data é a da conclusão)
+COPIA_FIM_CONCLUIDO = (
+    "Cópia criptografada criada e verificada (concluída em {data} {hora}). Mantenha a origem e "
+    "um backup externo até verificar o cofre, de preferência em outro computador."
+)
+COPIA_FIM_SEM_DATA = (
+    "Cópia criptografada criada e verificada. Mantenha a origem e um backup externo até "
+    "verificar o cofre, de preferência em outro computador."
+)
+
+# --- falhas e cancelamentos: um texto por operação, sempre verdadeiro --------------------
+#: criação parada quando existe um cofre incompleto para retomar
 COPIA_CANCELADA = (
-    "Operação cancelada num ponto seguro. Na criação, use 'Retomar criação interrompida' "
-    "para continuar depois."
+    "Criação parada num ponto seguro. Use 'Retomar criação interrompida' para continuar depois."
 )
+#: criação parada antes de existir um cofre incompleto (não há o que retomar)
+COPIA_CANCELADA_SEM_RETOMADA = (
+    "Criação parada num ponto seguro, antes de haver algo para retomar. A pasta original não "
+    "foi alterada."
+)
+#: troca o "Criação interrompida (use 'Retomar')" do motor quando não há o que retomar
+COPIA_NAO_CRIOU = "Não foi possível criar o cofre"
+COPIA_CONFERENCIA_CANCELADA = "Conferência cancelada. Nada foi gravado."
+COPIA_VERIFICACAO_CANCELADA = "Conferência da cópia cancelada. A cópia não foi alterada."
+COPIA_RESTAURACAO_PARADA = "Restauração parada num ponto seguro."
+COPIA_RESTAURACAO_PARADA_ANTES = (
+    "Restauração parada num ponto seguro, antes de gravar arquivos na pasta nova."
+)
+COPIA_RESTAURACAO_INCOMPLETA = (
+    "A pasta nova '{nome}' ficou incompleta: para continuar, abra a cópia de novo com esse "
+    "mesmo nome."
+)
+COPIA_RESTAURACAO_TALVEZ = (
+    "A pasta nova '{nome}' pode ter ficado incompleta: confira os arquivos antes de usá-los."
+)
+#: o app foi bloqueado com um trabalho rodando: a tela foi limpa (sem nomes) e ele parou
+COPIA_BLOQUEIO_TERMINOU = "A operação terminou durante o bloqueio; a tela foi limpa."
+COPIA_BLOQUEIO_PAROU = "A operação parou durante o bloqueio; a tela foi limpa."
+
+#: "Há uma operação em andamento": o que acontece ao parar, por operação
 COPIA_FECHAR_TEXTO = (
-    "Parar num ponto seguro e fechar? Na criação, use 'Retomar criação interrompida' para "
-    "continuar depois."
+    "Parar num ponto seguro e fechar? Se já houver um cofre incompleto, use 'Retomar criação "
+    "interrompida' para continuar depois."
 )
+COPIA_FECHAR_CONFERENCIA = "Parar a conferência e fechar? Nada foi gravado."
+COPIA_FECHAR_CONFERIR = "Parar a conferência da cópia e fechar? A cópia não é alterada."
+COPIA_FECHAR_ABRIR = (
+    "Parar a restauração num ponto seguro e fechar? A pasta nova pode ficar incompleta: para "
+    "continuar, abra a cópia de novo com o mesmo nome de pasta."
+)
+COPIA_FECHAR_TEXTOS: dict[str, str] = {
+    "criar": COPIA_FECHAR_TEXTO,
+    "conferencia": COPIA_FECHAR_CONFERENCIA,
+    "conferir": COPIA_FECHAR_CONFERIR,
+    "abrir": COPIA_FECHAR_ABRIR,
+}

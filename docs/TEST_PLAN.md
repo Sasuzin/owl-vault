@@ -50,7 +50,14 @@ Os testes usam a política de KDF de teste (8 MiB, t=1), inalcançável pela UI/
 | **v2 — Windows e telas**: `desktop.ini`, atributos, atalho (lido pela API), DPAPI, instalação e versão, menus por estado, bloqueio sem nomes na tela | `test_shell_ui_v2.py` |
 | **Visual Cofre**: contraste WCAG dos dois temas, QSS casado com os tokens, nenhuma cor literal fora do tema | `test_tema.py` |
 | **Diálogos e cópia criptografada (assistente de 4 passos)** | `test_dialogs_v2.py`, `test_copy_window.py` |
+| **Revisão adversarial final (0.3.0) — motor**: "Desfazer" decide pelo FileId (não pela lista), "Continuar" depois de "Desfazer" parcial/interrompido confere o conteúdo, divergência antes de "apagando" volta a aberta, `restaurando` gravado antes de restaurar, versão mantida x cofre velho, "Procurar" recusa backup e acha pela pasta-mãe, cofre da área temporária sumido/ilegível (`cofre_inacessivel`), cofre trocado (`cofre_diferente`), pasta sem permissão (ACE de negação só em `tmp_path`), `view` sem exceção, "Deixar a pasta aberta", avisos de "Tirar da lista" em cada estado | `test_lockers_qa.py` |
+| **Revisão final — janela**: T11/faixa com todos os estados visíveis, filas de "Trancar agora"/"Trancar e sair" com resumo, T7 com Cancelar padrão, Resolver de todo estado com saída (genérico para issues novas, "Deixar a pasta aberta"), bloqueio fecha a Cópia criptografada, diálogos destruídos, janela cabe em 1366×768 a 125%, marca do tema, aviso de `.bak` pendente | `test_shell_ui_v2.py` |
+| **Revisão final — perfil, instalação e instância**: `write_both` com falha em cada ponto (PIN/SM valem nas duas cópias ou não valem), marca `versao.sha256` (nunca downgrade; rebuild com o mesmo número substitui), pedido do atalho com a janela principal ocupada (confirmação `ok`, sem reenvio, aviso) | `test_profile.py`, `test_install_instancia.py` |
+| **Revisão final — componentes e cópia**: menus com fundo do tema, linha da lista e hover, ícone do aviso, foco visível em listas e no registro, caminho cortado no começo, rótulos sempre texto puro, sombras e registro repintados na troca de tema, diálogos com botões à vista em telas baixas, aceites e "Destino gravável" sem ✓ falso, mensagens por operação | `test_componentes.py`, `test_tema.py`, `test_copy_window.py`, `test_dialogs_v2.py`, `test_ui_strings.py` |
 
 Testes manuais (checklist, não automatizados): pasta real do OneDrive; remover pendrive
 durante a gravação; queda de energia; `subst`; ponto de montagem (admin); executável em
-máquina limpa.
+máquina limpa; tela real de 1366×768 com escala de 125% e 150% (janela principal, Cópia
+criptografada e diálogos); Win+L com o seletor de pastas do Windows aberto na Cópia
+criptografada (o seletor continua aberto; o caminho escolhido depois deve ser descartado);
+atalho de uma pasta com o Owl Vault ocupado num trabalho longo.

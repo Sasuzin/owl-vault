@@ -9,40 +9,60 @@ restauração rodam de verdade (QThread) numa origem sintética.
 
 from __future__ import annotations
 
+import datetime as _dt
+import gc
 import itertools
 import os
 import threading
 import time
+import types
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
-from PySide6.QtCore import QCoreApplication, QEvent, Qt
-from PySide6.QtGui import QColor
+from PySide6.QtCore import QCoreApplication, QEvent, QObject, QPoint, QRect, Qt
+from PySide6.QtGui import QColor, QScreen
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QFrame, QLabel, QPushButton
+from PySide6.QtWidgets import (
+    QAbstractButton,
+    QApplication,
+    QFrame,
+    QGraphicsDropShadowEffect,
+    QLabel,
+    QLineEdit,
+    QPlainTextEdit,
+    QPushButton,
+    QScrollArea,
+    QStyleFactory,
+    QWidget,
+)
 
 from owl_vault.application import restore as restore_mod
-from owl_vault.application.create import create_vault, inspect_vault_dir
+from owl_vault.application.create import CreateResult, create_vault, inspect_vault_dir
 from owl_vault.application.preflight import CreatePlan, preflight_create
 from owl_vault.application.progress import CancelToken, NullProgress
 from owl_vault.application.protection import ProtectedPaths
 from owl_vault.application.verify import verify_vault
 from owl_vault.crypto.kdf import TESTING_PARAMS, TESTING_POLICY
-from owl_vault.domain.errors import CancelledError
-from owl_vault.ui import copy_window
+from owl_vault.domain.errors import CancelledError, OwlVaultError
+from owl_vault.ui import componentes, copy_window
 from owl_vault.ui import strings as S
 from owl_vault.ui.copy_window import (
     ABRIR,
     CONFERIR,
     CRIAR,
+    OP_ABRIR,
+    OP_CONFERENCIA,
+    OP_CONFERIR,
+    OP_CRIAR,
     TITULOS_CONFERENCIA,
     Checagem,
     CopyWindow,
     conferencia,
+    mensagem_de_erro,
 )
-from owl_vault.ui.theme import current_tokens
+from owl_vault.ui.theme import apply_theme, current_tokens
 
 SENHA = "cavalo correto bateria grampo 2026"
 SENHA_ERRADA = "outra frase qualquer 9183"
@@ -92,9 +112,13 @@ class Gravador:
         self.informes: list[tuple[str, str]] = []
         self.explorer: list[str] = []
         self.resposta = ""
+        #: roda "enquanto a pergunta está aberta" (o laço modal entrega sinais nesse meio-tempo)
+        self.durante: Callable[[], None] | None = None
 
     def ask(self, _parent: object, title: str, text: str, _buttons: object, **_kw: Any) -> str:
         self.perguntas.append((title, text))
+        if self.durante is not None:
+            self.durante()
         return self.resposta
 
     def inform(self, _parent: object, title: str, text: str, *_a: Any) -> None:
@@ -219,7 +243,7 @@ def test_conferencia_classifica_bloqueios_e_avisos() -> None:
     )
 
 
-def test_conferencia_sem_bloqueios_mostra_as_quatro_linhas_ok() -> None:
+def test_conferencia_sem_bloqueios_mostra_as_quatro_linhas() -> None:
     plan = _plano(
         files=[object()] * 3,
         dirs=[object()],
@@ -232,10 +256,22 @@ def test_conferencia_sem_bloqueios_mostra_as_quatro_linhas_ok() -> None:
     etapas = ["Pré-verificação: listando a origem", "Pré-verificação: abrindo arquivos"]
     linhas = conferencia(plan, etapas, 2 * 1024**3)
     assert [c.titulo for c in linhas] == list(TITULOS_CONFERENCIA)
-    assert all(c.estado == "ok" for c in linhas)
+    assert [c.estado for c in linhas[:3]] == ["ok", "ok", "ok"]
     assert "70,0 MB" in linhas[0].detalhe and "2,0 GB" in linhas[0].detalhe
     assert linhas[2].detalhe.startswith("3 arquivo(s) · 1 pasta(s)")
     assert "NTFS" in linhas[3].detalhe
+
+
+def test_destino_gravavel_nunca_tem_ok_sem_testar_gravacao() -> None:
+    """copia-3: a conferência não grava nada (COPIA_P3_TEXTO), então "Destino gravável" não
+    pode ter ✓ — fica neutro e diz que a gravação será testada ao criar."""
+    plan = _plano(vault_res=object(), test_res=object(), vault_fs="NTFS")
+    destino = conferencia(plan, ["Pré-verificação: listando a origem"], None)[3]
+    assert destino.titulo == "Destino gravável"
+    assert destino.estado == ""  # neutro (•), nunca "ok" (✓)
+    assert "ainda não foi testada" in destino.detalhe
+    assert "será testada no início da criação" in destino.detalhe
+    assert "testada de novo" not in destino.detalhe  # não insinua um teste que não houve
 
 
 def test_conferencia_que_parou_cedo_nao_finge_que_conferiu() -> None:
@@ -396,17 +432,21 @@ def test_fluxo_completo_cria_cofre_de_verdade(
     titulos = [lin.titulo.text() for lin in win.linhas]
     assert titulos[:4] == list(TITULOS_CONFERENCIA)
     estados = [str(lin.icone.property("estado") or "") for lin in win.linhas]
-    assert estados[:4] == ["ok"] * 4
+    # "Destino gravável" fica neutro: a gravação só é testada ao criar (copia-3)
+    assert estados[:4] == ["ok", "ok", "ok", ""]
     assert "aviso" in estados  # "Não são preservados: ..." é sempre informado
     assert not win.aceite_fat.isVisibleTo(win)  # NTFS
-    # primário só com os aceites
+    # primário só com os aceites; o rodapé diz o que falta de verdade (visual-14)
     assert win.rodape.primario.text() == "Criar cofre agora"
     assert not win.rodape.primario.isEnabled()
+    assert win.rodape.texto.text() == S.COPIA_MARQUE_AVISOS
     win.aceite_limites.setChecked(True)
     win.aceite_backup.setChecked(True)
     assert not win.rodape.primario.isEnabled()
+    assert win.rodape.texto.text() == S.COPIA_MARQUE_AVISOS
     win.aceite_senha.setChecked(True)
     assert win.rodape.primario.isEnabled()
+    assert win.rodape.texto.text() == S.COPIA_PRONTO_CRIAR
     # passo 4: criação de verdade
     win.rodape.primario.click()
     assert win.passo == 3
@@ -484,7 +524,9 @@ def test_falha_na_criacao_mostra_motivo_e_volta_as_pastas(
     assert win.criacao == "falhou"
     assert win.p4_titulo.text() == "A criação parou"
     assert win.erro_criar.isVisibleTo(win)
-    assert win.erro_criar.text() == S.COPIA_CANCELADA
+    # nada foi criado: o texto não manda usar "Retomar" (copia-3/copia-8)
+    assert win.erro_criar.text() == S.COPIA_CANCELADA_SEM_RETOMADA
+    assert "Retomar" not in win.erro_criar.text()
     assert win.rodape.ponto.property("estado") == "erro"
     assert win.rodape.primario.text() == "Voltar às pastas"  # nada a retomar
     assert win.rodape.voltar.isEnabled()
@@ -706,3 +748,644 @@ def test_fechar_com_operacao_em_andamento_pergunta(win: CopyWindow, gravador: Gr
     _espera(lambda: not win.runner.busy)
     _espera(lambda: not win.isVisible(), timeout=5)
     liberar.set()
+
+
+# --------------------------------------------------------------------------------------
+# regressões da revisão (qa_confirmados): bloqueio, fechar, aceites, textos e telas baixas
+
+
+def _textos_na_janela(w: QWidget) -> list[str]:
+    """Tudo que os widgets da janela mostram ou guardam como texto (inclusive dicas)."""
+    out: list[str] = []
+    for x in w.findChildren(QWidget):
+        out.append(x.toolTip())
+        if isinstance(x, QLabel | QAbstractButton):
+            out.append(x.text())
+        elif isinstance(x, QLineEdit):
+            out += [x.text(), x.displayText()]
+        elif isinstance(x, QPlainTextEdit):
+            out.append(x.toPlainText())
+    return [t for t in out if t]
+
+
+class _Fechamentos(QObject):
+    """Conta os pedidos de fechar (QCloseEvent) que chegam à janela."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.pedidos = 0
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:
+        if event.type() == QEvent.Type.Close:
+            self.pedidos += 1
+        return False
+
+
+def _cofre_interrompido(pastas: dict[str, Path], nome: str) -> Path:
+    cofre = pastas["cofres"] / nome
+    plan = preflight_create(
+        str(pastas["origem"]),
+        str(cofre),
+        test_parent=str(pastas["teste"]),
+        protected=ProtectedPaths.none(),
+    )
+    token = CancelToken()
+
+    class Cancela(NullProgress):
+        def stage(self, name: str, total_bytes: int = 0, total_items: int = 0) -> None:
+            if name.startswith("Criptografando"):
+                token.cancel()
+
+    with pytest.raises(CancelledError):
+        create_vault(
+            str(pastas["origem"]),
+            str(cofre),
+            SENHA,
+            plan=plan,
+            kdf_params=TESTING_PARAMS,
+            kdf_policy=TESTING_POLICY,
+            progress=Cancela(),
+            cancel=token,
+        )
+    assert inspect_vault_dir(str(cofre)).kind == "vault-incomplete"
+    return cofre
+
+
+def test_bloquear_sem_trabalho_fecha_ja_sem_senha_nem_caminho(
+    win: CopyWindow, pastas: dict[str, Path], gravador: Gravador
+) -> None:
+    """copia-1 / perfil-1 / fluxos-8 (contrato C1): o bloqueio do app fecha a Cópia e não
+    deixa senha (nem "Mostrar" ligado), caminho ou nome de pasta em nenhum widget."""
+    _ate_conferencia(win, pastas)
+    assert win.c_senha.text() == SENHA
+    win.c_senha.mostrar.click()
+    assert win.c_senha.echoMode() == QLineEdit.EchoMode.Normal
+    win.r_copia.definir(str(pastas["cofres"]))
+    win.r_local.definir(str(pastas["saida"]))
+    win.r_senha.setText(SENHA_ERRADA)
+    win.v_copia.definir(str(pastas["cofres"]))
+    win.v_senha.setText(SENHA_ERRADA)
+    win.painel_criar.escrever(f"linha do registro com {pastas['origem']}")
+    win.session_sources.append(str(pastas["origem"]))  # como depois de criar uma cópia
+    QCoreApplication.processEvents()
+    raiz = str(pastas["origem"].parent)
+    assert any(raiz in t for t in _textos_na_janela(win))  # antes: caminhos na tela
+
+    win.bloquear()
+
+    assert not win.isVisible()
+    assert not gravador.perguntas  # fecha sem perguntar nada
+    for campo in (win.c_senha, win.r_senha, win.v_senha):
+        assert campo.text() == ""
+        assert campo.echoMode() == QLineEdit.EchoMode.Password
+        assert campo.mostrar.text() == "Mostrar"
+    assert win.c_conf.text() == ""
+    textos = _textos_na_janela(win)  # ainda sem rodar o laço (nada de "deleteLater depois")
+    assert not [t for t in textos if raiz in t or "origem sintética" in t or "Cofre-teste" in t]
+    assert not [t for t in textos if SENHA in t or SENHA_ERRADA in t]
+    assert win.modo == CRIAR and win.passo == 0 and win.criacao == ""
+    assert not any(c.isChecked() for c in win.aceites_todos)
+    assert win.session_sources == []
+    # aberta de novo depois do desbloqueio: volta a funcionar, do começo
+    win.show()
+    QCoreApplication.processEvents()
+    assert win.resumo.findChildren(QLabel, "secaoLateral")[0].text()  # título da lateral fica
+    win.rodape.primario.click()
+    assert win.erro_pastas.text() == "Escolha a pasta de origem."
+
+
+def test_bloquear_com_trabalho_pede_parada_some_e_fecha_sozinha(
+    win: CopyWindow, gravador: Gravador
+) -> None:
+    """C1 com trabalho rodando: some na hora, pede o cancelamento sem perguntar, nada do
+    trabalho volta à tela e a janela fecha sozinha quando ele para."""
+    liberar = threading.Event()
+    parou = threading.Event()
+    chamados: list[object] = []
+
+    def job(_p: Any, cancel: CancelToken) -> str:
+        try:
+            while not liberar.wait(0.01):
+                cancel.check()
+        finally:
+            parou.set()
+        return "terminou"
+
+    fechamentos = _Fechamentos()
+    win.installEventFilter(fechamentos)
+    win._rodar(
+        job, chamados.append, chamados.append, win.painel_criar, "Criando…", copy_window.OP_CRIAR
+    )
+    assert win.runner.busy
+    win.c_senha.setText(SENHA)
+    win.bloquear()
+    assert not win.isVisible()
+    assert not gravador.perguntas
+    assert win.c_senha.text() == ""
+    token = win.runner.cancel_token
+    assert token is not None and token.cancelled
+    win.runner.bridge.info.emit("arquivo secreto.docx")  # chega depois do bloqueio
+    win.runner.bridge.stage.emit("Criptografando segredo.docx", 10, 1)
+    _espera(lambda: not win.runner.busy)
+    _espera(lambda: fechamentos.pedidos > 0, timeout=5)  # fechou sozinha (sem perguntar)
+    assert not gravador.perguntas
+    assert parou.is_set()
+    assert chamados == []  # o resultado/erro (com caminhos) não volta à tela
+    assert "segredo" not in "\n".join(_textos_na_janela(win))
+    assert not win.isVisible()
+    assert win.rodape.texto.text() == S.COPIA_BLOQUEIO_PAROU
+    win.removeEventFilter(fechamentos)
+    liberar.set()
+
+
+def test_seletor_de_pastas_que_volta_depois_do_bloqueio_nao_deixa_caminho(
+    win: CopyWindow, pastas: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C1: o seletor de pastas do Windows não fecha com o bloqueio; o caminho que ele devolve
+    depois (origem, que também sugere o teste) não entra na janela bloqueada."""
+    escolhida = str(pastas["origem"])
+
+    def seletor(*_a: object) -> str:
+        win.bloquear()  # o app bloqueia com o seletor aberto (5 min sem uso, Win+L…)
+        return escolhida
+
+    monkeypatch.setattr(componentes, "choose_folder", seletor)
+    win.c_origem.botao.click()
+    QCoreApplication.processEvents()
+    assert win._bloqueada
+    assert [c.texto() for c in win._campos_caminho()] == [""] * 6
+    textos = "\n".join(_textos_na_janela(win))
+    assert escolhida not in textos and str(pastas["origem"].parent) not in textos
+
+
+SENHA_UNICA = "senha so deste teste pelicano 6631"
+
+
+def _closures_com_a_senha() -> list[str]:
+    """Funções da Cópia ainda vivas cuja closure guarda a senha (direto ou numa caixa
+    ``_Senha`` que não foi esvaziada)."""
+    gc.collect()
+    achados: list[str] = []
+    for o in gc.get_objects():
+        if not isinstance(o, types.FunctionType) or "CopyWindow." not in o.__qualname__:
+            continue
+        for cell in o.__closure__ or ():
+            try:
+                v = cell.cell_contents
+            except ValueError:
+                continue
+            if isinstance(v, str) and SENHA_UNICA in v:
+                achados.append(o.__qualname__)
+            elif isinstance(v, copy_window._Senha) and v._valor:
+                achados.append(f"{o.__qualname__} (caixa cheia)")
+    return achados
+
+
+def test_senha_nao_fica_no_trabalho_depois_que_ele_termina(
+    win: CopyWindow, pastas: dict[str, Path]
+) -> None:
+    """JAN-8 (parte da Cópia): o JobRunner mantém vivo o trabalho de cada operação, e a função
+    dele guardava a senha da cópia — alcançável depois do fim e do bloqueio (C1)."""
+    # criar (passo 4)
+    _preenche_pastas(win, pastas, "Cofre-segredo")
+    win.rodape.primario.click()
+    win.c_senha.setText(SENHA_UNICA)
+    win.c_conf.setText(SENHA_UNICA)
+    win.rodape.primario.click()
+    _espera(lambda: not win.runner.busy)
+    _marca_aceites(win)
+    win.rodape.primario.click()
+    _espera(lambda: not win.runner.busy)
+    assert win.criacao == "ok", win.erro_criar.text()
+    cofre = pastas["cofres"] / "Cofre-segredo"
+    # conferir uma cópia
+    win.bt_conferir.click()
+    win.v_copia.definir(str(cofre))
+    win.v_senha.setText(SENHA_UNICA)
+    win.rodape.primario.click()
+    _espera(lambda: not win.runner.busy)
+    assert "Cofre íntegro" in win.resultado_conferir.texto()
+    # abrir uma cópia numa pasta nova
+    win.bt_abrir.click()
+    win.r_copia.definir(str(cofre))
+    win.r_senha.setText(SENHA_UNICA)
+    win.r_local.definir(str(pastas["saida"]))
+    win.r_nome.setText("Restaurado-segredo")
+    win.rodape.primario.click()
+    _espera(lambda: not win.runner.busy)
+    assert (pastas["saida"] / "Restaurado-segredo" / "a.txt").is_file()
+    win.bloquear()
+    _descarta()
+    assert _closures_com_a_senha() == []
+
+
+def test_fechar_a_janela_apaga_as_senhas_e_pede_a_senha_de_novo(
+    win: CopyWindow, pastas: dict[str, Path]
+) -> None:
+    """copia-1: a janela é reaproveitada; fechada, ela não guarda senha nenhuma."""
+    _ate_conferencia(win, pastas)
+    win.r_senha.setText(SENHA)
+    win.v_senha.setText(SENHA)
+    win.c_senha.mostrar.click()
+    assert win.close()
+    for campo in (win.c_senha, win.r_senha, win.v_senha, win.c_conf):
+        assert campo.text() == ""
+    assert win.c_senha.echoMode() == QLineEdit.EchoMode.Password
+    win.show()
+    QCoreApplication.processEvents()
+    # sem a senha, a conferência pronta não pode virar criação: volta ao passo Senha
+    assert win.passo == 1
+    assert win.rodape.primario.text() != S.COPIA_PRIMARIO[2]
+
+
+def test_mostrar_senha_desliga_ao_trocar_de_passo_ou_de_tela(
+    win: CopyWindow, pastas: dict[str, Path]
+) -> None:
+    _preenche_pastas(win, pastas)
+    win.rodape.primario.click()
+    win.c_senha.setText(SENHA)
+    win.c_senha.mostrar.click()
+    assert win.c_senha.echoMode() == QLineEdit.EchoMode.Normal
+    win.rodape.voltar.click()
+    assert win.c_senha.echoMode() == QLineEdit.EchoMode.Password
+    assert win.c_senha.text() == SENHA  # voltar não perde o que foi digitado
+    win.bt_abrir.click()
+    win.r_senha.setText(SENHA)
+    win.r_senha.mostrar.click()
+    win.bt_conferir.click()
+    assert win.r_senha.echoMode() == QLineEdit.EchoMode.Password
+
+
+def test_iniciar_criacao_sem_senha_volta_ao_passo_senha(
+    win: CopyWindow, pastas: dict[str, Path]
+) -> None:
+    _ate_conferencia(win, pastas)
+    _marca_aceites(win)
+    win.c_senha.limpar()  # como depois de um bloqueio que aconteceu no meio
+    win._iniciar_criacao()
+    assert not win.runner.busy and win.criacao == ""
+    assert win.passo == 1
+    assert win.erro_senha.text() == S.COPIA_DIGITE_DE_NOVO
+
+
+def test_aceites_sao_pedidos_de_novo_a_cada_conferencia(
+    win: CopyWindow, pastas: dict[str, Path], tmp_path: Path
+) -> None:
+    """copia-2: aceites dados para uma origem/destino/mídia não valem para outra."""
+    _ate_conferencia(win, pastas)
+    _marca_aceites(win)
+    assert win.rodape.primario.isEnabled()
+    outra = tmp_path / "outra origem"
+    outra.mkdir()
+    (outra / "x.txt").write_bytes(b"x")
+    win.rodape.voltar.click()
+    win.rodape.voltar.click()
+    assert win.passo == 0
+    win.c_origem.definir(str(outra))
+    win.rodape.primario.click()
+    assert win.passo == 1
+    win.rodape.primario.click()  # a senha continua digitada
+    assert win.passo == 2
+    _espera(lambda: not win.runner.busy)
+    assert win._plan is not None and win._plan.ok
+    assert not any(c.isChecked() for c in win.aceites_todos)
+    assert not win.rodape.primario.isEnabled()
+    # o aceite de FAT/exFAT vale para uma conferência só (a mídia pode ter sido trocada)
+    _marca_aceites(win)
+    win.aceite_fat.setChecked(True)
+    win.bt_de_novo.click()
+    _espera(lambda: not win.runner.busy)
+    assert not win.aceite_fat.isChecked()
+
+
+def test_duplo_clique_na_retomada_nao_comeca_sem_mostrar_a_conferencia(
+    win: CopyWindow, pastas: dict[str, Path]
+) -> None:
+    """copia-6: o 2º clique de um duplo clique em "Continuar para a conferência" cai no
+    mesmo lugar do rodapé; com os aceites desmarcados, ele não dispara a retomada."""
+    _cofre_interrompido(pastas, "Cofre-interrompido")
+    _preenche_pastas(win, pastas, "Cofre-interrompido")
+    _marca_aceites(win)  # aceites de uma tentativa anterior
+    win.c_retomar.click()
+    assert win.passo == 1 and win.retomando
+    win.c_senha.setText(SENHA)
+    win.rodape.primario.click()
+    win.rodape.primario.click()
+    assert win.passo == 2
+    assert not win.runner.busy and win.criacao == ""
+    assert not win.rodape.primario.isEnabled()
+    assert win.rodape.texto.text() == S.COPIA_MARQUE_AVISOS
+    _marca_aceites(win)
+    assert win.rodape.texto.text() == S.COPIA_PRONTO_RETOMAR
+
+
+def test_parar_e_fechar_fecha_mesmo_se_o_trabalho_acaba_durante_a_pergunta(
+    win: CopyWindow, gravador: Gravador
+) -> None:
+    """copia-7."""
+    liberar = threading.Event()
+
+    def job(_p: Any, cancel: CancelToken) -> None:
+        while not liberar.wait(0.01):
+            cancel.check()
+
+    win._rodar(job, lambda _r: None, lambda _e: None, None, "Trabalhando…")
+
+    def termina() -> None:
+        liberar.set()
+        _espera(lambda: not win.runner.busy)
+
+    gravador.durante = termina
+    gravador.resposta = "stop"
+    assert win.close()
+    assert not win.isVisible()
+    assert gravador.perguntas
+
+
+def test_mensagem_de_erro_por_operacao() -> None:
+    """copia-3/copia-8: "Retomar criação interrompida" só quando há o que retomar."""
+    parado = CancelledError("x")
+    assert mensagem_de_erro(parado, OP_CONFERENCIA) == S.COPIA_CONFERENCIA_CANCELADA
+    assert mensagem_de_erro(parado, OP_CONFERIR) == S.COPIA_VERIFICACAO_CANCELADA
+    assert mensagem_de_erro(parado, OP_CRIAR, ha_incompleto=True) == S.COPIA_CANCELADA
+    assert mensagem_de_erro(parado, OP_CRIAR) == S.COPIA_CANCELADA_SEM_RETOMADA
+    assert mensagem_de_erro(parado, OP_ABRIR) == S.COPIA_RESTAURACAO_PARADA_ANTES
+    meio = mensagem_de_erro(parado, OP_ABRIR, ha_incompleto=True, destino="C:\\saida\\Volta")
+    assert meio.startswith(S.COPIA_RESTAURACAO_PARADA) and "'Volta' ficou incompleta" in meio
+    for op in (OP_CONFERENCIA, OP_CONFERIR, OP_ABRIR):
+        assert "Retomar" not in mensagem_de_erro(parado, op)
+    gravar = OwlVaultError(
+        "Criação interrompida (use 'Retomar'): acesso negado. Se o Windows Defender 'Acesso "
+        "controlado a pastas' estiver ativo, permita o OwlVault.exe ou escolha outra pasta."
+    )
+    assert mensagem_de_erro(gravar, OP_CRIAR, ha_incompleto=True) == str(gravar)
+    sem = mensagem_de_erro(gravar, OP_CRIAR)
+    assert sem.startswith("Não foi possível criar o cofre: acesso negado.")
+    assert "Retomar" not in sem
+    assert "Retomar" not in mensagem_de_erro(RuntimeError("x"), OP_CRIAR)
+    assert "Retomar" in mensagem_de_erro(RuntimeError("x"), OP_CRIAR, ha_incompleto=True)
+    erro_abrir = mensagem_de_erro(OwlVaultError("disco cheio."), OP_ABRIR, destino="C:\\s\\V")
+    assert erro_abrir.startswith("disco cheio.") and "'V' pode ter ficado incompleta" in erro_abrir
+
+
+def test_falha_de_gravacao_sem_cofre_incompleto_nao_manda_retomar(
+    win: CopyWindow, pastas: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """copia-3: acesso negado no início da criação (nada criado) não sugere "Retomar"."""
+
+    def nega(*_a: Any, **_kw: Any) -> Any:
+        raise OwlVaultError(
+            "Criação interrompida (use 'Retomar'): acesso negado. Se o Windows Defender "
+            "'Acesso controlado a pastas' estiver ativo, permita o OwlVault.exe ou escolha "
+            "outra pasta."
+        )
+
+    _ate_conferencia(win, pastas)
+    monkeypatch.setattr(copy_window, "create_vault", nega)
+    _marca_aceites(win)
+    win.rodape.primario.click()
+    _espera(lambda: not win.runner.busy)
+    assert win.criacao == "falhou"
+    assert win.erro_criar.text().startswith("Não foi possível criar o cofre: acesso negado.")
+    assert "Retomar" not in win.erro_criar.text()
+    assert "Retomar" not in win.painel_criar.log.toPlainText()
+    assert win.rodape.primario.text() == "Voltar às pastas"
+
+
+def test_cancelar_a_conferencia_diz_que_nada_foi_gravado(
+    win: CopyWindow, pastas: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """copia-8: cancelar a conferência do passo 3 não manda usar "Retomar"."""
+    comecou = threading.Event()
+
+    def lenta(*_a: Any, cancel: CancelToken, **_kw: Any) -> Any:
+        comecou.set()
+        while True:
+            cancel.check()
+            time.sleep(0.01)
+
+    monkeypatch.setattr(copy_window, "preflight_create", lenta)
+    _preenche_pastas(win, pastas)
+    win.rodape.primario.click()
+    win.c_senha.setText(SENHA)
+    win.c_conf.setText(SENHA)
+    win.rodape.primario.click()
+    assert win.runner.busy
+    assert comecou.wait(10)
+    win.cancelar.click()
+    _espera(lambda: not win.runner.busy)
+    parou = win.linhas[-1]
+    assert parou.titulo.text() == "A conferência parou"
+    assert parou.detalhe.text() == S.COPIA_CONFERENCIA_CANCELADA
+    assert "Retomar" not in win.rodape.texto.text()
+
+
+def _abrir_com(win: CopyWindow, pastas: dict[str, Path], nome: str) -> None:
+    win.bt_abrir.click()
+    win.r_copia.definir(str(pastas["cofres"]))
+    win.r_senha.setText(SENHA)
+    win.r_local.definir(str(pastas["saida"]))
+    win.r_nome.setText(nome)
+    win.rodape.primario.click()
+
+
+def test_restauracao_parada_diz_o_que_ficou_na_pasta_nova(
+    win: CopyWindow, pastas: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """copia-8: a restauração parada fala da pasta nova (e de como continuar), não de
+    "Retomar criação"."""
+
+    def parcial(_vault: str, _password: str, dest: str, **_kw: Any) -> Any:
+        os.mkdir(dest)
+        (Path(dest) / restore_mod.MARKER_NAME).write_text("{}", encoding="utf-8")
+        (Path(dest) / "a.txt").write_bytes(b"x")
+        raise CancelledError("parada")
+
+    monkeypatch.setattr(copy_window, "restore_vault", parcial)
+    _abrir_com(win, pastas, "Volta")
+    _espera(lambda: not win.runner.busy)
+    msg = win.erro_abrir.text()
+    assert msg.startswith(S.COPIA_RESTAURACAO_PARADA)
+    assert "'Volta' ficou incompleta" in msg and "mesmo nome" in msg
+    assert "Retomar" not in msg
+
+    def antes(*_a: Any, **_kw: Any) -> Any:
+        raise CancelledError("parada")
+
+    monkeypatch.setattr(copy_window, "restore_vault", antes)
+    _abrir_com(win, pastas, "Outra")
+    _espera(lambda: not win.runner.busy)
+    assert win.erro_abrir.text() == S.COPIA_RESTAURACAO_PARADA_ANTES
+
+
+@pytest.mark.parametrize("nome", ["Fotos?", "x*", "a:b", "a|b", "a<b", "CON", "nome."])
+def test_abrir_com_nome_invalido_avisa_em_vez_de_nao_fazer_nada(
+    win: CopyWindow, pastas: dict[str, Path], nome: str
+) -> None:
+    """copia-4: o OSError (WinError 123) não escapa do clique; a pessoa vê o motivo."""
+    _abrir_com(win, pastas, nome)
+    assert not win.runner.busy
+    assert win.erro_abrir.isVisibleTo(win)
+    assert win.erro_abrir.text().startswith("Escolha outro nome para a pasta nova:")
+    assert "caminho absoluto" not in win.erro_abrir.text()
+    assert win.r_senha.text() == SENHA  # nada começou
+
+
+def test_abrir_quando_o_destino_nao_pode_ser_lido(
+    win: CopyWindow, pastas: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def falha(_dest: str) -> str:
+        raise OSError(5, "Acesso negado")
+
+    monkeypatch.setattr(copy_window, "inspect_destination", falha)
+    _abrir_com(win, pastas, "Restaurado-ok")
+    assert not win.runner.busy
+    assert win.erro_abrir.text().startswith("Não foi possível olhar a pasta de destino:")
+
+
+def test_nome_do_cofre_invalido_e_recusado_no_passo_pastas(
+    win: CopyWindow, pastas: dict[str, Path]
+) -> None:
+    _preenche_pastas(win, pastas, "Cofre?")
+    win.rodape.primario.click()
+    assert win.passo == 0
+    assert win.erro_pastas.text().startswith("Escolha outro nome para o cofre:")
+
+
+def test_texto_final_da_retomada_que_so_limpou_um_cofre_concluido(win: CopyWindow) -> None:
+    """copia-9: o motor devolve a conclusão em ISO UTC; a tela mostra data e hora locais."""
+    resultado = CreateResult(
+        vault="C:\\x\\Cofre",
+        status="success",
+        files=1,
+        dirs=0,
+        total_bytes=10,
+        snapshot_label="2026-11-17T15:03:22Z",
+    )
+    win.passo = 3
+    win._depois_criar(resultado)
+    local = _dt.datetime(2026, 11, 17, 15, 3, 22, tzinfo=_dt.UTC).astimezone()
+    texto = win.resultado_criar.texto()
+    assert f"(concluída em {local:%d/%m/%Y %H:%M})" in texto
+    assert "T15:03" not in texto and " )" not in texto
+    assert "T15:03" not in win.painel_criar.log.toPlainText()
+    # a criação normal continua com o texto do design (data e hora locais da cópia)
+    assert CopyWindow._texto_fim("17/11/2026 14:13") == S.FIM_TEXTO.format(
+        data="17/11/2026", hora="14:13"
+    )
+    assert CopyWindow._texto_fim("???") == S.COPIA_FIM_SEM_DATA
+
+
+def test_depois_de_abrir_o_nome_sugerido_e_novo_e_o_erro_nao_fica_junto_do_ok(
+    win: CopyWindow, cofre_pronto: Path, pastas: dict[str, Path]
+) -> None:
+    """visual-15."""
+    win.bt_abrir.click()
+    win.r_copia.definir(str(cofre_pronto))
+    win.r_senha.setText(SENHA)
+    win.r_local.definir(str(pastas["saida"]))
+    usado = win.r_nome.text()
+    win.rodape.primario.click()
+    _espera(lambda: not win.runner.busy)
+    assert (pastas["saida"] / usado).is_dir()
+    sugerido = win.r_nome.text()
+    assert sugerido != usado and not (pastas["saida"] / sugerido).exists()
+    # 2ª tentativa com o nome já usado: o erro aparece sozinho (o ✓ anterior sai da tela)
+    win.r_senha.setText(SENHA)
+    win.r_nome.setText(usado)
+    win.rodape.primario.click()
+    assert "não está vazia" in win.erro_abrir.text()
+    assert not win.resultado_abrir.isVisibleTo(win)
+    assert not win.painel_abrir.isVisibleTo(win)
+    assert win.rodape.texto.text() == "Pronto."
+
+
+@pytest.mark.parametrize(("largura", "altura"), [(1093, 566), (911, 464)], ids=["125", "150"])
+def test_janela_cabe_na_area_util_de_1366x768(
+    qapp: QApplication,
+    gravador: Gravador,
+    pastas: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    largura: int,
+    altura: int,
+) -> None:
+    """copia-5 e visual-4: 1366x768 a 125%/150% — a janela nunca passa da área útil, o
+    rodapé fica à vista no menor tamanho e a lateral rola em vez de espremer os itens."""
+    monkeypatch.setattr(QScreen, "availableGeometry", lambda _s: QRect(0, 0, largura, altura))
+    w = CopyWindow(
+        kdf_policy=TESTING_POLICY, kdf_params=TESTING_PARAMS, protected=ProtectedPaths.none()
+    )
+    try:
+        w.show()
+        QCoreApplication.processEvents()
+        moldura = copy_window._MOLDURA_ALTURA
+        assert w.height() + moldura <= altura  # o 1040x860 inicial encolheu
+        assert w.width() <= largura
+        assert w.minimumHeight() + moldura <= altura
+        w.resize(w.minimumSize())
+        _preenche_pastas(w, pastas)
+        w.rodape.primario.click()
+        assert w.passo == 1
+        for _ in range(3):  # os itens novos da lateral entram no layout nos próximos giros
+            _descarta()
+        for b in (w.rodape.voltar, w.rodape.primario):
+            topo = b.mapTo(w, QPoint(0, 0)).y()
+            assert topo >= 0 and topo + b.height() <= w.height(), b.text()
+        assert w.lateral.parentWidget() is not None
+        assert isinstance(w.lateral.parentWidget().parentWidget(), QScrollArea)
+        for b in w.resumo.findChildren(QPushButton):
+            if b.isVisibleTo(w):
+                assert b.height() >= b.sizeHint().height(), b.text()
+        for lbl in w.resumo.findChildren(QLabel):
+            if lbl.isVisibleTo(w) and lbl.text():
+                assert lbl.height() >= lbl.minimumSizeHint().height(), lbl.text()
+    finally:
+        w.close()
+        w.deleteLater()
+        _descarta()
+
+
+def test_trocar_o_tema_repinta_registro_e_sombras(win: CopyWindow, qapp: QApplication) -> None:
+    """visual-10 (C6): a sombra dos cartões e as linhas coloridas do registro acompanham o
+    tema novo (a linha verde não fica #7ee2b0 sobre o fundo claro)."""
+    folha, paleta, estilo = qapp.styleSheet(), qapp.palette(), qapp.style().name()
+    anterior = qapp.property("owlTheme")
+    try:
+        apply_theme(qapp, "dark")
+        QCoreApplication.processEvents()
+        win.painel_criar.escrever("Cópia criptografada criada e verificada", "ok")
+        win.painel_criar.escrever("linha comum")
+        apply_theme(qapp, "light")
+        QCoreApplication.processEvents()
+        tokens = current_tokens()
+        ultimo = win.painel_criar.log.document().lastBlock()
+        verde = ultimo.previous().begin().fragment().charFormat().foreground().color()
+        assert verde == QColor(tokens["ok"])
+        comum = ultimo.begin().fragment().charFormat().foreground()
+        assert comum.style() == Qt.BrushStyle.NoBrush
+        sombras = [
+            f.graphicsEffect()
+            for f in win.findChildren(QFrame)
+            if f.objectName() in ("cartao", "cartaoLateral")
+        ]
+        assert sombras
+        for efeito in sombras:
+            assert isinstance(efeito, QGraphicsDropShadowEffect)
+            assert efeito.color() == QColor(tokens["sombra"])
+    finally:
+        qapp.setStyleSheet(folha)
+        qapp.setStyle(QStyleFactory.create(estilo) or QStyleFactory.create("Fusion"))
+        qapp.setPalette(paleta)
+        qapp.setProperty("owlTheme", anterior)
+        _descarta()
+
+
+def test_texto_do_resultado_nunca_vira_html(win: CopyWindow) -> None:
+    """copia-10 (última parte, pendência do agente do tema): o texto do resultado cita nomes de
+    pastas e de arquivos; um nome como '<i>Cofre</i>' aparece como está, nunca como HTML."""
+    nome = "<i>Cofre</i> <b>Fotos</b>"
+    win.resultado_criar.mostrar("Cópia criada", "ok", "", f"O cofre '{nome}' foi criado.")
+    corpo = win.resultado_criar.corpo
+    assert corpo is not None
+    assert corpo.textFormat() == Qt.TextFormat.PlainText
+    assert corpo.text() == f"O cofre '{nome}' foi criado."

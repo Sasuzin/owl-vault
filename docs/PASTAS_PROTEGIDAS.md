@@ -38,6 +38,11 @@ originais" e "sem integração com o Explorer". O formato do cofre (FORMAT.md) n
   for um perfil legível (um principal danificado nunca toma o lugar de um `.bak` bom). Erros
   32/33 ⇒ tenta de novo (nunca cai para o `.bak` por isso); `.bak` só se o principal não
   autenticar ou estiver ilegível, e então a sessão avisa (`NOTE_BACKUP_USED`).
+* Gravação nas duas cópias (`write_both`): os bytes são montados uma vez e vão iguais para o
+  principal e para o `.bak`. Um erro antes de trocar o principal desfaz a mudança também na
+  memória (o PIN ou a SM nova não vale, nem num `save()` depois). Se só o `.bak` falhar, a
+  mudança vale, `write_both` devolve False e a sessão avisa (`NOTE_BACKUP_PENDING`); o `.bak`
+  é refeito na próxima gravação.
 * SM: tenta o cabeçalho (`kdf`/`wrap_sm`) do principal e, se não autenticar, o do `.bak`.
   Depois de um desbloqueio, o índice autêntico é re-selado nas duas cópias e o cabeçalho é
   conferido com a KEK do índice (`wrap_sm` ruim não se espalha; se os dois estiverem
@@ -67,7 +72,11 @@ originais" e "sem integração com o Explorer". O formato do cofre (FORMAT.md) n
 * **Prática da SM**: no 1º desbloqueio após 1 dia e depois a cada 30 dias, pede a SM em vez do
   PIN. Assistente exige "Anotei minha senha mestra em um lugar seguro".
 * Travamento automático: 5 min sem uso, Windows bloqueado (Win+L) ou suspensão ⇒ descarta
-  chaves da interface e volta ao PIN. **Todo pedido pelo atalho pede o PIN**, mesmo com o app
+  chaves da interface e volta ao PIN. Todo bloqueio também fecha a janela da Cópia
+  criptografada (`CopyWindow.bloquear`: senhas e caminhos apagados; um trabalho dela em
+  andamento para num ponto seguro e a janela se fecha sozinha) e destrói os diálogos já
+  fechados, que guardam nomes. Um trabalho da Cópia conta como uso: a inatividade não trava no
+  meio dele. **Todo pedido pelo atalho pede o PIN**, mesmo com o app
   destravado; o pedido que chega por mensagem (app já aberto) ainda confirma com o nome da
   pasta. "Remover proteção" e "Alterar PIN" pedem o PIN.
 * Limite honesto: quem usa a conta do Windows do usuário (ou o disco de uma conta sem senha)
@@ -90,7 +99,9 @@ gravado no índice; uma exclusão interrompida é retomada a cada início. O pri
 nomes do layout v1 (cabeçalho primeiro).
 
 * A versão **mantida** é comparada pelo CONTEÚDO (SHA-256 no cofre mais novo; tamanho e data de
-  modificação na pasta aberta), não só pelo caminho: o próximo trancamento não a apaga.
+  modificação na pasta aberta), não só pelo caminho: o próximo trancamento não a apaga. Com a
+  pasta não trancada, ela é comparada só com a pasta: um cofre `anterior` mais velho não conta
+  como cobertura.
 * Cofre ausente ou ilegível **nunca** conta como vazio: `kept_only_files`, `removal_missing`,
   `delete_kept` e `remove_protection` recusam (StateError) sem apagar nem esquecer nada; a lista
   mostra "versão anterior ilegível" (só "Tentar recuperar…"/salvamento de emergência) e, se a
@@ -108,7 +119,9 @@ nomes do layout v1 (cabeçalho primeiro).
    confirmação com a lista (grava a lista aceita).
 3. Índice `trancando` (+ cofre `novo`). `create_vault(P → .owlvault-<id>\novo,
    test_parent=.owlvault-<id>)` com a KEK do perfil. Falha/cancelamento/divergência ⇒ apaga o
-   `novo` (é nosso), volta a `aberta`. **Nada da pasta é apagado nesta fase.**
+   `novo` (é nosso), volta a `aberta`. **Nada da pasta é apagado nesta fase.** Como este
+   processo não apagou nada, um arquivo que falta em P foi tirado pelo usuário e não impede a
+   volta a `aberta` ("Tente de novo" funciona); só um marcador de restauração em P faz conferir.
 4. Índice `apagando` + impressões digitais por arquivo (FileId, tamanho, mtime, ctime) vindas do
    motor, **gravado antes de apagar qualquer original** (se a gravação falhar, a memória volta
    a `trancando` e o `novo` é descartado). Grava em P o marcador de restauração v1 (para
@@ -122,7 +135,15 @@ nomes do layout v1 (cabeçalho primeiro).
    cofre, ou **Desfazer** = `restore_vault(allow_resume)` com o marcador). **Nunca** roda outro
    `create_vault` com um cofre parcialmente aplicado. No "Desfazer", um conflito num caminho que
    o Owl Vault apagou (outro item colocado no lugar) faz o `novo` virar versão `mantido`, e a
-   interface lista os conflitos.
+   interface lista os conflitos. "Nunca foi apagado" é decidido pelo próprio arquivo (mesmo
+   volume e FileId da impressão gravada na cifragem), não pela lista de pendências: sem
+   impressão, sem leitura ou com outro FileId, o conflito conta como apagado. As pendências têm
+   textos separados — arquivo em uso ("Feche-os"), arquivo que mudou depois de criptografado (a
+   versão nova NÃO está guardada) e item novo colocado durante o trancamento (NÃO está
+   guardado: "Mova-os") — e o `attention` diz qual é o caso.
+   "Continuar trancando" (inclusive depois de um "Desfazer" parcial ou interrompido) só apaga um
+   arquivo se a impressão gravada ainda bate ou, se não bate, se o CONTEÚDO confere com o
+   manifesto (tamanho + SHA-256, sem mudar durante a conferência).
 7. Sem pendências: remove o marcador; renomeia (por handle, mesmo volume, sem substituir)
    `novo` → `P\.owlvault` e, **logo em seguida**, troca o papel para `atual` e grava o índice
    `trancada` — antes de qualquer outro passo. Espaço reservado e regra de ouro sobre o
@@ -134,11 +155,13 @@ nomes do layout v1 (cabeçalho primeiro).
    (qualquer outro item ⇒ Precisa de atenção, nada é sobrescrito; uma trava de restauração
    órfã é aceita e limpa).
 2. Confere destino, caminho longo, FAT32 e espaço livre **antes** de gravar `abrindo` (sem
-   espaço ⇒ recusa com o cofre ainda em P). Índice `abrindo`; renomeia `P\.owlvault` →
+   espaço ⇒ recusa com o cofre ainda em P). Índice `abrindo` (com `hidden=False` na mesma
+   gravação: uma pasta escondida que não abre continua escondida); renomeia `P\.owlvault` →
    `.owlvault-<id>\anterior`; remove o espaço reservado; tira atributos de P; marca P "não
    indexar conteúdo".
-3. Grava a subfase `restaurando` e roda `restore_vault(anterior → P)` (motor v1); se falhar sem
-   marcador, volta a `abrindo`. `aberta` só se `report.ok` e restaurados + pulados = arquivos
+3. Grava a subfase `restaurando` e roda `restore_vault(anterior → P)` (motor v1); se a
+   gravação de `restaurando` falhar, a restauração não começa (a memória volta a `abrindo`); se
+   a restauração falhar sem marcador, volta a `abrindo`. `aberta` só se `report.ok` e restaurados + pulados = arquivos
    do manifesto; senão `abertura_incompleta` (cofre anterior intocado). "P não vazia sem
    marcador" só conta como restaurada em `restaurando`/`abertura_incompleta`; em `abrindo`
    recusa ("Há item(ns) colocado(s)…").
@@ -157,15 +180,41 @@ Ao iniciar (após PIN), reconcilia cada pasta isoladamente (um problema numa pas
 as outras): retoma exclusões `descartando`; `trancando` ⇒ descarta `novo` e volta a `aberta` —
 **exceto** se há marcador em P ou falta algum arquivo do manifesto em P: então vai para
 `apagando` com atenção, e "Continuar" confere o conteúdo (SHA-256 do manifesto + impressão
-digital estável) antes de apagar; um `novo` concluído nunca é apagado nesse caso. `apagando`
+digital estável) antes de apagar; um `novo` concluído nunca é apagado nesse caso. Se a cópia
+nova não pode ser conferida (ilegível), nada é feito e a pasta continua em `trancando`; o
+Resolver oferece **"Deixar a pasta aberta"** (`leave_open`): volta a `aberta`, o `novo` vira
+versão `mantido` e nada é apagado (se a conferência decidir, segue o caminho normal). `apagando`
 com o cofre já em `P\.owlvault` (mesmo vault_id) ⇒ conclui o trancamento; senão Precisa de
 atenção (Continuar/Desfazer). `abrindo`/`restaurando` ⇒ "Continuar abrindo". `trancada` ⇒ aplica
 a regra de ouro pendente e confere o espaço reservado (ver §5).
+Problemas que a lista mostra (issues de `FolderView`), cada um com texto próprio e verdadeiro
+(`attention`) e sempre com saída ("Procurar a pasta…" / "Tirar da lista"):
+* `cofre_inacessivel`: o cofre da área temporária de que `apagando`, `abrindo` ou `restaurando`
+  precisa sumiu ou não abre; o texto diz onde fica a pasta oculta `.owlvault-<id>`. Continuar,
+  Desfazer e Abrir recusam com esse mesmo texto. Em `abertura_incompleta` a issue continua a
+  mesma (com o texto trocado), porque "Continuar sem eles" segue funcionando.
+* `cofre_diferente`: em `trancada`, o `P\.owlvault` não é o cofre registrado (outro vault_id,
+  ex.: uma cópia antiga posta no lugar). "Abrir" não aparece, "Verificar arquivos" recusa e
+  `keys_for_vault` recusa esse cofre.
+* `sem_acesso` (o Windows nega a leitura da pasta) e `erro_leitura` (outro erro de disco):
+  `view()`/`views()` nunca levantam erro de disco; o texto traz o motivo, sem o caminho cru, e
+  as outras pastas continuam na lista.
 "Procurar a pasta…" (`relocate`) funciona em qualquer estado: reconhece a mesma pasta por volume
 + FileId (ou pelo vault_id do `.owlvault` dentro dela) e recalcula o local de cada cofre (dentro
-da pasta ou na área temporária); recusa sem alterar nada se algum cofre não for achado. "Tirar
-da lista" avisa quando há arquivos guardados fora da pasta (`forget_warning`): eles não
-aparecem em "Recuperar". "Recuperar uma pasta protegida…" registra uma pasta com `.owlvault`
+da pasta ou na área temporária); recusa sem alterar nada se algum cofre não for achado. O
+`.owlvault` de dentro só é aceito se for o que o estado espera em P (`atual` em `trancada`; o
+`anterior` que ainda não saiu em `abrindo`; o `novo` que já entrou em `apagando`): uma cópia
+trancada (backup) é recusada no lugar de uma pasta aberta ou em abertura. Escolher a pasta-mãe
+também funciona (procura nas pastas logo abaixo dela, preferindo a mesma identidade e, na
+dúvida, não escolhe nenhuma) — é o jeito de achar uma pasta escondida.
+"Tirar da lista" (`forget`) vale em qualquer estado e não apaga nada. A confirmação usa
+`forget_warning`, verdadeiro para o estado atual: onde ficam os arquivos legíveis (só afirma que
+continuam na pasta em `aberta` e `trancando`), que em `apagando`/`abrindo`/`restaurando`/
+`abertura_incompleta` parte dos arquivos só existe na cópia criptografada, onde fica cada cópia
+fora de P (área temporária, versão mantida, as que sumiram) e que "Recuperar uma pasta
+protegida" NÃO as acha (para abrir uma delas: Cópia criptografada → "Abrir uma cópia"). Só
+devolve "" numa pasta trancada com tudo dentro; um erro de disco vira um aviso, nunca "".
+"Recuperar uma pasta protegida…" registra uma pasta com `.owlvault`
 usando a SM; as KEKs trazidas assim ficam marcadas `recuperada` e não disparam o aviso de
 "senha antiga" (só uma KEK `trocada` por "Criar nova senha mestra" o dispara).
 
@@ -186,7 +235,10 @@ usando a SM; as KEKs trazidas assim ficam marcadas `recuperada` e não disparam 
   `.owlvault-<id>`, em `P\.owlvault` e em cada item do espaço reservado.
 * "Unidade removível" vem do tipo da unidade (`is_removable_drive`), não do sistema de arquivos.
 * Instância única: mutex `Local\OwlVault-<SID>` + QLocalServer; o lançador chama
-  `AllowSetForegroundWindow`; o principal traz a janela para frente.
+  `AllowSetForegroundWindow`; o principal traz a janela para frente. O principal confirma
+  (`ok`) logo depois de ler o pedido; o lançador tenta de novo por até 10 s se o pedido não foi
+  lido, nunca reenvia um pedido já lido (não pede o PIN duas vezes) e, sem entrega, avisa o
+  usuário numa caixa de mensagem.
 
 ## 6. Limites (honestos)
 * Pasta aberta = legível por quem usa o computador. O nome da pasta trancada continua visível

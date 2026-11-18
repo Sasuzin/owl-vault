@@ -68,7 +68,10 @@ criptograficamente; a defesa contra conteúdo hostil é a validação de caminho
   (strings imutáveis, cópias, swap/hibernação). Senha e chaves podem permanecer em
   RAM/pagefile por tempo indeterminado.
 * **Rollback do cofre inteiro:** substituir o cofre todo por uma versão antiga e válida dele
-  mesmo não é detectado. Cofres v1 são de escrita única.
+  mesmo não é detectado. Cofres v1 são de escrita única. Nas pastas protegidas (v2), cada
+  trancamento cria um cofre com vault_id novo: um `P\.owlvault` trocado por outro cofre (ex.:
+  o de um trancamento anterior) é detectado pelo vault_id registrado no perfil (a pasta vira
+  "Precisa de atenção", sem Abrir nem "Verificar" como se fosse o cofre certo).
 * **Senha antiga após uma futura troca de senha** (não existe na v1): qualquer cópia antiga do
   cabeçalho continua abrindo o cofre com a senha antiga; após vazamento, crie um cofre novo.
 * **Canais laterais**, **coerção**, **negação plausível** (o cofre é obviamente um cofre).
@@ -178,7 +181,7 @@ guardá-las cifradas dentro dela (`P\.owlvault`, um cofre v1). Detalhes normativ
 |----|-----------|--------------------|
 | B1 | Outra conta / outro computador / disco removido | C2 vale; o PIN não funciona fora da conta (DPAPI); só a senha mestra abre |
 | B2 | Alguém com acesso à **sua conta** com o app travado | Não abre pastas trancadas sem PIN/senha mestra. Pode tentar PINs: 5 tentativas por cópia do perfil, cada uma custa um Argon2id; quem copia/restaura o arquivo do perfil consegue mais tentativas — o PIN é fraco por natureza (6–12 dígitos) e isso está escrito na tela de limites |
-| B3 | Alguém com acesso à sua conta com o app **destravado** ou pasta **aberta** | Fora do escopo: lê tudo o que estiver aberto. Mitigação: travamento automático (5 min, Win+L, suspensão) e "Trancar e sair" |
+| B3 | Alguém com acesso à sua conta com o app **destravado** ou pasta **aberta** | Fora do escopo: lê tudo o que estiver aberto. Mitigação: travamento automático (5 min, Win+L, suspensão) e "Trancar e sair". Um bloqueio pedido durante um trabalho acontece quando ele termina e ANTES do resultado: nenhum aviso com nomes, nenhum Explorer aberto, nenhuma sessão nova adotada e nenhum erro (que pode citar arquivos) na tela travada. Bloquear fecha a Cópia criptografada e limpa senhas e caminhos digitados; os trabalhos terminados não guardam a senha, o PIN nem a função que os usou (o limite da "Memória do processo" acima continua valendo) |
 | B4 | Malware na sua conta | Fora do escopo (§4) |
 | B6 | Outra conta comum do computador com permissão de escrita na pasta (pastas criadas direto na raiz de C: ou de D: herdam "Usuários autenticados: Modificar") | Não consegue trocar o atalho nem ler a área temporária: esses itens recebem permissões só da conta dona (+SYSTEM/Administradores). Pode renomear/mover a pasta trancada: o Owl Vault reconhece a pasta pelo identificador do NTFS e pelo cofre dentro dela |
 | B5 | Itens colocados numa pasta trancada | Não são apagados nem cifrados; a pasta vai para "Precisa de atenção" e a abertura espera o usuário movê-los |

@@ -10,6 +10,8 @@ from __future__ import annotations
 import builtins
 import ctypes
 import datetime as dt
+import gc
+import json
 import os
 import re
 import secrets
@@ -18,18 +20,23 @@ import subprocess
 import sys
 import threading
 import time
+import types
 from collections.abc import Callable, Iterator
 from ctypes import wintypes
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from PySide6.QtCore import SIGNAL, QCoreApplication, QEvent, Qt
+import shiboken6
+from PySide6.QtCore import SIGNAL, QCoreApplication, QEvent, QPoint, Qt
+from PySide6.QtGui import QColor
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
+    QGraphicsDropShadowEffect,
     QLabel,
     QLineEdit,
     QMenu,
@@ -47,9 +54,11 @@ from owl_vault.application.lockers import (
     ABERTURA_INCOMPLETA,
     ABRINDO,
     APAGANDO,
+    COFRE_DIFERENTE,
     ICON_NAME,
     INFOTIP,
     MANTIDO,
+    RESTAURANDO,
     TRANCADA,
     TRANCANDO,
     FolderView,
@@ -66,6 +75,7 @@ from owl_vault.application.profile import (
     ProfileStore,
     VaultRef,
 )
+from owl_vault.application.progress import CancelToken, NullProgress
 from owl_vault.application.protection import ProtectedPaths
 from owl_vault.application.restore import RestoreReport
 from owl_vault.crypto.kdf import TESTING_PARAMS, TESTING_POLICY
@@ -78,8 +88,17 @@ from owl_vault.domain.errors import (
 )
 from owl_vault.storage import dpapi, shell, winfs
 from owl_vault.ui import app as ui_app
-from owl_vault.ui import common, owl_window, pages, protect_flow, single_instance
+from owl_vault.ui import (
+    common,
+    componentes,
+    folder_dialogs,
+    owl_window,
+    pages,
+    protect_flow,
+    single_instance,
+)
 from owl_vault.ui.owl_window import IDLE_LOCK_SECONDS, OwlWindow
+from owl_vault.ui.theme import current_tokens
 from owl_vault.ui.workers import JobRunner
 
 LAUNCHER = ("C:\\Windows\\notepad.exe", "")
@@ -501,9 +520,11 @@ def test_ensure_installed_congelado_copia_e_cria_atalho(instalacao: InstalacaoFa
     assert args == ""
     assert _mesmo(exe, instalacao.alvo)
     assert instalacao.alvo.read_bytes() == instalacao.baixado.read_bytes()
-    # sem .tmp; ao lado fica a versão instalada (impede trocar por uma versão mais antiga)
+    # sem .tmp; ao lado ficam a versão instalada (impede trocar por uma versão mais antiga) e a
+    # marca que liga essa versão ao conteúdo do exe (install.STAMP_FILE, revisão "perfil")
     assert sorted(p.name for p in instalacao.alvo.parent.iterdir()) == [
         "OwlVault.exe",
+        "versao.sha256",
         "versao.txt",
     ]
     assert len(instalacao.escritas) == 1
@@ -537,22 +558,26 @@ def test_ensure_installed_atualiza_so_com_versao_mais_nova(
     assert len(novo) == instalacao.baixado.stat().st_size
     instalacao.baixado.write_bytes(novo)
     instalacao.escritas.clear()
-    # mesma versão (ou mais antiga): NÃO substitui o instalado (revisão de segurança)
-    install.ensure_installed()
-    assert instalacao.alvo.read_bytes() == antigo
-    assert instalacao.escritas == []
     major, minor, patch, build = install.current_version()
+    # versão mais antiga: NUNCA substitui o instalado (revisão de segurança)
     monkeypatch.setattr(
         install, "current_version", lambda: (major, minor, patch - 1 if patch else 0, 0)
     )
     install.ensure_installed()
     assert instalacao.alvo.read_bytes() == antigo
+    assert instalacao.escritas == []
     # versão mais nova: atualiza e grava a versão nova ao lado
     monkeypatch.setattr(install, "current_version", lambda: (major, minor, patch, build + 1))
     install.ensure_installed()
     assert instalacao.alvo.read_bytes() == novo
     assert len(instalacao.escritas) == 1
     assert install.installed_version(instalacao.alvo.parent) == (major, minor, patch, build + 1)
+    # mesma versão com conteúdo diferente é um rebuild (ou um exe trocado por fora): substitui
+    # (regra de install.py desde a revisão "perfil"; antes este teste exigia o contrário)
+    rebuild = instalacao.pe + os.urandom(4096)
+    instalacao.baixado.write_bytes(rebuild)
+    install.ensure_installed()
+    assert instalacao.alvo.read_bytes() == rebuild
 
 
 def test_ensure_installed_rodando_da_copia_instalada(
@@ -714,7 +739,7 @@ def test_map_stage_trancar_nunca_mostra_texto_cru_do_motor() -> None:
     ("n", "esperado"),
     [
         (0, "0 bytes"),
-        (1, "1 bytes"),
+        (1, "1 byte"),  # singular (common.fmt_size, revisão fmt-1)
         (1023, "1023 bytes"),
         (1024, "1,0 KB"),
         (1536, "1,5 KB"),
@@ -873,25 +898,37 @@ MENU_ABERTA = [
     ("Trancar e esconder", "lock_hide"),
     ("Remover proteção…", "remove"),
 ]
-MENU_NAO_ENCONTRADA = [("Procurar a pasta…", "relocate"), ("Tirar da lista", "forget")]
+PROCURAR = ("Procurar a pasta…", "relocate")
+TIRAR = ("Tirar da lista", "forget")
+EXPLORER = ("Abrir a pasta no Explorer", "explore")
+MENU_NAO_ENCONTRADA = [PROCURAR, TIRAR]
+#: estado intermediário (com conteúdo na pasta): ver no Explorer, procurar e tirar da lista
+MENU_INTERMEDIARIO = [EXPLORER, PROCURAR, TIRAR]
 
-#: (id, estado, escondida, ação, issue, ação base, menu esperado)
+#: (id, estado, escondida, ação, issue, ação base, menu esperado). Contratos C2/C4: TODA linha
+#: tem saída no ⋯ — "Tirar da lista" em qualquer estado; "Procurar a pasta…" quando a pasta
+#: sumiu, a unidade não responde, o estado é intermediário ou o problema é desconhecido.
 CASOS_MENU: list[tuple[str, str, bool, str, str, str, list[tuple[str, str]]]] = [
-    ("trancada", TRANCADA, False, "abrir", "", "abrir", MENU_TRANCADA),
-    ("escondida", TRANCADA, True, "abrir", "", "abrir", MENU_ESCONDIDA),
-    ("aberta", ABERTA, False, "trancar", "", "trancar", MENU_ABERTA),
-    ("itens_extras", TRANCADA, False, "resolver", "itens_extras", "abrir", [("Abrir", "abrir"), *MENU_TRANCADA]),
-    ("sem_dados", TRANCADA, False, "resolver", "sem_dados", "abrir", [("Abrir", "abrir"), *MENU_TRANCADA]),
-    ("senha_antiga", TRANCADA, True, "resolver", "senha_antiga", "abrir", [("Abrir", "abrir"), *MENU_ESCONDIDA]),
-    ("versao_anterior_aberta", ABERTA, False, "resolver", "versao_anterior", "trancar", [("Trancar", "trancar"), *MENU_ABERTA]),
-    ("versao_anterior_trancada", TRANCADA, False, "resolver", "versao_anterior", "abrir", [("Abrir", "abrir"), *MENU_TRANCADA]),
+    ("trancada", TRANCADA, False, "abrir", "", "abrir", [*MENU_TRANCADA, TIRAR]),
+    ("escondida", TRANCADA, True, "abrir", "", "abrir", [*MENU_ESCONDIDA, TIRAR]),
+    ("aberta", ABERTA, False, "trancar", "", "trancar", [*MENU_ABERTA, TIRAR]),
+    ("itens_extras", TRANCADA, False, "resolver", "itens_extras", "abrir", [("Abrir", "abrir"), *MENU_TRANCADA, TIRAR]),
+    ("sem_dados", TRANCADA, False, "resolver", "sem_dados", "abrir", [("Abrir", "abrir"), *MENU_TRANCADA, TIRAR]),
+    ("senha_antiga", TRANCADA, True, "resolver", "senha_antiga", "abrir", [("Abrir", "abrir"), *MENU_ESCONDIDA, TIRAR]),
+    ("versao_anterior_aberta", ABERTA, False, "resolver", "versao_anterior", "trancar", [("Trancar", "trancar"), *MENU_ABERTA, TIRAR]),
+    ("versao_anterior_trancada", TRANCADA, False, "resolver", "versao_anterior", "abrir", [("Abrir", "abrir"), *MENU_TRANCADA, TIRAR]),
     ("nao_encontrada_trancada", TRANCADA, False, "resolver", "nao_encontrada", "", MENU_NAO_ENCONTRADA),
     ("nao_encontrada_aberta", ABERTA, False, "resolver", "nao_encontrada", "", MENU_NAO_ENCONTRADA),
-    ("indisponivel", TRANCADA, True, "", "indisponivel", "", [("Tirar da lista", "forget")]),
-    ("apagando", APAGANDO, False, "resolver", APAGANDO, "", []),
-    ("trancando", TRANCANDO, False, "resolver", TRANCANDO, "", []),
-    ("abrindo", ABRINDO, False, "resolver", ABRINDO, "", []),
-    ("abertura_incompleta", ABERTURA_INCOMPLETA, False, "resolver", ABERTURA_INCOMPLETA, "", []),
+    # unidade que voltou com outra letra: "Procurar a pasta…" acha a mesma pasta (estados-6)
+    ("indisponivel", TRANCADA, True, "", "indisponivel", "", [PROCURAR, TIRAR]),
+    ("apagando", APAGANDO, False, "resolver", APAGANDO, "", MENU_INTERMEDIARIO),
+    ("trancando", TRANCANDO, False, "resolver", TRANCANDO, "", MENU_INTERMEDIARIO),
+    ("abrindo", ABRINDO, False, "resolver", ABRINDO, "", [PROCURAR, TIRAR]),
+    ("restaurando", RESTAURANDO, False, "resolver", ABRINDO, "", MENU_INTERMEDIARIO),
+    ("abertura_incompleta", ABERTURA_INCOMPLETA, False, "resolver", ABERTURA_INCOMPLETA, "", MENU_INTERMEDIARIO),
+    # problema que a janela não conhece (C4): nunca fica sem saída
+    ("issue_desconhecida", TRANCADA, False, "resolver", "cofre_diferente", "abrir", [("Abrir", "abrir"), *MENU_TRANCADA, PROCURAR, TIRAR]),
+    ("estado_desconhecido", "estado_novo", False, "resolver", "estado_novo", "", [PROCURAR, TIRAR]),
 ]  # fmt: skip
 
 #: chaves que OwlWindow._on_row_action sabe tratar
@@ -1061,17 +1098,40 @@ def test_home_page_lista_vazia_faixa_e_limpeza(qapp: QApplication) -> None:
 
 @gui
 def test_home_page_faixa_conta_pastas_com_copias_legiveis(qapp: QApplication) -> None:
-    """Abrindo/apagando/abertura incompleta também deixam arquivos legíveis (T11)."""
+    """Abrindo/restaurando/apagando/trancando/abertura incompleta também podem deixar arquivos
+    legíveis (T11). Antes, 'restaurando' (abertura cancelada no meio) e 'trancando' ficavam
+    fora da faixa (estados-1, fluxos-1): este teste exigia a faixa oculta em 'trancando'."""
     home = pages.HomePage()
-    atencao = [_view(_caso(n)) for n in ("apagando", "abrindo", "abertura_incompleta")]
-    home.set_rows(atencao, lambda _f, _a: None)
-    assert home.banner_text.startswith("3 pastas estão abertas e visíveis")
+    nomes = ("apagando", "abrindo", "restaurando", "trancando", "abertura_incompleta")
+    home.set_rows([_view(_caso(n)) for n in nomes], lambda _f, _a: None)
+    assert home.banner_text.startswith("5 pastas estão abertas e visíveis")
     assert "Resolver" in home.banner_text
     assert home.lock_all.isHidden()  # nenhuma ABERTA: "Trancar agora" não faria nada
-    home.set_rows([_view(_caso("trancando"))], lambda _f, _a: None)
+    for nome in ("restaurando", "trancando"):
+        home.set_rows([_view(_caso(nome))], lambda _f, _a: None)
+        assert home.banner_text.startswith("1 pasta está aberta e visível"), nome
+        assert not home.banner.isHidden()
+    # aberta, mas a pasta sumiu: conta como visível, sem "Trancar agora" (não trancaria)
+    home.set_rows([_view(_caso("nao_encontrada_aberta"))], lambda _f, _a: None)
+    assert "Resolver" in home.banner_text
+    assert home.lock_all.isHidden()
+    home.set_rows([_view(_caso("trancada")), _view(_caso("escondida"))], lambda _f, _a: None)
     assert home.banner.isHidden()
     home.deleteLater()
     _descarta()
+
+
+def test_visiveis_inclui_todo_estado_com_copias_legiveis() -> None:
+    """estados-1/fluxos-1 (contrato C5): só 'trancada' fica fora."""
+    assert {
+        ABERTA,
+        ABERTURA_INCOMPLETA,
+        ABRINDO,
+        RESTAURANDO,
+        APAGANDO,
+        TRANCANDO,
+    } == pages.VISIVEIS
+    assert TRANCADA not in pages.VISIVEIS
 
 
 @gui
@@ -1943,7 +2003,8 @@ def test_run_recusa_com_trabalho_em_andamento(abrir_tela: Callable[..., Tela]) -
     assert segundo == []
     assert depois == [True]
     assert job is not None and job.dialog is not None
-    assert not job.dialog.isVisible()  # a tela de progresso fechou
+    # a tela de progresso fechou e foi destruída (fluxos-9: o título dela tem o nome da pasta)
+    assert not shiboken6.isValid(job.dialog)
 
 
 @gui
@@ -2517,6 +2578,10 @@ def test_pasta_aberta_renomeada_oferece_procurar_e_explica_tirar_da_lista(
     sessao = _criar_perfil(tela)
     win._unlocked(sessao)
     rec = _pasta_aberta(tmp_path)
+    # a cópia criptografada da pasta aberta fica na área temporária ao lado dela
+    area = tmp_path / "pastas" / f".owlvault-{rec.id}" / "anterior-0123456789abcdef"
+    area.mkdir(parents=True)
+    rec.vaults.append(VaultRef("cd" * 16, "anterior", winfs.to_extended(str(area))))
     sessao.index.folders.append(rec)
     pasta = Path(winfs.strip_extended(rec.path))
     pasta.rename(pasta.with_name(NOME + " 2024"))  # renomeada no Explorer
@@ -2530,7 +2595,10 @@ def test_pasta_aberta_renomeada_oferece_procurar_e_explica_tirar_da_lista(
     texto = tela.pergunta(f"Tirar '{NOME}' da lista?")["text"]
     assert f".owlvault-{rec.id}" in texto  # onde fica a cópia criptografada anterior
     assert "Proteger uma pasta" in texto
-    assert "Recuperar uma pasta protegida" not in texto  # Recuperar não acharia nada aqui
+    # Recuperar não acharia nada aqui: o texto avisa isso (UI_SPEC T8) e nunca manda usá-lo
+    # (antes este teste exigia que "Recuperar" nem aparecesse — estados-3/fluxos-7)
+    assert "use ☰ > Recuperar" not in texto
+    assert "NÃO" in texto and "Recuperar uma pasta protegida" in texto
 
 
 # --------------------------------------------------------------------------- integração 0.3
@@ -2618,12 +2686,13 @@ def test_versao_anterior_ilegivel_nunca_oferece_apagar(
     win._resolve(rec.id)
     pergunta = tela.pergunta(f"Versão anterior de '{NOME}'")
     assert "delete" not in pergunta["buttons"]
+    # JAN-7: todo Resolver tem [Tirar da lista] (T8), também o da versão anterior ilegível
     if sumiu:
-        assert pergunta["buttons"] == ["forget_kept", "close"]
+        assert pergunta["buttons"] == ["forget_kept", "forget", "close"]
         assert esquecidas == [rec.id]
         assert "Nada foi apagado" in win.home.notice.text()
     else:
-        assert pergunta["buttons"] == ["restore", "close"]
+        assert pergunta["buttons"] == ["restore", "forget", "close"]
         assert esquecidas == []
 
 
@@ -2645,13 +2714,14 @@ def test_versao_anterior_que_ficou_ilegivel_nao_conta_como_vazia(
     monkeypatch.setattr(win.mgr, "kept_only_files", ilegivel)
     win._resolve(rec.id)
     pergunta = tela.pergunta(f"Versão anterior de '{NOME}'")
-    assert pergunta["buttons"] == ["restore", "close"]
+    assert pergunta["buttons"] == ["restore", "forget", "close"]  # JAN-7: com Tirar da lista
     # legível: 'Apagar a versão anterior…' é o botão destrutivo (vermelho)
     monkeypatch.setattr(win.mgr, "kept_only_files", lambda _fid: ["a.txt"])
     win._resolve(rec.id)
     pergunta = tela.pergunta(f"Versão anterior de '{NOME}'")
-    assert pergunta["buttons"] == ["restore", "delete", "close"]
+    assert pergunta["buttons"] == ["restore", "delete", "forget", "close"]
     assert pergunta["perigo"] == "delete"
+    assert pergunta["primary"] == "restore"  # o padrão não mudou
 
 
 @gui
@@ -2724,6 +2794,140 @@ def test_resolver_trancando_mostra_as_notas_da_conferencia(
     _com_vista(win, monkeypatch, rec, TRANCANDO)
     win._resolve(rec.id)
     assert win.home.notice.text() == nota
+
+
+class _Queda(BaseException):
+    """Queda simulada do processo: passa por cima do tratamento normal de erros."""
+
+
+@gui
+def test_resolver_trancando_preso_oferece_deixar_a_pasta_aberta(
+    abrir_tela: Callable[..., Tela], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """estados-5 (B), pendência entre motor e janela: um trancamento interrompido cuja cópia
+    nova não pode ser conferida ficava preso em 'trancando' (só Procurar e Tirar da lista).
+    Agora o Resolver oferece 'Deixar a pasta aberta' (``LockerManager.leave_open``): a pasta
+    volta a ficar aberta, a cópia em dúvida vira versão anterior e nada é apagado."""
+    tela = abrir_tela()
+    win = _pronta(tela)
+    pasta, rec = _protegida(win, tmp_path / "pastas", NOME)
+    mgr = win.mgr
+    assert mgr is not None
+    assert mgr.unlock(rec.id).complete
+    antes = {p.name: p.read_bytes() for p in pasta.iterdir() if p.is_file()}
+    real = type(mgr)._vault_id_of
+
+    def queda_no_novo(vault_dir: str) -> str:
+        if "novo-" in vault_dir:
+            raise _Queda
+        return real(vault_dir)
+
+    with monkeypatch.context() as m:
+        m.setattr(type(mgr), "_vault_id_of", staticmethod(queda_no_novo))
+        with pytest.raises(_Queda):
+            mgr.lock(rec.id)
+    novo = rec.vault("novo")
+    assert novo is not None and rec.state == TRANCANDO
+    for n in ("vault.owl", "vault.owl.bak"):  # cabeçalho da cópia nova danificado
+        f = Path(winfs.strip_extended(novo.location)) / n
+        if f.exists():
+            with open(f, "r+b") as fh:
+                fh.seek(40)
+                fh.write(b"\x00" * 16)
+    titulo = f"Trancamento de '{NOME}' interrompido"
+    tela.respostas[titulo] = "open"
+
+    win._resolve(rec.id)
+    _descarta()
+
+    pergunta = tela.pergunta(titulo)
+    assert pergunta["buttons"] == ["open", "find", "forget", "close"]
+    assert pergunta["primary"] == "close"  # Enter não muda nada
+    assert "Deixar a pasta aberta" in pergunta["text"]
+    assert rec.state == ABERTA
+    assert MANTIDO in [v.role for v in rec.vaults]  # a cópia em dúvida não foi apagada
+    assert os.path.isdir(winfs.strip_extended(novo.location))
+    assert {p.name: p.read_bytes() for p in pasta.iterdir() if p.is_file()} == antes
+    assert win.home.notice.text() == f"'{NOME}' continua aberta."
+
+
+@gui
+def test_deixar_a_pasta_aberta_que_vira_apagando_ou_falha_tem_saida(
+    abrir_tela: Callable[..., Tela], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Se a conferência de 'Deixar a pasta aberta' decidir que a exclusão já tinha começado
+    (APAGANDO), aparece o Resolver da etapa 4; se ela falhar, o motivo aparece."""
+    tela = abrir_tela()
+    win, rec = _destravada_com_pasta(tela, tmp_path, TRANCANDO)
+    assert win.mgr is not None
+    monkeypatch.setattr(win.mgr, "reconcile_on_start", lambda: [])
+    monkeypatch.setattr(
+        win.mgr,
+        "view",
+        lambda r: FolderView(
+            r, "Precisa de atenção", "resolver", "Atenção sintética", issue=r.state
+        ),
+    )
+
+    def para_apagando(_fid: str) -> str:
+        rec.state = APAGANDO
+        return APAGANDO
+
+    monkeypatch.setattr(win.mgr, "leave_open", para_apagando)
+    titulo = f"Trancamento de '{NOME}' interrompido"
+    tela.respostas[titulo] = "open"
+    win._resolve(rec.id)
+    _descarta()
+    assert "undo" in tela.pergunta(titulo)["buttons"]  # Resolver da etapa 4 (Desfazer)
+
+    def falha(_fid: str) -> str:
+        raise StateError("Não há trancamento interrompido nesta pasta.")
+
+    rec.state = TRANCANDO
+    monkeypatch.setattr(win.mgr, "leave_open", falha)
+    win._resolve(rec.id)
+    _descarta()
+    assert (
+        tela.pergunta("Não foi possível deixar a pasta aberta")["text"]
+        == "Não há trancamento interrompido nesta pasta."
+    )
+
+
+@gui
+def test_alterar_pin_com_copia_de_seguranca_travada_avisa(
+    abrir_tela: Callable[..., Tela], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pendência do perfil (perfil-2): quando o PIN novo valeu no arquivo principal mas a cópia
+    de segurança do perfil não pôde ser trocada, o aviso diz isso (NOTE_BACKUP_PENDING)."""
+
+    class AlterarFalso:
+        def __init__(self, *_a: object) -> None:
+            pass
+
+        def exec(self) -> QDialog.DialogCode:
+            return QDialog.DialogCode.Accepted
+
+        def take(self) -> tuple[str, str, bool]:
+            return PIN, "961473", False
+
+    monkeypatch.setattr(owl_window, "ChangePinDialog", AlterarFalso)
+    tela = abrir_tela()
+    win = tela.win
+    win._unlocked(_criar_perfil(tela))
+    store = win.store
+    real = store.write_both
+
+    def bak_travado(obj: dict[str, Any]) -> bool:
+        real(obj)
+        store.backup_pending = True  # o .bak não pôde ser trocado
+        return False
+
+    monkeypatch.setattr(store, "write_both", bak_travado)
+    win._change_pin()
+    _espera(lambda: not win.runner.busy)
+    _descarta()
+    assert win.home.notice.text() == f"PIN alterado. {profile_mod.NOTE_BACKUP_PENDING}"
+    assert OwlWindow._profile_saved("PIN criado.", None) == "PIN criado."
 
 
 @gui
@@ -2862,7 +3066,7 @@ def test_sair_com_app_travado_e_pasta_aberta_ainda_pergunta(
 
 
 @gui
-@pytest.mark.parametrize("estado", [APAGANDO, ABERTURA_INCOMPLETA, ABRINDO])
+@pytest.mark.parametrize("estado", [APAGANDO, ABERTURA_INCOMPLETA, ABRINDO, RESTAURANDO, TRANCANDO])
 def test_sair_com_pasta_com_copias_legiveis_pergunta(
     abrir_tela: Callable[..., Tela], tmp_path: Path, estado: str
 ) -> None:
@@ -3000,13 +3204,1491 @@ def test_erro_no_trancar_e_sair_mostra_o_motivo_e_esc_nao_sai(
     erro = PreflightError(
         "Não é possível proteger esta pasta.", ["IMG_0042.jpg: em uso", "IMG_0043.jpg: em uso"]
     )
-    assert win._quit_lock_failed(rec.id, erro)
+    # a fila não para no erro (estados-7): ele vai para o resumo do fim do "Trancar e sair"
+    seq = owl_window._Sequencia([], sair=True, conhecidas={rec.id})
+    seq.falhas.append(win._lock_failure(rec.id, erro))
+    win._quit_sequence = True
+    win._quit_sequence_end(seq)
     _descarta()
     pergunta = tela.pergunta(f"Não deu para trancar '{NOME}'")
     assert pergunta["text"].startswith("IMG_0042.jpg: em uso")
+    assert "Tentar de novo" in pergunta["text"]
     assert pergunta["details"] == ["IMG_0043.jpg: em uso"]
+    assert pergunta["buttons"] == ["retry", "quit"]
     assert pergunta["primary"] == "retry"
+    assert not win._quit_sequence
     assert win._quitting == sai
     if not sai:  # Esc/X no aviso: volta ao app, nada de sair com a pasta aberta
         assert win.session is sessao
         assert "continuam abertas" in win.home.notice.text()
+
+
+# =========================================================================== revisão adversarial
+# (janela principal: achados estados-*, fluxos-*, perfil-*, visual-* da revisão da 0.3.0)
+
+
+class _CancelaDepois(NullProgress):
+    """Progresso que pede o cancelamento depois de ``n`` arquivos (como o [Cancelar] da tela)."""
+
+    def __init__(self, token: CancelToken, n: int) -> None:
+        self.token = token
+        self.n = n
+        self.vistos = 0
+
+    def advance(self, nbytes: int = 0, nitems: int = 0) -> None:
+        self.vistos += nitems
+        if self.vistos >= self.n:
+            self.token.cancel()
+
+
+def _pronta(tela: Tela) -> OwlWindow:
+    tela.win._unlocked(_criar_perfil(tela))
+    _descarta()
+    return tela.win
+
+
+def _protegida(win: OwlWindow, base: Path, nome: str, n: int = 4) -> tuple[Path, FolderRecord]:
+    """Pasta sintética protegida DE VERDADE (trancada) pelo gerente da janela."""
+    pasta = base / nome
+    pasta.mkdir(parents=True)
+    for i in range(n):
+        (pasta / f"doc {i}.txt").write_bytes(f"{i:02d}".encode() * 300)
+    assert win.mgr is not None
+    return pasta, win.mgr.protect(win.mgr.check_protect(str(pasta))).record
+
+
+def _espera_fila(win: OwlWindow, cond: Callable[[], object], timeout: float = 60.0) -> None:
+    """Espera uma fila de trabalhos (um puxa o outro por QTimer) chegar a ``cond``."""
+    fim = time.monotonic() + timeout
+    while not (cond() and not win.runner.busy):
+        if time.monotonic() > fim:
+            raise AssertionError("tempo esgotado esperando a fila de trabalhos")
+        _descarta()
+        time.sleep(0.005)
+    _descarta()
+
+
+@gui
+def test_abertura_cancelada_no_meio_pergunta_ao_sair_e_conta_ao_bloquear(
+    abrir_tela: Callable[..., Tela], tmp_path: Path
+) -> None:
+    """estados-1 / fluxos-1: [Cancelar] em 'Abrindo' deixa a pasta em 'restaurando' com parte
+    dos arquivos legível. Antes, a faixa sumia e o X fechava o app sem perguntar nada."""
+    tela = abrir_tela()
+    win = _pronta(tela)
+    pasta, rec = _protegida(win, tmp_path / "pastas", NOME, n=6)
+    assert win.mgr is not None
+    token = CancelToken()
+    with pytest.raises(CancelledError):
+        win.mgr.unlock(rec.id, _CancelaDepois(token, 2), token)
+    assert rec.state == RESTAURANDO
+    assert [n for n in os.listdir(pasta) if n.endswith(".txt")]  # há cópias legíveis
+    win._refresh()
+    assert not win.home.banner.isHidden()
+    assert win.home.banner_text.startswith("1 pasta está aberta e visível")
+    assert not win.close()
+    pergunta = tela.pergunta("Sair do Owl Vault?")
+    assert pergunta["buttons"] == ["quit", "cancel"]  # não dá para trancar automaticamente
+    assert any(NOME in d and "precisa de atenção" in d for d in pergunta["details"])
+    assert win.session is not None
+    win.lock_now()  # depois do bloqueio, o X ainda pergunta (só a contagem fica em memória)
+    assert win._visible_count == 1
+    antes = len(tela.perguntas)
+    assert not win.close()
+    assert [p["title"] for p in tela.perguntas[antes:]] == ["Sair do Owl Vault?"]
+
+
+@gui
+@pytest.mark.parametrize("estado", [APAGANDO, ABRINDO, RESTAURANDO, ABERTURA_INCOMPLETA])
+def test_tirar_da_lista_em_estado_intermediario_diz_a_verdade(
+    abrir_tela: Callable[..., Tela],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    estado: str,
+) -> None:
+    """estados-3 / fluxos-7 (contrato C2): o texto vem de forget_warning em QUALQUER estado.
+    Antes, fora de 'trancada', a janela dizia "Os arquivos legíveis continuam na pasta" (falso:
+    em 'abrindo' a pasta está vazia; em 'apagando' parte já foi apagada) e não avisava que
+    'Recuperar' não acha a cópia da área temporária."""
+    tela = abrir_tela()
+    win, rec = _destravada_com_pasta(tela, tmp_path, estado)
+    assert win.mgr is not None
+    aviso = (
+        f"'{NOME}' tem arquivos guardados fora da pasta (em X, uma pasta oculta). Depois de tirar "
+        "da lista, eles NÃO aparecem em 'Recuperar uma pasta protegida'."
+    )
+    monkeypatch.setattr(win.mgr, "forget_warning", lambda _fid: aviso)
+    win._forget(rec.id)
+    texto = tela.pergunta(f"Tirar '{NOME}' da lista?")["text"]
+    assert texto.startswith("Nada será apagado.")
+    assert aviso in texto
+    assert "Os arquivos legíveis continuam na pasta" not in texto
+    assert "use ☰ > Recuperar" not in texto
+    # sem aviso do gerente: a janela também não afirma o que pode ser falso
+    monkeypatch.setattr(win.mgr, "forget_warning", lambda _fid: "")
+    win._forget(rec.id)
+    texto = tela.pergunta(f"Tirar '{NOME}' da lista?")["text"]
+    assert "Os arquivos legíveis continuam na pasta" not in texto
+    assert f".owlvault-{rec.id}" in texto
+    assert "NÃO encontra" in texto
+    assert "use ☰ > Recuperar" not in texto
+    assert win.session is not None and win.session.index.folder(rec.id) is rec  # cancelado
+    tela.respostas[f"Tirar '{NOME}'"] = "go"
+    win._forget(rec.id)
+    assert win.session.index.folder(rec.id) is None
+    assert win.home.notice.text() == f"'{NOME}' saiu da lista. Nada foi apagado."
+
+
+#: (estado da pasta, issue mostrada, título do Resolver)
+CASOS_RESOLVER = [
+    (APAGANDO, APAGANDO, f"Trancamento de '{NOME}' interrompido"),
+    (ABRINDO, ABRINDO, f"Abertura de '{NOME}' interrompida"),
+    (RESTAURANDO, ABRINDO, f"Abertura de '{NOME}' interrompida"),
+    (ABERTURA_INCOMPLETA, ABERTURA_INCOMPLETA, f"'{NOME}' não abriu por completo"),
+    (TRANCANDO, TRANCANDO, f"Trancamento de '{NOME}' interrompido"),
+    (TRANCADA, "indisponivel", f"'{NOME}' está indisponível"),
+    (TRANCADA, "nao_encontrada", f"'{NOME}' não foi encontrada"),
+    (TRANCADA, "itens_extras", f"Há itens novos em '{NOME}'"),
+    (TRANCADA, "sem_dados", f"Dados de '{NOME}' não encontrados"),
+    (TRANCADA, "cofre_diferente", f"'{NOME}' precisa de atenção"),
+    ("estado_novo", "estado_novo", f"'{NOME}' precisa de atenção"),
+]
+
+
+@gui
+@pytest.mark.parametrize(("estado", "issue", "titulo"), CASOS_RESOLVER)
+def test_resolver_de_todo_estado_oferece_tirar_da_lista(
+    abrir_tela: Callable[..., Tela],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    estado: str,
+    issue: str,
+    titulo: str,
+) -> None:
+    """estados-5 / contratos C2 e C4: todo Resolver tem uma saída ("Tirar da lista"), mostra o
+    texto do gerente (``attention``) e um problema desconhecido cai no Resolver genérico."""
+    tela = abrir_tela()
+    win, rec = _destravada_com_pasta(tela, tmp_path, estado)
+    assert win.mgr is not None
+    _com_vista(win, monkeypatch, rec, issue)
+    monkeypatch.setattr(win.mgr, "reconcile_on_start", lambda: [])  # 'trancando' continua preso
+    tela.respostas[titulo] = "forget"
+    win._resolve(rec.id)
+    pergunta = tela.pergunta(titulo)
+    assert "forget" in pergunta["buttons"]
+    if issue not in ("nao_encontrada", "abertura_incompleta", "sem_dados"):
+        assert "Atenção sintética" in pergunta["text"]  # o texto específico do gerente
+    if issue in ("indisponivel", "nao_encontrada", "cofre_diferente", "estado_novo", TRANCANDO):
+        assert "find" in pergunta["buttons"]  # "Procurar a pasta…"
+    tela.pergunta(f"Tirar '{NOME}' da lista?")  # "Tirar da lista" leva à confirmação
+
+
+@gui
+def test_resolver_generico_oferece_a_acao_base_e_cancelar_e_o_padrao(
+    abrir_tela: Callable[..., Tela], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C4 / estados-9: um problema novo do gerente (ex.: o cofre na pasta não é o registrado)
+    mostra o texto dele, a ação base, [Procurar a pasta…] [Tirar da lista] [Cancelar]."""
+    tela = abrir_tela()
+    win, rec = _destravada_com_pasta(tela, tmp_path, TRANCADA)
+    assert win.mgr is not None
+    vista = FolderView(
+        rec,
+        "Precisa de atenção",
+        "resolver",
+        "Os dados desta pasta não são os registrados.",
+        issue="cofre_diferente",
+        base_action="abrir",
+    )
+    monkeypatch.setattr(win.mgr, "view", lambda _r: vista)
+    win._resolve(rec.id)
+    pergunta = tela.pergunta(f"'{NOME}' precisa de atenção")
+    assert pergunta["text"] == "Os dados desta pasta não são os registrados."
+    assert pergunta["buttons"] == ["base", "find", "forget", "cancel"]
+    assert pergunta["primary"] == "cancel"
+    assert pages.row_menu(vista)[-2:] == [PROCURAR, TIRAR]
+
+
+@gui
+def test_unidade_com_outra_letra_pelo_atalho_explica_e_oferece_procurar(
+    abrir_tela: Callable[..., Tela], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """estados-6: 'indisponível' tinha só "Tirar da lista" no ⋯, e o atalho da própria pasta
+    pedia o PIN e terminava em silêncio (o Resolver não tinha ramo para 'indisponivel')."""
+    tela = abrir_tela()
+    win, rec = _destravada_com_pasta(tela, tmp_path, TRANCADA)
+    assert win.mgr is not None
+    vista = FolderView(
+        rec,
+        "Indisponível — conecte a unidade Q:",
+        "",
+        f"A unidade de '{NOME}' não está disponível.",
+        available=False,
+        issue="indisponivel",
+    )
+    monkeypatch.setattr(win.mgr, "view", lambda _r: vista)
+
+    def fora(_fid: str) -> list[str]:
+        raise StateError("A unidade não está disponível.")
+
+    monkeypatch.setattr(win.mgr, "repair_placeholders", fora)
+    procurar: list[str] = []
+    monkeypatch.setattr(win, "_relocate", procurar.append)
+    tela.respostas[f"'{NOME}' está indisponível"] = "find"
+    win._open_from_shortcut(rec.id)  # depois do PIN aceito
+    pergunta = tela.pergunta(f"'{NOME}' está indisponível")
+    assert pergunta["buttons"] == ["find", "forget", "close"]
+    assert "outra letra" in pergunta["text"]
+    assert procurar == [rec.id]
+    assert pages.row_menu(vista) == [PROCURAR, TIRAR]
+    row = pages.FolderRow(vista, lambda _f, _a: None, pages.row_menu(vista))
+    assert any("Procurar a pasta" in d.accessibleName() for d in _por_nome(row, "linhaDetalhe"))
+    row.deleteLater()
+    _descarta()
+
+
+@gui
+def test_trancar_agora_segue_depois_de_uma_falha_e_resume(
+    abrir_tela: Callable[..., Tela], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """fluxos-12 / estados-7: a 1ª pasta com erro não para a fila; no fim, um resumo diz qual
+    ficou aberta e por quê (com o nome dela, não "Não é possível proteger esta pasta.")."""
+    tela = abrir_tela()
+    win = _pronta(tela)
+    _pa, ra = _protegida(win, tmp_path / "pastas", "Pasta A", 2)
+    _pb, rb = _protegida(win, tmp_path / "pastas", "Pasta B", 2)
+    _pc, rc = _protegida(win, tmp_path / "pastas", "Pasta C", 2)
+    mgr = win.mgr
+    assert mgr is not None
+    for r in (ra, rb, rc):
+        mgr.unlock(r.id)
+    (tmp_path / "pastas" / "Pasta C").rename(tmp_path / "pastas" / "Pasta C renomeada")
+    real_lock = mgr.lock
+
+    def lock(folder_id: str, *a: Any, **k: Any) -> LockOutcome:
+        if folder_id == ra.id:
+            raise PreflightError(
+                "Não é possível proteger esta pasta.", ["doc 0.txt: em uso", "doc 1.txt: em uso"]
+            )
+        return real_lock(folder_id, *a, **k)
+
+    monkeypatch.setattr(mgr, "lock", lock)
+    win._refresh()
+    assert not win.home.lock_all.isHidden()
+    win._lock_all()
+    _espera_fila(win, lambda: rb.state == TRANCADA and tela.perguntas)
+    assert [ra.state, rb.state, rc.state] == [ABERTA, TRANCADA, ABERTA]
+    pergunta = tela.perguntas[-1]
+    assert pergunta["title"] == "2 pastas não foram trancadas"
+    assert pergunta["text"].startswith("1 pasta(s) foram trancadas.")
+    assert any(d.startswith("Pasta A: doc 0.txt: em uso") for d in pergunta["details"])
+    assert any(d.startswith("Pasta C: ") for d in pergunta["details"])
+    assert not [p for p in tela.perguntas if p["title"] == "Não é possível proteger esta pasta."]
+
+
+@gui
+def test_trancar_agora_poe_no_resumo_a_pasta_restaurando(
+    abrir_tela: Callable[..., Tela], tmp_path: Path
+) -> None:
+    """'Trancar agora' tranca as abertas e põe no resumo também a pasta visível que não dá
+    para trancar fora de 'aberta' (aqui, uma abertura cancelada no meio: 'restaurando').
+    Antes, só as pastas em 'aberta' entravam no resumo e esta ficava de fora, calada."""
+    tela = abrir_tela()
+    win = _pronta(tela)
+    _pa, ra = _protegida(win, tmp_path / "pastas", "Pasta A", 2)
+    _pb, rb = _protegida(win, tmp_path / "pastas", "Pasta B", 6)
+    mgr = win.mgr
+    assert mgr is not None
+    mgr.unlock(ra.id)
+    token = CancelToken()
+    with pytest.raises(CancelledError):
+        mgr.unlock(rb.id, _CancelaDepois(token, 2), token)
+    assert rb.state == RESTAURANDO
+    win._refresh()
+    assert not win.home.lock_all.isHidden()
+    win._lock_all()
+    _espera_fila(win, lambda: ra.state == TRANCADA and tela.perguntas)
+    assert [ra.state, rb.state] == [TRANCADA, RESTAURANDO]
+    pergunta = tela.perguntas[-1]
+    assert pergunta["title"] == "Não deu para trancar 'Pasta B'"
+    assert pergunta["text"].startswith("1 pasta(s) foram trancadas.")
+
+
+@gui
+def test_bloquear_no_meio_do_trancar_agora_nao_mostra_resumo_na_tela_travada(
+    abrir_tela: Callable[..., Tela], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """O travamento automático (ou Win+L) chega com a pergunta do T7 na tela, no meio de
+    'Trancar agora': a fila acaba ali, sem mostrar o resumo (com nomes) na tela travada."""
+    tela = abrir_tela()
+    win = _pronta(tela)
+    _pa, ra = _protegida(win, tmp_path / "pastas", "Pasta A", 2)
+    _pc, rc = _protegida(win, tmp_path / "pastas", "Pasta C", 2)
+    mgr = win.mgr
+    assert mgr is not None
+    for r in (ra, rc):
+        mgr.unlock(r.id)
+    (tmp_path / "pastas" / "Pasta C").rename(tmp_path / "pastas" / "Pasta C 2")  # vai p/ resumo
+    monkeypatch.setattr(mgr, "missing_since_open", lambda _f: ["doc 9.txt"])
+
+    def t7() -> str:
+        win.lock_now()  # bloqueia com a pergunta na tela (ela é rejeitada)
+        return ""
+
+    tela.respostas["Trancar 'Pasta A'?"] = t7
+    win._lock_all()
+    _descarta()
+    assert win.session is None and win.mgr is None
+    assert [p["title"] for p in tela.perguntas] == ["Trancar 'Pasta A'?"]
+    assert ra.state == ABERTA
+
+
+@gui
+@pytest.mark.parametrize("resposta", ["", "quit"])
+def test_trancar_e_sair_tranca_as_outras_e_so_sai_se_pedirem(
+    abrir_tela: Callable[..., Tela],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resposta: str,
+) -> None:
+    """estados-7: "Trancar e sair" parava na 1ª pasta com problema e "Sair sem trancar" deixava
+    abertas TODAS as outras; agora a fila segue e o resumo só sai se o usuário pedir."""
+    tela = abrir_tela()
+    win = _pronta(tela)
+    _pa, ra = _protegida(win, tmp_path / "pastas", "Antiga", 2)
+    _pb, rb = _protegida(win, tmp_path / "pastas", "Fotos", 2)
+    _pc, rc = _protegida(win, tmp_path / "pastas", "Renomeada", 2)
+    mgr = win.mgr
+    assert mgr is not None
+    for r in (ra, rb, rc):
+        mgr.unlock(r.id)
+    (tmp_path / "pastas" / "Renomeada").rename(tmp_path / "pastas" / "Renomeada 2")
+    real_lock = mgr.lock
+
+    def lock(folder_id: str, *a: Any, **k: Any) -> LockOutcome:
+        if folder_id == ra.id:
+            raise PreflightError("Não é possível proteger esta pasta.", ["doc 0.txt: em uso"])
+        return real_lock(folder_id, *a, **k)
+
+    monkeypatch.setattr(mgr, "lock", lock)
+    tela.respostas["Sair do Owl Vault?"] = "lock"
+    tela.respostas["2 pastas não foram trancadas"] = resposta
+    assert not win.close()
+    t11 = tela.pergunta("Sair do Owl Vault?")
+    assert t11["buttons"] == ["lock", "quit", "cancel"]
+    # a que sumiu aparece como "precisa de atenção", não como aberta
+    assert any(d.startswith("Renomeada — precisa de atenção") for d in t11["details"])
+    _espera_fila(
+        win, lambda: bool([p for p in tela.perguntas if "não foram trancadas" in p["title"]])
+    )
+    assert rb.state == TRANCADA  # a falha de 'Antiga' não impediu as outras
+    # JAN-1: a que precisa de atenção ('Renomeada', com cópias legíveis) também entra no
+    # resumo — antes, só 'Antiga' aparecia e a outra ficava aberta sem ninguém escolher
+    resumo = tela.pergunta("2 pastas não foram trancadas")
+    assert resumo["buttons"] == ["retry", "quit"]  # 'Antiga' dá para tentar de novo
+    assert any(d.startswith("Antiga: doc 0.txt: em uso") for d in resumo["details"])
+    assert any(d.startswith("Renomeada: ") for d in resumo["details"])
+    _descarta()
+    assert win._quitting == (resposta == "quit")
+    assert len([p for p in tela.perguntas if p["title"] == "Sair do Owl Vault?"]) == 1
+    if not resposta:
+        assert win.session is not None
+        assert ra.state == ABERTA
+
+
+@gui
+def test_trancar_e_sair_parado_na_etapa_4_nao_promete_o_que_nao_existe(
+    abrir_tela: Callable[..., Tela], tmp_path: Path
+) -> None:
+    """fluxos-4: [Parar depois do arquivo atual] deixa a pasta em 'apagando'. O aviso dizia "A
+    pasta continua aberta" e oferecia "Tentar de novo", que não trancava nada."""
+    tela = abrir_tela()
+    win, rec = _destravada_com_pasta(tela, tmp_path, APAGANDO)
+    falha = win._lock_failure(rec.id, CancelledError("parou"))
+    assert "parte das cópias legíveis ainda está na pasta" in falha.motivo
+    assert "continua aberta" not in falha.motivo
+    assert "Resolver" in falha.motivo
+    seq = owl_window._Sequencia([], sair=True, conhecidas={rec.id}, parou=True)
+    seq.falhas.append(falha)
+    win._quit_sequence = True
+    win._quit_sequence_end(seq)
+    pergunta = tela.pergunta(f"Não deu para trancar '{NOME}'")
+    assert pergunta["buttons"] == ["cancel", "quit"]  # [Voltar ao Owl Vault] [Sair sem trancar]
+    assert pergunta["primary"] == "cancel"
+    assert not win._quitting
+    assert "Resolver" in win.home.notice.text()
+    # cancelado nas etapas 1 a 3: a pasta continua aberta, como antes
+    rec.state = ABERTA
+    assert "continua aberta" in win._lock_failure(rec.id, CancelledError("parou")).motivo
+
+
+@gui
+def test_t11_decide_com_a_lista_de_agora(abrir_tela: Callable[..., Tela], tmp_path: Path) -> None:
+    """fluxos-2: uma pasta aberta pelo atalho com a pergunta de saída na tela ficava aberta e
+    o app saía. Agora a lista é refeita no momento da decisão e a pergunta volta com ela."""
+    tela = abrir_tela()
+    win, rec_a = _destravada_com_pasta(tela, tmp_path)
+    rec_b = _pasta_aberta(tmp_path, "Pasta B", state=TRANCADA)
+    assert win.session is not None
+    win.session.index.folders.append(rec_b)
+    respostas = iter(["quit", "cancel"])
+
+    def responde() -> str:
+        rec_b.state = ABERTA  # o atalho abriu 'Pasta B' com a pergunta na tela
+        return next(respostas)
+
+    tela.respostas["Sair do Owl Vault?"] = responde
+    assert not win.close()
+    t11 = [p for p in tela.perguntas if p["title"] == "Sair do Owl Vault?"]
+    assert len(t11) == 2
+    assert not any("Pasta B" in d for d in t11[0]["details"])
+    assert any(d == "Pasta B" for d in t11[1]["details"])
+    assert not win._quitting  # a 2ª resposta foi "Cancelar"
+    assert win.session is not None
+    assert rec_a.state == ABERTA
+
+
+@gui
+def test_t11_trancar_e_sair_tranca_a_pasta_aberta_durante_a_pergunta(
+    abrir_tela: Callable[..., Tela], tmp_path: Path
+) -> None:
+    tela = abrir_tela()
+    win = _pronta(tela)
+    _pa, ra = _protegida(win, tmp_path / "pastas", "Pasta A", 2)
+    _pb, rb = _protegida(win, tmp_path / "pastas", "Pasta B", 2)
+    mgr = win.mgr
+    assert mgr is not None
+    mgr.unlock(ra.id)
+    chamadas: list[int] = []
+
+    def responde() -> str:
+        if not chamadas:
+            mgr.unlock(rb.id)  # aberta pelo atalho com a pergunta na tela
+        chamadas.append(1)
+        return "lock"
+
+    tela.respostas["Sair do Owl Vault?"] = responde
+    assert not win.close()
+    _espera_fila(win, lambda: win._quitting)
+    assert [ra.state, rb.state] == [TRANCADA, TRANCADA]
+    assert len(chamadas) == 2  # a pergunta voltou, agora com 'Pasta B'
+
+
+@gui
+def test_t11_pasta_oferecida_que_sumiu_durante_a_pergunta_vai_para_o_resumo(
+    abrir_tela: Callable[..., Tela], tmp_path: Path
+) -> None:
+    """fluxos-2 / estados-7: 'Trancar e sair' prometeu trancar 'Pasta B'; se ela deixou de poder
+    ser trancada com a pergunta na tela (renomeada), o app não sai calado: o resumo diz qual
+    ficou aberta e por quê, e só sai sem trancar se o usuário escolher."""
+    tela = abrir_tela()
+    win = _pronta(tela)
+    _pa, ra = _protegida(win, tmp_path / "pastas", "Pasta A", 2)
+    _pb, rb = _protegida(win, tmp_path / "pastas", "Pasta B", 2)
+    mgr = win.mgr
+    assert mgr is not None
+    mgr.unlock(ra.id)
+    mgr.unlock(rb.id)
+
+    def responde() -> str:
+        (tmp_path / "pastas" / "Pasta B").rename(tmp_path / "pastas" / "Pasta B 2")
+        return "lock"
+
+    tela.respostas["Sair do Owl Vault?"] = responde
+    tela.respostas["Não deu para trancar"] = ""  # Esc: volta ao app
+    assert not win.close()
+    t11 = tela.pergunta("Sair do Owl Vault?")
+    assert t11["details"] == ["Pasta A", "Pasta B"]  # as duas podiam ser trancadas
+    _espera_fila(win, lambda: bool(tela.perguntas[-1]["title"].startswith("Não deu")))
+    resumo = tela.pergunta("Não deu para trancar 'Pasta B'")
+    assert resumo["buttons"] == ["cancel", "quit"]  # [Voltar ao Owl Vault] [Sair sem trancar]
+    assert resumo["text"].startswith("1 pasta(s) foram trancadas.")
+    _descarta()
+    assert [ra.state, rb.state] == [TRANCADA, ABERTA]
+    assert not win._quitting and win.session is not None
+    assert len([p for p in tela.perguntas if p["title"] == "Sair do Owl Vault?"]) == 1
+
+
+@gui
+def test_atalho_durante_trancar_e_sair_pede_para_esperar(
+    abrir_tela: Callable[..., Tela], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    falso = _segredo_falso(monkeypatch, [PIN])
+    tela = abrir_tela()
+    win, rec = _destravada_com_pasta(tela, tmp_path, TRANCADA)
+    win._quit_sequence = True
+    win.request_open(rec.id)
+    assert falso.criados == []  # nada de PIN: a pasta não é aberta no meio da saída
+    assert "trancando as pastas para fechar" in tela.pergunta("Aguarde")["text"]
+    # e se, mesmo assim, aparecer outra pasta aberta, o app pergunta de novo em vez de sair
+    rec.state = ABERTA
+    win._quit_now(conhecidas=set())
+    assert not win._quitting
+    _descarta()
+    assert tela.pergunta("Sair do Owl Vault?")
+
+
+@gui
+def test_t7_enter_nao_escolhe_trancar_e_apagar(
+    abrir_tela: Callable[..., Tela], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """fluxos-5: no T7, Enter acionava "Trancar mesmo assim", que apaga para sempre a cópia
+    protegida dos arquivos que sumiram. O padrão agora é Cancelar e o "go" é o de perigo."""
+    tela = abrir_tela()
+    win, rec = _destravada_com_pasta(tela, tmp_path)
+    assert win.mgr is not None
+    monkeypatch.setattr(win.mgr, "missing_since_open", lambda _f: ["Relatorio secreto 1.txt"])
+    assert not win._lock_folder(rec.id)  # resposta gravada: "cancel"
+    assert not win.runner.busy
+    pergunta = tela.pergunta(f"Trancar '{NOME}'?")
+    assert pergunta["buttons"] == ["go", "cancel"]
+    assert pergunta["primary"] == "cancel"
+    assert pergunta["perigo"] == "go"
+    assert "para sempre" in pergunta["text"]
+    # a caixa de verdade: Enter (botão padrão) é Cancelar
+    caixa = folder_dialogs.ChoiceDialog(
+        win,
+        pergunta["title"],
+        pergunta["text"],
+        [("Trancar mesmo assim", "go"), ("Cancelar", "cancel")],
+        primary="cancel",
+        perigo="go",
+    )
+    assert caixa.buttons["cancel"].isDefault()
+    assert not caixa.buttons["go"].isDefault()
+    assert caixa.buttons["go"].objectName() == "perigo"
+    caixa.deleteLater()
+    _descarta()
+
+
+@gui
+def test_resolver_apagando_usa_o_texto_do_gerente_e_avisa_item_novo(
+    abrir_tela: Callable[..., Tela], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """fluxos-6: o Resolver dizia "Seus arquivos já estão guardados… Feche-os" também para um
+    item NOVO colocado durante o trancamento (que NÃO está guardado)."""
+    tela = abrir_tela()
+    win, rec = _destravada_com_pasta(tela, tmp_path, APAGANDO)
+    assert win.mgr is not None
+    rec.pending = ["Planilha nova.xlsx: item novo colocado na pasta durante o trancamento"]
+    vista = FolderView(rec, "Precisa de atenção", "resolver", "Texto do gerente.", issue=APAGANDO)
+    monkeypatch.setattr(win.mgr, "view", lambda _r: vista)
+    tela.respostas[f"Trancamento de '{NOME}'"] = "show"
+    win._resolve(rec.id)
+    pergunta = tela.pergunta(f"Trancamento de '{NOME}' interrompido")
+    assert pergunta["text"].startswith("Texto do gerente.")
+    assert "NÃO estão guardados" in pergunta["text"]
+    assert "Seus arquivos já estão guardados" not in pergunta["text"]
+    assert pergunta["details"] == rec.pending
+    assert pergunta["details_open"]
+    assert pergunta["buttons"] == ["cont", "undo", "show", "forget", "close"]
+    assert ("explorer", rec.path) in tela.dialogos
+    # quando o texto do gerente já fala dos itens novos, o aviso não se repete
+    tela.perguntas.clear()
+    vista.attention = (
+        "O trancamento não terminou. 1 item(ns) foram colocados na pasta durante o trancamento "
+        "e NÃO estão guardados: Planilha nova.xlsx."
+    )
+    win._resolve(rec.id)
+    texto = tela.pergunta(f"Trancamento de '{NOME}' interrompido")["text"]
+    assert texto == vista.attention
+
+
+class _CopiaOcupada(QWidget):
+    """Cópia criptografada (falsa) com um trabalho rodando e o ``bloquear`` do contrato C1."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.runner = SimpleNamespace(busy=True)
+        self.bloqueios = 0
+
+    def bloquear(self) -> None:
+        self.bloqueios += 1
+        self.hide()
+
+
+@gui
+def test_bloquear_fecha_a_copia_criptografada_e_apaga_a_senha(
+    abrir_tela: Callable[..., Tela],
+) -> None:
+    """fluxos-8 / perfil-1 (contrato C1): a janela da Cópia continuava aberta e utilizável depois
+    do bloqueio, com o caminho e a senha digitada (que "Mostrar" revelava)."""
+    tela = abrir_tela()
+    win = _pronta(tela)
+    win._open_copy_tool()
+    copia = win._copy_window
+    assert copia is not None and copia.isVisible()
+    copia.r_senha.setText("SenhaDaCopia-Teste-91")  # type: ignore[attr-defined]
+    win._watcher.last = time.monotonic() - IDLE_LOCK_SECONDS - 1
+    win._idle_check()  # 5 min sem uso
+    assert win.session is None
+    assert copia.r_senha.text() == ""  # type: ignore[attr-defined]
+    assert not copia.isVisible()
+    assert win._copy_window is None  # parada: fechada e descartada
+    _descarta()
+    assert not shiboken6.isValid(copia)
+
+
+@gui
+def test_bloquear_com_a_copia_trabalhando_bloqueia_ja_e_espera_ela_parar(
+    abrir_tela: Callable[..., Tela],
+) -> None:
+    tela = abrir_tela()
+    win = _pronta(tela)
+    copia = _CopiaOcupada()
+    copia.show()
+    win._copy_window = copia
+    win._watcher.last = time.monotonic() - IDLE_LOCK_SECONDS - 1
+    win._idle_check()  # a Cópia trabalhando conta como uso: não interrompe o trabalho dela
+    assert win.session is not None and copia.bloqueios == 0
+    liberar = threading.Event()
+    assert win._run(lambda _p, _c: liberar.wait(10), lambda _r: None)
+    win.lock_now()  # Win+L com um trabalho desta janela rodando
+    assert copia.bloqueios == 1  # a Cópia é bloqueada JÁ (a senha dela não espera)
+    assert win.session is not None  # a principal espera o próprio trabalho
+    assert win._copy_window is copia  # a referência fica até ela parar e fechar
+    liberar.set()
+    _espera(lambda: win.session is None)
+    assert not win._close_copy_window()  # ainda parando: não é destruída no meio
+    copia.runner.busy = False
+    assert win._close_copy_window()
+    assert win._copy_window is None
+
+
+@gui
+def test_bloquear_destroi_os_dialogos_com_nomes(abrir_tela: Callable[..., Tela]) -> None:
+    """fluxos-9: diálogos ocultos (progresso, perguntas) guardavam nomes de pastas e arquivos
+    depois do bloqueio e se acumulavam a cada operação."""
+    tela = abrir_tela()
+    win = _pronta(tela)
+    for _ in range(3):
+        assert win._run(lambda _p, _c: None, lambda _r: None, title=f"Abrindo '{NOME}'")
+        _espera(lambda: not win.runner.busy)
+        _descarta()
+    assert win.findChildren(QDialog) == []  # não se acumulam
+    caixa = folder_dialogs.ChoiceDialog(
+        win, f"Trancar '{NOME}'?", f"Desde que você abriu '{NOME}'…", [("OK", "ok")]
+    )
+    assert not caixa.isVisible()  # como depois de um exec()
+    win.lock_now()
+    _descarta()
+    assert not shiboken6.isValid(caixa)
+    assert win.findChildren(QDialog) == []
+    assert not [t for t in _textos(win) if NOME in t]
+
+
+@gui
+def test_nova_senha_mestra_com_pin_desativado_pede_a_senha_mestra(
+    abrir_tela: Callable[..., Tela],
+) -> None:
+    """perfil-3 / fluxos-10: com o PIN desativado no meio de "Criar nova senha mestra", a tela
+    continuava pedindo o PIN (que não funcionava mais) e escondia "Usar a senha mestra"."""
+    tela = abrir_tela()
+    win = tela.win
+    _criar_perfil(tela).close()
+    win._show_unlock()
+    win._request_new_master()
+    page = win.unlock_page
+    assert not page.master
+    assert "nova senha mestra" in page.text.text()
+    for _ in range(5):
+        _envia(tela, PIN_ERRADO)
+    assert not tela.store.pin_available()
+    assert page.master  # agora pede a senha mestra
+    assert not win._wants_new_master
+    assert "PIN foi desativado" in page.text.text()
+    assert "PIN incorreto muitas vezes" in page.err.text()
+    _envia(tela, SENHA_MESTRA)
+    assert win.session is not None
+
+
+@gui
+@pytest.mark.parametrize("falhou", [False, True])
+def test_recuperar_versao_anterior_mostra_falhas_e_nao_abre_explorer_bloqueado(
+    abrir_tela: Callable[..., Tela],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    falhou: bool,
+) -> None:
+    """estados-12: "Versão anterior recuperada" mesmo com arquivos que falharam. fluxos-11: o
+    Explorer abria na pasta recuperada (legível) depois de o app bloquear com o aviso na tela."""
+    tela = abrir_tela()
+    win, rec = _destravada_com_pasta(tela, tmp_path)
+    assert win.mgr is not None
+    destino = tmp_path / "destino"
+    destino.mkdir()
+    monkeypatch.setattr(owl_window, "choose_folder", lambda *_a, **_k: str(destino))
+    alvo = winfs.to_extended(str(destino / f"{NOME} (versão anterior)"))
+    relatorio = RestoreReport(alvo, "ok", restored=1)
+    if falhou:
+        relatorio.failed.append("b.txt: dado criptografado ausente ou truncado")
+    monkeypatch.setattr(win.mgr, "restore_kept", lambda *_a, **_k: [relatorio])
+    avisos: list[tuple[str, str, list[str]]] = []
+
+    def inform(_p: object, title: str, text: str = "", details: Any = (), **_k: object) -> None:
+        avisos.append((title, text, list(details)))
+        if falhou:
+            win.lock_now()  # 5 min sem uso (ou Win+L) com o aviso na tela
+
+    monkeypatch.setattr(owl_window, "inform", inform)
+    win._restore_kept(rec.id)
+    _espera(lambda: not win.runner.busy and bool(avisos))
+    _descarta()
+    titulo, texto, detalhes = avisos[0]
+    explorer = [d for d in tela.dialogos if d[0] == "explorer"]
+    if falhou:
+        assert titulo == "Nem todos os arquivos foram recuperados"
+        assert detalhes == ["b.txt: dado criptografado ausente ou truncado"]
+        assert "1 arquivo(s) não puderam ser recuperados" in texto
+        assert explorer == []  # bloqueou: nada de abrir a pasta legível
+    else:
+        assert titulo == "Versão anterior recuperada"
+        assert detalhes == [f"{winfs.strip_extended(alvo)}: 1 arquivo(s)"]  # sem \\?\
+        assert explorer == [("explorer", alvo)]
+
+
+@gui
+@pytest.mark.parametrize("esconde_falha", [False, True])
+def test_trancar_e_esconder_esconde_mesmo_depois_de_continuar(
+    abrir_tela: Callable[..., Tela],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    esconde_falha: bool,
+) -> None:
+    """estados-15: com o trancamento parado na etapa 4, "Continuar trancando" terminava sem
+    esconder; e uma falha ao esconder era engolida ("'X' está trancada.")."""
+    tela = abrir_tela()
+    win, rec = _destravada_com_pasta(tela, tmp_path)
+    mgr = win.mgr
+    assert mgr is not None
+
+    def lock(folder_id: str, *_a: Any, **_k: Any) -> LockOutcome:
+        rec.state = APAGANDO
+        rec.pending = ["nota.txt: em uso"]
+        return LockOutcome(rec, complete=False, pending=list(rec.pending))
+
+    def continua(folder_id: str, *_a: Any, **_k: Any) -> LockOutcome:
+        rec.state = TRANCADA
+        rec.pending = []
+        return LockOutcome(rec, complete=True)
+
+    escondidas: list[str] = []
+
+    def hide(folder_id: str) -> None:
+        if esconde_falha:
+            raise OSError("acesso negado (simulado)")
+        escondidas.append(folder_id)
+
+    monkeypatch.setattr(mgr, "lock", lock)
+    monkeypatch.setattr(mgr, "continue_lock", continua)
+    monkeypatch.setattr(mgr, "hide", hide)
+    _com_vista(win, monkeypatch, rec, APAGANDO)
+    tela.respostas[f"Trancamento de '{NOME}'"] = "cont"
+    win._on_row_action(rec.id, "lock_hide")
+    _espera_fila(win, lambda: rec.state == TRANCADA)
+    _descarta()
+    assert tela.pergunta(f"Trancamento de '{NOME}' interrompido")
+    if esconde_falha:
+        assert "não foi possível escondê-la" in win.home.notice.text()
+        assert "acesso negado" in win.home.notice.text()
+    else:
+        assert escondidas == [rec.id]
+        assert win.home.notice.text() == f"'{NOME}' está trancada."
+    assert rec.id not in win._hide_after
+
+
+# --------------------------------------------------------------------- rodada verifica2-janela
+
+
+def _enter(tela: Tela) -> Callable[[], str]:
+    """Responde como a tecla Enter: o botão padrão da última pergunta (``primary`` ou o 1º)."""
+
+    def responde() -> str:
+        p = tela.perguntas[-1]
+        return str(p.get("primary") or p["buttons"][0])
+
+    return responde
+
+
+def _legiveis(pasta: Path) -> list[str]:
+    return sorted(n for n in os.listdir(pasta) if n.endswith(".txt")) if pasta.exists() else []
+
+
+@gui
+@pytest.mark.parametrize("resposta", ["enter", "quit"])
+@pytest.mark.parametrize("variante", ["restaurando", "renomeada"])
+def test_trancar_e_sair_com_pasta_que_precisa_de_atencao_so_sai_se_pedirem(
+    abrir_tela: Callable[..., Tela], tmp_path: Path, variante: str, resposta: str
+) -> None:
+    """JAN-1: T11 com uma pasta que dá para trancar (B) e outra que precisa de atenção (A, com
+    cópias legíveis). 'Trancar e sair' (o padrão, Enter) trancava B e SAÍA, deixando A legível
+    sem a pessoa escolher 'Sair sem trancar'. Agora A entra no resumo do fim."""
+    tela = abrir_tela()
+    win = _pronta(tela)
+    pa, ra = _protegida(win, tmp_path / "pastas", "Pasta A", 6)
+    _pb, rb = _protegida(win, tmp_path / "pastas", "Pasta B", 2)
+    mgr = win.mgr
+    assert mgr is not None
+    mgr.unlock(rb.id)
+    if variante == "restaurando":  # abertura de A cancelada no meio
+        token = CancelToken()
+        with pytest.raises(CancelledError):
+            mgr.unlock(ra.id, _CancelaDepois(token, 2), token)
+        assert ra.state == RESTAURANDO
+        local_a = pa
+    else:  # A aberta e renomeada no Explorer
+        mgr.unlock(ra.id)
+        local_a = pa.with_name("Pasta A renomeada")
+        pa.rename(local_a)
+    legiveis = _legiveis(local_a)
+    assert legiveis
+    win._refresh()
+    tela.respostas["Sair do Owl Vault?"] = _enter(tela)
+    tela.respostas["Não deu para trancar"] = _enter(tela) if resposta == "enter" else "quit"
+    assert not win.close()
+    t11 = tela.pergunta("Sair do Owl Vault?")
+    assert t11["buttons"] == ["lock", "quit", "cancel"]
+    assert t11["primary"] == "lock"
+    _espera_fila(win, lambda: any(p["title"].startswith("Não deu") for p in tela.perguntas))
+    _descarta()
+    assert rb.state == TRANCADA  # a que dava para trancar foi trancada
+    resumo = tela.pergunta("Não deu para trancar 'Pasta A'")
+    assert resumo["buttons"] == ["cancel", "quit"]  # [Voltar ao Owl Vault] [Sair sem trancar]
+    assert resumo["primary"] == "cancel"  # Enter NÃO sai deixando A legível
+    assert resumo["text"].startswith("1 pasta(s) foram trancadas.")
+    assert "'Resolver…'" in resumo["text"]  # as saídas que o texto cita ficam na lista
+    assert win._quitting == (resposta == "quit")
+    assert _legiveis(local_a) == legiveis  # nada foi apagado de A
+    if resposta == "enter":
+        assert win.session is not None
+        assert win.pages.currentWidget() is win.home
+        assert len([p for p in tela.perguntas if p["title"] == "Sair do Owl Vault?"]) == 1
+
+
+def _modal_e_ausencia(win: OwlWindow, sessao: list[object]) -> None:
+    """Uma pergunta modal de verdade na tela e 10 min sem uso: roda o timer de inatividade."""
+    caixa = QDialog(win)
+    caixa.open()
+    assert QApplication.activeModalWidget() is caixa
+    win._watcher.last = time.monotonic() - IDLE_LOCK_SECONDS - 300
+    win._idle_check()
+    sessao.append(win.session)
+    caixa.deleteLater()
+
+
+@gui
+@pytest.mark.parametrize("onde", ["resumo", "t7"])
+def test_inatividade_trava_com_pergunta_do_trancar_e_sair_na_tela(
+    abrir_tela: Callable[..., Tela], tmp_path: Path, monkeypatch: pytest.MonkeyPatch, onde: str
+) -> None:
+    """JAN-2: com o resumo "Não deu para trancar…" (ou o T7) do 'Trancar e sair' na tela, o
+    travamento automático ficava desligado: a pessoa saía de perto e o app ficava destravado,
+    com o nome da pasta na tela, sem prazo."""
+    tela = abrir_tela()
+    win = _pronta(tela)
+    _pa, ra = _protegida(win, tmp_path / "pastas", "Pasta Quati", 2)
+    mgr = win.mgr
+    assert mgr is not None
+    mgr.unlock(ra.id)
+    win._refresh()
+    # entre um trancamento e o próximo da fila (sem pergunta na tela) não trava no meio
+    win._quit_sequence = True
+    win._watcher.last = time.monotonic() - IDLE_LOCK_SECONDS - 300
+    win._idle_check()
+    assert win.session is not None
+    win._quit_sequence = False
+    win._watcher.last = time.monotonic()
+    if onde == "resumo":
+
+        def em_uso(_fid: str, *_a: Any, **_k: Any) -> LockOutcome:
+            raise PreflightError("Não é possível proteger esta pasta.", ["doc 0.txt: em uso"])
+
+        monkeypatch.setattr(mgr, "lock", em_uso)
+        titulo = "Não deu para trancar 'Pasta Quati'"
+    else:
+        monkeypatch.setattr(mgr, "missing_since_open", lambda _f: ["doc 1.txt"])
+        titulo = "Trancar 'Pasta Quati'?"
+    sessao: list[object] = []
+
+    def pergunta() -> str:
+        _modal_e_ausencia(win, sessao)
+        return ""  # a caixa de verdade foi rejeitada pelo bloqueio
+
+    tela.respostas["Sair do Owl Vault?"] = "lock"
+    tela.respostas[titulo] = pergunta
+    assert not win.close()
+    _espera_fila(win, lambda: bool(sessao))
+    _descarta()
+    assert sessao == [None]  # travou com a pergunta na tela
+    assert win.session is None and win.mgr is None
+    assert win.pages.currentWidget() is win.unlock_page
+    assert not win._quit_sequence and not win._quitting
+    assert "Pasta Quati" not in win.home.notice.text()
+    assert ra.state == ABERTA  # nada foi trancado nem apagado pela metade
+
+
+@gui
+def test_bloqueio_durante_parar_e_fechar_trava_antes_da_pergunta_de_sair(
+    abrir_tela: Callable[..., Tela], tmp_path: Path
+) -> None:
+    """JAN-3: X → 'Parar e fechar' e, com o trabalho ainda parando, Win+L/suspensão. O pedido de
+    bloqueio se perdia: o T11 aparecia com os nomes e, com Cancelar, o app voltava destravado."""
+    tela = abrir_tela()
+    win, _rec = _destravada_com_pasta(tela, tmp_path)  # 'aberta': há o que perguntar ao sair
+    liberar = threading.Event()
+    fim: list[object] = []
+    assert win._run(lambda _p, _c: liberar.wait(10), fim.append, title=f"Abrindo '{NOME}'")
+    tela.respostas["Há uma operação em andamento"] = "stop"
+    assert not win.close()
+    assert win._quit_after_job
+    win.lock_now()  # Win+L / suspensão com o trabalho ainda indo até o ponto seguro
+    assert win._lock_after_job and win.session is not None
+    antes = len(tela.perguntas)
+    liberar.set()
+    _espera(lambda: not win.runner.busy)
+    _descarta()
+    assert fim == [True]
+    assert win.session is None and win.mgr is None
+    assert win.pages.currentWidget() is win.unlock_page
+    assert not win._lock_after_job and not win._quit_after_job
+    sair = [p for p in tela.perguntas[antes:] if p["title"] == "Sair do Owl Vault?"]
+    assert len(sair) == 1
+    assert sair[0]["buttons"] == ["quit", "cancel"]  # travado: só a contagem, pede o PIN
+    assert "Há 1 pasta aberta" in sair[0]["text"]
+    assert NOME not in sair[0]["text"] and not sair[0].get("details")
+    assert not win._quitting  # respondeu Cancelar: continua aberto, mas BLOQUEADO
+
+
+@gui
+def test_bloqueio_pedido_durante_recuperar_versao_anterior_vem_antes_do_aviso(
+    abrir_tela: Callable[..., Tela], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """JAN-4: Win+L durante 'Recuperando a versão anterior': o aviso com os caminhos aparecia
+    com o app destravado e, no OK, o Explorer abria a pasta decifrada; só então bloqueava."""
+    tela = abrir_tela()
+    win, rec = _destravada_com_pasta(tela, tmp_path)
+    assert win.mgr is not None
+    destino = tmp_path / "destino"
+    destino.mkdir()
+    monkeypatch.setattr(owl_window, "choose_folder", lambda *_a, **_k: str(destino))
+    alvo = winfs.to_extended(str(destino / f"{NOME} (versão anterior)"))
+    liberar = threading.Event()
+
+    def lento(*_a: Any, **_k: Any) -> list[RestoreReport]:
+        liberar.wait(10)
+        return [RestoreReport(alvo, "ok", restored=1)]
+
+    monkeypatch.setattr(win.mgr, "restore_kept", lento)
+    win._restore_kept(rec.id)
+    assert win.runner.busy
+    win.lock_now()  # Win+L / suspensão durante o trabalho: fica para o fim dele
+    assert win._lock_after_job
+    antes = len(tela.perguntas)
+    liberar.set()
+    _espera(lambda: not win.runner.busy)
+    _descarta()
+    assert win.session is None and win.pages.currentWidget() is win.unlock_page
+    assert tela.perguntas[antes:] == []  # nem o aviso com os caminhos
+    assert [d for d in tela.dialogos if d[0] == "explorer"] == []  # nem o Explorer
+
+
+@gui
+def test_bloqueio_pedido_durante_a_abertura_nao_abre_o_explorer(
+    abrir_tela: Callable[..., Tela], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """JAN-4 (outros fins de trabalho): a pasta aberta não aparece no Explorer depois do Win+L,
+    e o aviso "'<Nome>' está aberta" não fica na lista escondida."""
+    tela = abrir_tela()
+    win, rec = _destravada_com_pasta(tela, tmp_path, TRANCADA)
+    mgr = win.mgr
+    assert mgr is not None
+    vista = FolderView(rec, "Trancada", "abrir", base_action="abrir")
+    monkeypatch.setattr(mgr, "view", lambda _r: vista)
+    liberar = threading.Event()
+
+    def lento(folder_id: str, *_a: Any, **_k: Any) -> UnlockOutcome:
+        liberar.wait(10)
+        rec.state = ABERTA
+        return UnlockOutcome(rec, True, None, rec.path)
+
+    monkeypatch.setattr(mgr, "unlock", lento)
+    win._open_folder(rec.id)
+    assert win.runner.busy
+    win.lock_now()
+    liberar.set()
+    _espera(lambda: not win.runner.busy)
+    _descarta()
+    assert win.session is None
+    assert [d for d in tela.dialogos if d[0] == "explorer"] == []
+    assert NOME not in win.home.notice.text()
+
+
+@gui
+def test_bloqueio_pedido_durante_o_desbloqueio_descarta_a_sessao_nova(
+    abrir_tela: Callable[..., Tela], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """JAN-4: com o bloqueio pedido enquanto o PIN é conferido, a sessão nova não é adotada (o
+    bloqueio vale mais) e é fechada."""
+    tela = abrir_tela()
+    win = tela.win
+    _criar_perfil(tela).close()
+    win._show_unlock()
+    real = win.store.unlock_with_pin
+    liberar = threading.Event()
+    sessoes: list[profile_mod.ProfileSession] = []
+
+    def lento(pin: str) -> profile_mod.ProfileSession:
+        liberar.wait(10)
+        s = real(pin)
+        sessoes.append(s)
+        return s
+
+    monkeypatch.setattr(win.store, "unlock_with_pin", lento)
+    win.unlock_page.edit.setText(PIN)
+    win.unlock_page._submit()
+    assert win.runner.busy
+    win.lock_now()
+    liberar.set()
+    _espera(lambda: not win.runner.busy)
+    _descarta()
+    assert len(sessoes) == 1
+    assert win.session is None and win.mgr is None
+    assert win.pages.currentWidget() is win.unlock_page
+    with pytest.raises(OwlVaultError):
+        _ = sessoes[0].index  # fechada: as chaves foram descartadas
+
+
+PIN_NOVO = "961473"
+
+
+class _AlterarPinFalso:
+    """ChangePinDialog que não abre nada: confirma com ``atual`` e ``novo``."""
+
+    atual = PIN
+    novo = PIN_NOVO
+
+    def __init__(self, _parent: object) -> None:
+        pass
+
+    def exec(self) -> QDialog.DialogCode:
+        return QDialog.DialogCode.Accepted
+
+    def take(self) -> tuple[str, str, bool]:
+        return type(self).atual, type(self).novo, False
+
+
+@gui
+def test_bloqueio_pedido_ao_alterar_o_pin_avisa_que_o_pin_mudou(
+    abrir_tela: Callable[..., Tela], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """JAN-4: o PIN muda no disco mesmo com o bloqueio pedido no meio; a tela travada diz isso
+    (sem nomes), para a pessoa não gastar tentativas com o PIN antigo."""
+    tela = abrir_tela()
+    win = tela.win
+    win._unlocked(_criar_perfil(tela))
+    monkeypatch.setattr(owl_window, "ChangePinDialog", _AlterarPinFalso)
+    real = win.store.unlock_with_pin
+    liberar = threading.Event()
+
+    def lento(pin: str) -> profile_mod.ProfileSession:
+        liberar.wait(10)
+        return real(pin)
+
+    monkeypatch.setattr(win.store, "unlock_with_pin", lento)
+    win._change_pin()
+    assert win.runner.busy
+    win.lock_now()
+    liberar.set()
+    _espera(lambda: not win.runner.busy)
+    _descarta()
+    assert win.session is None and win.pages.currentWidget() is win.unlock_page
+    aviso = tela.pergunta("PIN alterado")
+    assert aviso["text"] == "Para entrar, use o PIN novo."
+    monkeypatch.setattr(win.store, "unlock_with_pin", real)
+    win.store.unlock_with_pin(PIN_NOVO).close()  # o PIN novo vale
+
+
+@gui
+def test_seletor_aberto_no_bloqueio_nao_comeca_a_recuperar_a_versao_anterior(
+    abrir_tela: Callable[..., Tela], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """JAN-5: o seletor de pastas nativo não fecha com o bloqueio. Uma pasta escolhida depois
+    dele iniciava o trabalho com o app travado (e um erro aparecia sobre a tela do PIN)."""
+    tela = abrir_tela()
+    win, rec = _destravada_com_pasta(tela, tmp_path)
+    assert win.mgr is not None
+    destino = tmp_path / "destino"
+    destino.mkdir()
+    chamadas: list[object] = []
+    monkeypatch.setattr(win.mgr, "restore_kept", lambda *a, **_k: chamadas.append(a) or [])
+
+    def seletor(*_a: Any, **_k: Any) -> str:
+        win.lock_now()  # Win+L / 5 min sem uso com o seletor aberto
+        return str(destino)  # alguém escolhe uma pasta depois do bloqueio
+
+    monkeypatch.setattr(owl_window, "choose_folder", seletor)
+    win._restore_kept(rec.id)
+    _descarta()
+    assert not win.runner.busy
+    assert chamadas == []
+    assert win.session is None and win.pages.currentWidget() is win.unlock_page
+    assert tela.perguntas == []  # nada de "Não foi possível concluir" na tela travada
+    assert list(destino.iterdir()) == []
+
+
+@gui
+def test_proteger_seletor_que_volta_depois_do_bloqueio_nao_guarda_o_caminho(
+    abrir_tela: Callable[..., Tela], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """JAN-6: '+ Proteger uma pasta…' > Escolher com o app bloqueando no meio: o caminho (com o
+    nome da pasta) ficava no campo oculto e na dica da tela Proteger da janela travada."""
+    tela = abrir_tela()
+    win = _pronta(tela)
+    pasta = tmp_path / "pastas" / NOME
+    pasta.mkdir(parents=True)
+    win._protect()
+    assert win.pages.currentWidget() is win.protect_page
+
+    def seletor(*_a: Any, **_k: Any) -> str:
+        win.lock_now()
+        return str(pasta)
+
+    monkeypatch.setattr(componentes, "choose_folder", seletor)
+    win.protect_page.campo.botao.click()
+    _descarta()
+    assert win.session is None and win.pages.currentWidget() is win.unlock_page
+    assert win.protect_page._path == ""
+    assert win.protect_page.campo.texto() == ""
+    assert not [w for w in win.findChildren(QLineEdit) if NOME in w.text()]
+    assert not [w for w in win.findChildren(QWidget) if NOME in w.toolTip()]
+    assert not [t for t in _textos(win) if NOME in t]
+    assert not win.runner.busy  # nenhuma conferência começou
+
+
+@gui
+def test_proteger_depois_de_bloquear_recusa_caminho_ate_comecar_de_novo(
+    proteger: protect_flow.ProtectPage,
+) -> None:
+    page = proteger
+    caminho = "C:\\Sintetico\\Pastas\\" + NOME
+    page.clear()  # o app bloqueou
+    page.set_path(caminho)
+    assert page._path == ""
+    assert page.campo.texto() == ""
+    assert not page.rodape.primario.isEnabled()
+    page.start(first_time=False)  # desbloqueou e abriu "Proteger uma pasta" de novo
+    page.set_path(caminho)
+    assert page.campo.texto() == caminho
+    assert page.rodape.primario.isEnabled()
+
+
+@gui
+@pytest.mark.parametrize(
+    ("issue", "titulo"),
+    [
+        ("versao_anterior", f"Versão anterior de '{NOME}'"),
+        ("versao_anterior_ilegivel", f"Versão anterior de '{NOME}'"),
+        ("senha_antiga", f"Atualizar '{NOME}'"),
+    ],
+)
+def test_resolver_da_versao_anterior_e_da_senha_antiga_tem_tirar_da_lista(
+    abrir_tela: Callable[..., Tela],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    issue: str,
+    titulo: str,
+) -> None:
+    """JAN-7 (T8: "Todo Resolver tem [Tirar da lista]"): faltava nestes três."""
+    tela = abrir_tela()
+    win, rec = _destravada_com_pasta(tela, tmp_path, TRANCADA)
+    assert win.mgr is not None
+    _versao_mantida(rec, tmp_path / "area" / "anterior-0123456789abcdef", existe=True)
+    _com_vista(win, monkeypatch, rec, issue)
+    monkeypatch.setattr(win.mgr, "kept_only_files", lambda _fid: ["a.txt"])
+    tela.respostas[titulo] = "forget"
+    win._resolve(rec.id)
+    pergunta = tela.pergunta(titulo)
+    assert pergunta["buttons"][-2:] == ["forget", "close"]
+    # a escolha leva à confirmação de 'Tirar da lista' (padrão Cancelar), com o aviso do gerente
+    confirmacao = tela.pergunta(f"Tirar '{NOME}' da lista?")
+    assert confirmacao["primary"] == "cancel"
+    assert win.session is not None and win.session.index.folder(rec.id) is rec  # cancelou
+
+
+SM_UNICA = "frase mestra so deste teste 5521"
+
+
+def _closures_com_segredo(segredos: tuple[str, ...], dono: str) -> list[str]:
+    """Funções vivas (de ``dono``) cuja closure guarda um dos segredos, direto ou numa caixa
+    ``_Segredo`` que ainda não foi esvaziada."""
+    gc.collect()
+    achados: list[str] = []
+    for o in gc.get_objects():
+        if not isinstance(o, types.FunctionType) or dono not in o.__qualname__:
+            continue
+        for cell in o.__closure__ or ():
+            try:
+                v = cell.cell_contents
+            except ValueError:
+                continue
+            if isinstance(v, str) and any(s in v for s in segredos):
+                achados.append(o.__qualname__)
+            elif isinstance(v, owl_window._Segredo) and v._valor:
+                achados.append(f"{o.__qualname__} (caixa cheia)")
+    return achados
+
+
+PIN_NOVO_2 = "583920"
+
+
+@gui
+def test_senha_mestra_e_pin_nao_ficam_no_trabalho_depois_de_bloquear(
+    abrir_tela: Callable[..., Tela], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """JAN-8 (parte da janela): o JobRunner mantém vivo o trabalho de cada operação; a função
+    do desbloqueio guardava a senha mestra ou o PIN digitado, alcançáveis depois de bloquear.
+    Também o PIN novo de 'Alterar PIN' quando o PIN atual está errado (o trabalho falha antes
+    de usá-lo)."""
+    tela = abrir_tela()
+    win = tela.win
+    tela.store.create(SM_UNICA, PIN_NOVO, params=TESTING_PARAMS).close()
+    win._show_unlock()
+    win.unlock_page.configure(master=True)
+    _envia(tela, SM_UNICA)
+    assert win.session is not None
+    win.lock_now()
+    _envia(tela, PIN_NOVO)
+    assert win.session is not None
+    falso = type("AlterarPinErrado", (_AlterarPinFalso,), {"atual": PIN, "novo": PIN_NOVO_2})
+    monkeypatch.setattr(owl_window, "ChangePinDialog", falso)
+    win._change_pin()  # PIN atual errado: falha antes de gravar o novo
+    _espera(lambda: not win.runner.busy)
+    assert tela.pergunta("PIN incorreto")
+    win.lock_now()
+    _descarta()
+    assert win.session is None
+    assert _closures_com_segredo((SM_UNICA, PIN_NOVO, PIN_NOVO_2), "OwlWindow.") == []
+
+
+@gui
+def test_verificar_recusa_cofre_que_nao_e_o_registrado(
+    abrir_tela: Callable[..., Tela], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """estados-9 (parte da janela): 'Verificar arquivos' dizia "Tudo certo" sobre um cofre
+    trocado (backup antigo copiado por cima), que não é o registrado."""
+    tela = abrir_tela()
+    win, rec = _destravada_com_pasta(tela, tmp_path, TRANCADA)
+    _com_vista(win, monkeypatch, rec, COFRE_DIFERENTE)  # o gerente vê o cofre trocado
+    win._verify(rec.id)
+    assert not win.runner.busy  # nada é conferido
+    pergunta = tela.pergunta("Os dados não são os registrados")
+    assert pergunta["text"].startswith("Atenção sintética")  # o texto do gerente
+    assert "Nada foi verificado" in pergunta["text"]
+    # e a linha tem saída: o ⋯ oferece Procurar e Tirar da lista (issue desconhecida, C4)
+    menu = pages.row_menu(win.mgr.view(rec))  # type: ignore[union-attr]
+    assert PROCURAR in menu and TIRAR in menu
+
+
+@gui
+def test_lista_com_nome_longo_nunca_esconde_botoes_e_menu(qapp: QApplication) -> None:
+    """visual-2: nome longo (ou "Aberta — visível…" numa janela estreita) empurrava o botão e o
+    ⋯ de TODAS as linhas para fora da lista, sem rolagem horizontal."""
+    home = pages.HomePage()
+    longo = "Relatórios trimestrais da diretoria financeira " * 3
+    views = [
+        FolderView(_registro(ABERTA, name=longo), "Aberta — visível neste computador", "trancar",
+                   base_action="trancar"),
+        FolderView(_registro(TRANCADA, name="Contratos"), "Trancada", "abrir",
+                   base_action="abrir"),
+        FolderView(_registro(TRANCADA, name="Fotos"), "Precisa de atenção", "resolver",
+                   "A pasta 'Fotos' não está mais em C:\\Users\\Ana\\Documentos\\Particular\\"
+                   "Uma pasta com um nome bem comprido\\Fotos (foi movida, renomeada ou "
+                   "substituída).", issue="nao_encontrada"),
+    ]  # fmt: skip
+    home.set_rows(views, lambda _f, _a: None)
+    home.resize(760, 640)
+    home.show()
+    _descarta()
+    vp = home.list_area.viewport()
+    linhas = home.findChildren(pages.FolderRow)
+    assert len(linhas) == 3
+    for row in linhas:
+        for b in (row.button, row.more):
+            assert b is not None
+            direita = b.mapTo(vp, QPoint(b.width(), 0)).x()
+            assert direita <= vp.width(), (b.text(), direita, vp.width())
+    nome = next(lbl for lbl in _por_nome(linhas[0], "linhaNome"))
+    assert nome.text().endswith("…")  # cortado no fim, inteiro na dica
+    assert nome.toolTip() == longo
+    assert nome.accessibleName() == longo
+    home.hide()
+    home.deleteLater()
+    _descarta()
+
+
+@gui
+def test_desbloqueio_pratica_botoes_um_embaixo_do_outro(qapp: QApplication) -> None:
+    """visual-6: 'Criar nova senha mestra' e 'Usar o PIN desta vez' lado a lado não cabiam no
+    cartão de 460 px e o primeiro saía cortado dos dois lados."""
+    page = pages.UnlockPage()
+    page.configure(master=True, practice=True)
+    for _ in range(3):
+        page.fail("Senha mestra incorreta.")
+    page.resize(980, 700)
+    page.show()
+    _descarta()
+    assert not page.extra.isHidden()
+    for b in (page.new_master, page.once):
+        assert b.width() >= b.sizeHint().width(), b.text()
+    assert page.once.y() > page.new_master.y()  # um embaixo do outro
+    page.hide()
+    page.deleteLater()
+    _descarta()
+
+
+@gui
+def test_trocar_tema_repinta_sombras_e_marca_o_tema_no_menu(
+    abrir_tela: Callable[..., Tela], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """visual-10 (C6, janela principal) e visual-11: a sombra dos cartões (inclusive de diálogos
+    já montados) segue o tema novo; ☰ > Tema mostra qual está em uso."""
+    gravados: list[str] = []
+    monkeypatch.setattr(owl_window, "save_theme", gravados.append)  # nada vai para o registro
+    tela = abrir_tela()
+    win = _pronta(tela)
+    assert win._run(lambda _p, c: c.cancelled or time.sleep(0.2), lambda _r: None, title="X")
+    menu = win.theme_menu
+    acoes = [a for a in menu.actions() if not a.isSeparator()]
+    assert [a.text() for a in acoes] == ["Escuro", "Claro"]
+    assert all(a.isCheckable() for a in acoes)
+    grupo = acoes[0].actionGroup()
+    assert grupo is not None and grupo.isExclusive() and acoes[1].actionGroup() is grupo
+    assert "QMenu::indicator" in menu.styleSheet()  # a marca aparece (o app esconde)
+    try:
+        win._set_theme("light")
+        _descarta()
+        assert gravados == ["light"]
+        assert [a.isChecked() for a in acoes] == [False, True]
+        cor = QColor(current_tokens()["sombra"])
+        efeitos = [
+            w.graphicsEffect()
+            for w in win.findChildren(QWidget)
+            if isinstance(w.graphicsEffect(), QGraphicsDropShadowEffect)
+        ]
+        assert efeitos  # cartões da janela e da tela de progresso
+        assert all(e.color() == cor for e in efeitos)  # type: ignore[union-attr]
+    finally:
+        win._set_theme("dark")
+        _descarta()
+    assert [a.isChecked() for a in acoes] == [True, False]
+    _espera(lambda: not win.runner.busy)
+
+
+_TELA_PEQUENA = r"""
+import json, os, sys, tempfile
+from pathlib import Path
+from PySide6.QtCore import QCoreApplication, QEvent
+from PySide6.QtWidgets import QAbstractButton, QApplication, QLabel, QScrollArea
+from owl_vault.application.protection import ProtectedPaths
+from owl_vault.crypto.kdf import TESTING_PARAMS, TESTING_POLICY
+from owl_vault.ui import owl_window
+from owl_vault.ui.theme import apply_theme
+
+owl_window.saved_theme = lambda: "dark"
+owl_window.save_theme = lambda _k: None
+real = owl_window.LockerManager
+def gerente(session, **kw):
+    kw["protected"] = ProtectedPaths.none()
+    kw["known_folders"] = {}
+    return real(session, **kw)
+owl_window.LockerManager = gerente
+app = QApplication([])
+apply_theme(app, "dark")
+def pump():
+    for _ in range(8):
+        QCoreApplication.processEvents()
+        QCoreApplication.sendPostedEvents(None, int(QEvent.Type.DeferredDelete.value))
+win = owl_window.OwlWindow(("C:\\Windows\\notepad.exe", ""), policy=TESTING_POLICY,
+                           profile_dir=Path(sys.argv[1]))
+area = app.primaryScreen().availableGeometry()
+out = {"area": [area.width(), area.height()], "min": list(win.minimumSize().toTuple()),
+       "hint": list(win.minimumSizeHint().toTuple()), "size": list(win.size().toTuple()),
+       "pos": list(win.pos().toTuple()), "cabe": win.fits_screen(), "cortes": []}
+def em_rolagem(w):
+    p = w.parentWidget()
+    while p is not None:
+        if isinstance(p, QScrollArea):
+            return True
+        p = p.parentWidget()
+    return False
+def cortes(rot):
+    pump()
+    for w in win.findChildren(QLabel) + win.findChildren(QAbstractButton):
+        if not w.isVisible() or em_rolagem(w) or not w.text() or w.objectName() == "mais":
+            continue
+        quer = (w.heightForWidth(w.width()) if isinstance(w, QLabel) and w.wordWrap()
+                else w.minimumSizeHint().height())
+        if w.height() < quer or (isinstance(w, QAbstractButton)
+                                 and w.width() < w.sizeHint().width()):
+            out["cortes"].append([rot, w.text()[:40], w.size().toTuple()])
+    rod = win.rodapes.currentWidget()
+    if rod.mapTo(win, rod.rect().bottomLeft()).y() > win.height():
+        out["cortes"].append([rot, "rodapé fora da janela"])
+win.resize(win.minimumSize())
+win.show()
+cortes("assistente-1")
+win.setup_page._ir(1)
+cortes("assistente-2")
+win.store.create("cavalo correto bateria grampo", "947361", params=TESTING_PARAMS).close()
+win._show_unlock()
+cortes("pin")
+win.unlock_page.configure(master=True, practice=True)
+for _ in range(3):
+    win.unlock_page.fail("Senha mestra incorreta.")
+cortes("pratica")
+win._unlocked(win.store.unlock_with_pin("947361"))
+win.home.set_notice("Uma frase de aviso na lista, comprida o bastante para quebrar a linha.")
+cortes("lista")
+win._protect()
+cortes("proteger")
+print(json.dumps(out))
+"""
+
+
+@gui
+def test_janela_cabe_na_tela_de_notebook_e_nada_fica_espremido(tmp_path: Path) -> None:
+    """visual-3 / visual-5: em 1366x768 a 125% (1093x614 lógicos) a janela abria maior que a
+    área útil (rodapé com o botão principal atrás da barra de tarefas), e o mínimo fixo
+    (760x580) era menor que o layout: lateral e textos espremidos, link do rodapé cortado."""
+    cfg = tmp_path / "tela.json"
+    tela = {"name": "N", "x": 0, "y": 0, "width": 1093, "height": 614, "logicalDpi": 96,
+            "logicalBaseDpi": 96, "dpr": 1.0}  # fmt: skip
+    cfg.write_text(json.dumps({"screens": [tela]}), encoding="utf-8")
+    env = dict(os.environ)
+    env["QT_QPA_PLATFORM"] = "offscreen:configfile=tela.json"  # relativo: o ":" do C: quebra
+    env.setdefault("QT_QPA_FONTDIR", r"C:\Windows\Fonts")
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+    env["PYTHONIOENCODING"] = "utf-8"
+    proc = subprocess.run(  # noqa: S603
+        [sys.executable, "-c", _TELA_PEQUENA, str(tmp_path / "perfil")],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=240,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    out = json.loads(proc.stdout.strip().splitlines()[-1])
+    area_w, area_h = out["area"]
+    barra_de_tarefas = 40  # o offscreen não tem; no Windows a área útil é menor
+    min_w, min_h = out["min"]
+    assert out["hint"] == out["min"]  # o mínimo é o que o layout precisa (nem menos)
+    assert min_w + owl_window.MOLDURA_LARGURA <= area_w
+    assert min_h + owl_window.MOLDURA_ALTURA + barra_de_tarefas <= area_h
+    w, h = out["size"]
+    assert w + owl_window.MOLDURA_LARGURA <= area_w
+    assert h + owl_window.MOLDURA_ALTURA <= area_h
+    assert out["cabe"]
+    assert out["cortes"] == []

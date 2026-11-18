@@ -14,14 +14,16 @@ from __future__ import annotations
 import datetime as _dt
 import itertools
 import os
+import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
-from PySide6.QtCore import Qt, QTimer, Slot
-from PySide6.QtGui import QCloseEvent, QColor, QKeyEvent, QTextCharFormat, QTextCursor
+from PySide6.QtCore import QEvent, Qt, QTimer, Slot
+from PySide6.QtGui import QCloseEvent, QHideEvent, QKeyEvent, QShowEvent
 from PySide6.QtWidgets import (
     QAbstractButton,
     QApplication,
+    QDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -53,9 +55,18 @@ from owl_vault.crypto.kdf import PRODUCTION_POLICY, KdfPolicy
 from owl_vault.domain.errors import CancelledError, OwlVaultError, PreflightError
 from owl_vault.domain.limits import MIN_PASSWORD_LENGTH
 from owl_vault.domain.models import KdfParams
+from owl_vault.domain.names import component_problem
 from owl_vault.storage import winfs
 from owl_vault.ui import strings as S
-from owl_vault.ui.common import fmt_int, fmt_size, open_in_explorer
+from owl_vault.ui.common import (
+    area_util,
+    assinatura_do_tema,
+    colorir_linha,
+    fmt_int,
+    fmt_size,
+    open_in_explorer,
+    repintar_registro,
+)
 from owl_vault.ui.componentes import (
     LARGURA_LATERAL,
     Aviso,
@@ -77,6 +88,7 @@ from owl_vault.ui.componentes import (
     nota,
     repintar,
     rotulo,
+    sombra,
     subtitulo,
     titulo,
     transparente,
@@ -84,13 +96,21 @@ from owl_vault.ui.componentes import (
 from owl_vault.ui.dialogs import CaixaAceite
 from owl_vault.ui.folder_dialogs import ask, inform
 from owl_vault.ui.icon import owl_icon
-from owl_vault.ui.theme import current_tokens
 from owl_vault.ui.workers import JobRunner, QtProgress
 
 #: modos da janela (o assistente de criação e as duas ferramentas)
 CRIAR, ABRIR, CONFERIR = "criar", "abrir", "conferir"
+#: operação que está (ou estava) rodando: a criação/retomada, a conferência do passo 3, a
+#: conferência de uma cópia pronta ("Conferir uma cópia") e a restauração ("Abrir uma cópia")
+OP_CRIAR, OP_CONFERENCIA, OP_CONFERIR, OP_ABRIR = "criar", "conferencia", "conferir", "abrir"
 #: índices das páginas no QStackedWidget (0–3 são os passos do assistente)
 _PAGINA_ABRIR, _PAGINA_CONFERIR = 4, 5
+#: menor tamanho da janela quando a tela tem espaço (numa tela menor, a área útil manda)
+LARGURA_MINIMA, ALTURA_MINIMA = 860, 480
+#: tamanho inicial, reduzido para caber na área útil da tela
+LARGURA_INICIAL, ALTURA_INICIAL = 1040, 860
+#: moldura do Windows (barra de título e bordas) quando o Qt ainda não sabe medir
+_MOLDURA_ALTURA, _MOLDURA_LARGURA = 40, 16
 
 TITULOS_CONFERENCIA = (
     "Espaço em disco",
@@ -207,14 +227,10 @@ def conferencia(plan: CreatePlan, etapas: Sequence[str], livre: int | None) -> l
     if destino:
         linhas.append(Checagem(TITULOS_CONFERENCIA[3], "falhou", _resumo(destino)))
     elif plan.vault_res is not None and plan.test_res is not None:
+        # a conferência não grava nada: a gravação só é testada ao criar (sem ✓ falso)
         fs = plan.vault_fs or "?"
         linhas.append(
-            Checagem(
-                TITULOS_CONFERENCIA[3],
-                "ok",
-                f"O local do cofre existe ({fs}). A gravação é testada de novo no início da "
-                "criação.",
-            )
+            Checagem(TITULOS_CONFERENCIA[3], "", S.COPIA_DESTINO_NAO_TESTADO.format(fs=fs))
         )
     else:
         linhas.append(Checagem(TITULOS_CONFERENCIA[3], "", _NAO_CONFERIDO))
@@ -257,18 +273,110 @@ class _Registro:
         self._d.warning(message)
 
 
-def mensagem_de_erro(exc: object) -> str:
+class _Senha:
+    """Senha da cópia entregue UMA vez ao trabalho da thread.
+
+    A função do trabalho guarda só esta caixa, não o texto: o ``JobRunner`` mantém o trabalho
+    vivo depois do fim e, sem isto, a senha continuaria alcançável depois de bloquear (C1).
+    Ao ser tomada, ela sai daqui."""
+
+    __slots__ = ("_valor",)
+
+    def __init__(self, valor: str) -> None:
+        self._valor = valor
+
+    def tomar(self) -> str:
+        valor, self._valor = self._valor, ""
+        return valor
+
+
+#: o motor sugere "Retomar" em toda falha de gravação na criação; sem cofre incompleto não há
+#: o que retomar e a frase vira só o motivo
+_PREFIXO_RETOMAR = "Criação interrompida (use 'Retomar')"
+
+
+def _sobre_a_pasta_nova(destino: str, retomavel: bool) -> str:
+    """O que ficou na pasta nova de uma restauração que parou (vazio: nada foi gravado)."""
+    if not destino:
+        return ""
+    nome = os.path.basename(destino.rstrip("\\/")) or destino
+    modelo = S.COPIA_RESTAURACAO_INCOMPLETA if retomavel else S.COPIA_RESTAURACAO_TALVEZ
+    return modelo.format(nome=nome)
+
+
+def mensagem_de_erro(
+    exc: object, operacao: str = "", *, ha_incompleto: bool = False, destino: str = ""
+) -> str:
+    """Texto da falha, verdadeiro para a operação (``OP_*``).
+
+    Criação: só manda usar "Retomar criação interrompida" quando ``ha_incompleto`` (existe
+    um cofre incompleto para retomar). Restauração: ``destino`` é a pasta nova quando ela
+    ficou com arquivos; ``ha_incompleto`` diz se ela pode ser continuada (abrir de novo com o
+    mesmo nome)."""
+    criar = operacao == OP_CRIAR
+    pasta_nova = _sobre_a_pasta_nova(destino, ha_incompleto) if operacao == OP_ABRIR else ""
     if isinstance(exc, CancelledError):
+        if operacao == OP_CONFERENCIA:
+            return S.COPIA_CONFERENCIA_CANCELADA
+        if operacao == OP_CONFERIR:
+            return S.COPIA_VERIFICACAO_CANCELADA
+        if operacao == OP_ABRIR:
+            if pasta_nova:
+                return f"{S.COPIA_RESTAURACAO_PARADA} {pasta_nova}"
+            return S.COPIA_RESTAURACAO_PARADA_ANTES
+        if criar and not ha_incompleto:
+            return S.COPIA_CANCELADA_SEM_RETOMADA
         return S.COPIA_CANCELADA
     if isinstance(exc, OwlVaultError):
-        return str(exc)
-    return (
-        f"Erro inesperado ({type(exc).__name__}): {exc}. Nenhum arquivo da origem foi "
-        "alterado. Se for uma criação, você pode tentar 'Retomar criação interrompida'."
-    )
+        texto = str(exc)
+        if criar and not ha_incompleto and texto.startswith(_PREFIXO_RETOMAR):
+            texto = S.COPIA_NAO_CRIOU + texto[len(_PREFIXO_RETOMAR) :]
+    else:
+        texto = (
+            f"Erro inesperado ({type(exc).__name__}): {exc}. Nenhum arquivo da origem foi alterado."
+        )
+        if criar and ha_incompleto:
+            texto += " Você pode tentar 'Retomar criação interrompida'."
+    if pasta_nova:
+        texto += " " + pasta_nova
+    return texto
+
+
+def _data_e_hora(rotulo_motor: str) -> tuple[str, str, bool] | None:
+    """Rótulo de data do motor → (data, hora, é_da_conclusão) no horário local.
+
+    A criação devolve "dd/mm/aaaa hh:mm" (hora local da cópia); a retomada que só limpa um
+    cofre já concluído devolve a conclusão em ISO UTC ("2026-11-17T15:03:22Z")."""
+    local_ = re.fullmatch(r"\s*(\d{2}/\d{2}/\d{4}) (\d{2}:\d{2})\s*", rotulo_motor)
+    if local_ is not None:
+        return local_.group(1), local_.group(2), False
+    try:
+        momento = _dt.datetime.fromisoformat(rotulo_motor.strip())
+    except ValueError:
+        return None
+    if momento.tzinfo is None:
+        momento = momento.replace(tzinfo=_dt.UTC)
+    local = momento.astimezone()
+    return local.strftime("%d/%m/%Y"), local.strftime("%H:%M"), True
 
 
 # --- peças da tela -------------------------------------------------------------------------
+
+
+def _apagar_textos(raiz: QWidget) -> None:
+    """Esvazia os textos (e dicas) de ``raiz`` e dos filhos antes de o widget ser descartado:
+    o ``deleteLater`` só roda no próximo giro e o bloqueio não pode deixar caminhos para trás."""
+    for w in [raiz, *raiz.findChildren(QWidget)]:
+        if isinstance(w, QLabel):
+            definir = getattr(w, "set_full_text", None)  # RotuloCortado guarda o texto inteiro
+            if callable(definir):
+                definir("")
+            w.setText("")
+        elif isinstance(w, QPlainTextEdit):
+            w.setPlainText("")
+        elif isinstance(w, QLineEdit):
+            w.setText("")
+        w.setToolTip("")
 
 
 class PainelTrabalho(QWidget):
@@ -291,6 +399,7 @@ class PainelTrabalho(QWidget):
         self.log = QPlainTextEdit()
         self.log.setObjectName("log")
         self.log.setReadOnly(True)
+        self.log.setUndoRedoEnabled(False)  # o registro não guarda histórico de edição
         self.log.setMaximumBlockCount(5000)
         self.log.setMinimumHeight(altura_log)
         self.log.setPlaceholderText("Mensagens desta sessão (não são gravadas em disco).")
@@ -303,17 +412,27 @@ class PainelTrabalho(QWidget):
         self._feito = [0, 0]
 
     def escrever(self, mensagem: str, tipo: str = "") -> None:
-        """Acrescenta uma linha; ``tipo`` "aviso"/"erro"/"ok" pinta com o token do tema."""
+        """Acrescenta uma linha; ``tipo`` "aviso"/"erro"/"ok" pinta com o token do tema (e
+        volta a pintar com o tema novo quando ele muda: ``repintar``)."""
         stamp = _dt.datetime.now().strftime("%H:%M:%S")
         self.log.appendPlainText(f"[{stamp}] {mensagem}")
-        fmt = QTextCharFormat()
-        token = {"aviso": "warn", "erro": "danger", "ok": "ok"}.get(tipo)
-        if token is not None:
-            fmt.setForeground(QColor(current_tokens()[token]))
-        cur = QTextCursor(self.log.document().lastBlock())
-        cur.movePosition(QTextCursor.MoveOperation.StartOfBlock)
-        cur.movePosition(QTextCursor.MoveOperation.EndOfBlock, QTextCursor.MoveMode.KeepAnchor)
-        cur.setCharFormat(fmt)
+        token = {"aviso": "warn", "erro": "danger", "ok": "ok"}.get(tipo, "")
+        colorir_linha(self.log.document().lastBlock(), token)
+
+    def repintar(self) -> None:
+        """O tema mudou: as linhas coloridas passam para as cores do tema novo."""
+        repintar_registro(self.log)
+
+    def esvaziar(self) -> None:
+        """Apaga o registro, a etapa e a barra (bloqueio: nenhum nome fica na tela)."""
+        self.log.setPlainText("")
+        self.log.setMaximumHeight(_SEM_LIMITE)
+        self._nome = "Pronto."
+        self._totais = (0, 0)
+        self._feito = [0, 0]
+        self.etapa.setText("Pronto.")
+        self.barra.setRange(0, 1000)
+        self.barra.setValue(0)
 
     def reiniciar(self, texto: str = "Preparando…") -> None:
         self.log.setMaximumHeight(_SEM_LIMITE)
@@ -373,6 +492,7 @@ class Resultado(QWidget):
             item = self._lay.takeAt(0)
             w = item.widget() if item is not None else None
             if w is not None:
+                _apagar_textos(w)  # caminhos somem já, não só quando o Qt apagar o widget
                 w.hide()
                 w.deleteLater()
         self.linha = None
@@ -393,6 +513,8 @@ class Resultado(QWidget):
         self._lay.addWidget(self.linha)
         if texto:
             self.corpo = QLabel(texto)
+            # o texto traz nomes de pastas e de arquivos: nunca vira HTML (copia-10)
+            self.corpo.setTextFormat(Qt.TextFormat.PlainText)
             self.corpo.setObjectName("resultadoTexto")
             self.corpo.setWordWrap(True)
             self.corpo.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -448,8 +570,8 @@ class CopyWindow(QMainWindow):
         self._protected = protected
         self.setWindowTitle(S.COPIA_TITULO_JANELA)
         self.setWindowIcon(owl_icon())
-        self.resize(1040, 860)
-        self.setMinimumSize(860, 620)
+        self.resize(LARGURA_INICIAL, ALTURA_INICIAL)
+        self.setMinimumSize(LARGURA_MINIMA, ALTURA_MINIMA)  # showEvent ajusta à área útil
         self.runner = JobRunner(self)
         self.session_sources: list[str] = []
         self._auto_test: str | None = None
@@ -465,6 +587,16 @@ class CopyWindow(QMainWindow):
         self._ao_terminar: Callable[[object], None] | None = None
         self._ao_falhar: Callable[[object], None] | None = None
         self._fechar_depois = False
+        #: operação rodando (OP_*): cada uma tem o seu texto de falha/cancelamento
+        self._operacao = ""
+        #: destino da restauração em andamento (para dizer se a pasta nova ficou incompleta)
+        self._destino_abrir = ""
+        #: o app foi bloqueado (C1): nada mais é escrito na tela até ela ser mostrada de novo
+        self._bloqueada = False
+        #: um trabalho foi interrompido pelo bloqueio e ainda não terminou de parar
+        self._parado_pelo_bloqueio = False
+        self._tema = assinatura_do_tema()
+        self._ajustou_tela = False
         # etapa, total de itens e itens feitos da pré-verificação (vão para o rodapé)
         self._pf_nome = ""
         self._pf_total = 0
@@ -494,14 +626,22 @@ class CopyWindow(QMainWindow):
         self.paginas.addWidget(self._pagina_conferir())
         palco.addWidget(self.paginas, 1)
         self.lateral, ll = transparente()
-        self.lateral.setFixedWidth(LARGURA_LATERAL)
         ll.setSpacing(20)
         self.resumo = CartaoLateral(S.COPIA_SECAO_LATERAL)
         self.dica = Dica()
         ll.addWidget(self.resumo)
         ll.addWidget(self.dica)
         ll.addStretch(1)
-        palco.addWidget(self.lateral, 0)
+        # a lateral rola numa janela baixa (como o cartão): nada é espremido nem cortado
+        self.rolagem_lateral = QScrollArea()
+        self.rolagem_lateral.setObjectName("transparente")
+        self.rolagem_lateral.setWidgetResizable(True)
+        self.rolagem_lateral.setFrameShape(QFrame.Shape.NoFrame)
+        self.rolagem_lateral.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.rolagem_lateral.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.rolagem_lateral.setFixedWidth(LARGURA_LATERAL)
+        self.rolagem_lateral.setWidget(self.lateral)
+        palco.addWidget(self.rolagem_lateral, 0)
         lay.addLayout(palco, 1)
         externo.addWidget(corpo, 1)
 
@@ -526,6 +666,9 @@ class CopyWindow(QMainWindow):
         b.warning.connect(lambda m: self._escrever("AVISO: " + m, "aviso"))
         self.runner.done.connect(self._on_done)
         self.runner.error.connect(self._on_error)
+        # um seletor de pastas aberto quando o app bloqueou devolve o caminho depois: não fica
+        for campo in self._campos_caminho():
+            campo.escolhido.connect(lambda _p: self._descartar_caminho_se_bloqueada())
         if winfs.is_elevated():
             self.painel_criar.escrever(
                 "AVISO: o Owl Vault está rodando como administrador; isso não é necessário.",
@@ -749,8 +892,21 @@ class CopyWindow(QMainWindow):
         return frame
 
     @staticmethod
-    def _nome_restaurado() -> str:
-        return _dt.datetime.now().strftime("Restaurado-%Y%m%d-%H%M")
+    def _nome_restaurado(pasta: str = "") -> str:
+        """Nome genérico da pasta nova; com ``pasta``, um que ainda não existe ali (-2, -3…):
+        logo depois de abrir uma cópia, o nome do mesmo minuto já está em uso."""
+        base = _dt.datetime.now().strftime("Restaurado-%Y%m%d-%H%M")
+        if not pasta:
+            return base
+        nome = base
+        for n in range(2, 1000):
+            try:
+                if not os.path.lexists(winfs.to_extended(os.path.join(pasta, nome))):
+                    return nome
+            except (OSError, ValueError, OwlVaultError):
+                return nome
+            nome = f"{base}-{n}"
+        return nome
 
     # ------------------------------------------------------------------ estado da tela
     def _entradas(self) -> list[QWidget]:
@@ -925,6 +1081,12 @@ class CopyWindow(QMainWindow):
                 self._retomada_ok if self.retomando else (self._plan is not None and self._plan.ok)
             )
             p.setEnabled(pronto and aceites)
+            if pronto:  # o rodapé diz o que falta de verdade (os avisos já marcados ou não)
+                if aceites:
+                    texto = S.COPIA_PRONTO_RETOMAR if self.retomando else S.COPIA_PRONTO_CRIAR
+                else:
+                    texto = S.COPIA_MARQUE_AVISOS
+                self.rodape.definir_estado(texto)
             return
         p.setEnabled(True)
 
@@ -950,6 +1112,7 @@ class CopyWindow(QMainWindow):
         if self.runner.busy or modo == self.modo:
             return
         self.modo = modo
+        self._ocultar_senhas()
         self._mostrar()
 
     def _alterar(self, campo: QWidget) -> None:
@@ -957,12 +1120,36 @@ class CopyWindow(QMainWindow):
             return
         self.passo = 0
         self.criacao = "" if self.criacao == "falhou" else self.criacao
+        self._ocultar_senhas()
         self._mostrar()
         campo.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def _ir_passo(self, passo: int) -> None:
         self.passo = passo
+        self._ocultar_senhas()
         self._mostrar()
+
+    def _campos_senha(self) -> list[CampoSenha]:
+        return [self.c_senha, self.r_senha, self.v_senha]
+
+    def _ocultar_senhas(self) -> None:
+        """Trocar de passo ou de tela volta a esconder o que foi digitado ("Mostrar")."""
+        for c in self._campos_senha():
+            if c.echoMode() != QLineEdit.EchoMode.Password:
+                c.setEchoMode(QLineEdit.EchoMode.Password)
+                c.mostrar.setText("Mostrar")
+
+    def _descartar_senhas(self) -> None:
+        """Apaga as senhas dos campos (``setText("")`` também descarta o desfazer). Sem a
+        senha, a conferência pronta não pode virar criação: o assistente volta ao passo 2."""
+        for c in self._campos_senha():
+            c.limpar()
+        self.c_conf.setText("")
+        if self.modo == CRIAR and self.passo == 2 and not self.runner.busy:
+            self.passo = 1
+            self._plan = None
+            self._retomada_ok = False
+            self._mostrar()
 
     def _voltar(self) -> None:
         if self.runner.busy:
@@ -979,7 +1166,7 @@ class CopyWindow(QMainWindow):
             self._ir_passo(self.passo - 1)
 
     def _primario(self) -> None:
-        if self.runner.busy or not self.rodape.primario.isEnabled():
+        if self._bloqueada or self.runner.busy or not self.rodape.primario.isEnabled():
             return
         if self.modo == ABRIR:
             self._abrir_copia()
@@ -1024,7 +1211,7 @@ class CopyWindow(QMainWindow):
         contém a sugestão automática (uma pasta escolhida pelo usuário é mantida)."""
         src = self.c_origem.texto()
         current = self.c_teste.texto()
-        if not src or (current and current != self._auto_test):
+        if self._bloqueada or not src or (current and current != self._auto_test):
             return
         try:
             res = winfs.resolve(src)
@@ -1057,9 +1244,13 @@ class CopyWindow(QMainWindow):
         if vault is None:
             mostrar_erro(self.erro_pastas, "Informe o local e o nome do cofre.")
             return None
+        problema = component_problem(self.c_nome.text().strip())
+        if problema is not None:
+            mostrar_erro(self.erro_pastas, S.COPIA_NOME_INVALIDO.format(problema=problema))
+            return None
         try:
             status = inspect_vault_dir(vault)
-        except OwlVaultError as exc:
+        except (OwlVaultError, OSError) as exc:
             mostrar_erro(self.erro_pastas, f"Local do cofre: {exc}")
             return None
         if retomada and status.kind != "vault-incomplete":
@@ -1113,6 +1304,11 @@ class CopyWindow(QMainWindow):
         mostrar_erro(self.erro_senha, "")
         self._plan = None
         self._retomada_ok = False
+        # cada conferência pede os aceites de novo: os de outra origem, outro cofre ou outra
+        # mídia não valem para esta (e um duplo clique não cai em "Criar"/"Retomar" sem a
+        # pessoa ver a conferência)
+        for c in self.aceites_todos:
+            c.setChecked(False)
         self._ir_passo(2)
         if self.retomando:
             self._conferir_retomada()
@@ -1123,6 +1319,7 @@ class CopyWindow(QMainWindow):
     def _definir_linhas(self, linhas: Sequence[Checagem]) -> None:
         for w in self.linhas:
             self.lista_checagens.removeWidget(w)
+            _apagar_textos(w)
             w.hide()
             w.deleteLater()
         self.linhas = []
@@ -1147,6 +1344,9 @@ class CopyWindow(QMainWindow):
 
     def _rodar_conferencia(self) -> None:
         self._plan = None
+        # a mídia pode ter sido trocada (mesma letra de unidade): o aceite de FAT/exFAT vale
+        # para uma conferência só
+        self.aceite_fat.setChecked(False)
         self.aceite_fat.hide()
         self._definir_linhas([Checagem(t, "", "Conferindo…") for t in TITULOS_CONFERENCIA])
         self._definir_detalhes([])
@@ -1170,7 +1370,14 @@ class CopyWindow(QMainWindow):
                     livre = None
             return plan, reg.etapas, livre
 
-        self._rodar(job, self._depois_conferencia, self._falhou_conferencia, None, "Conferindo…")
+        self._rodar(
+            job,
+            self._depois_conferencia,
+            self._falhou_conferencia,
+            None,
+            "Conferindo…",
+            OP_CONFERENCIA,
+        )
 
     def _depois_conferencia(self, resultado: object) -> None:
         assert isinstance(resultado, tuple)
@@ -1183,11 +1390,11 @@ class CopyWindow(QMainWindow):
         if plan.blockers:
             self.rodape.definir_estado("Corrija os itens marcados e confira de novo.", "erro")
         else:
-            self.rodape.definir_estado("Conferência concluída. Marque os avisos para continuar.")
+            self.rodape.definir_estado(S.COPIA_MARQUE_AVISOS)
 
     def _falhou_conferencia(self, exc: object) -> None:
         self._plan = None
-        msg = mensagem_de_erro(exc)
+        msg = mensagem_de_erro(exc, OP_CONFERENCIA)
         self._definir_linhas(
             [Checagem(t, "", "Não conferido.") for t in TITULOS_CONFERENCIA]
             + [Checagem("A conferência parou", "falhou", msg)]
@@ -1199,6 +1406,7 @@ class CopyWindow(QMainWindow):
         tela antiga perguntava (aceites e, se for o caso, o aviso de FAT/exFAT)."""
         self._retomada_ok = False
         self._definir_detalhes([])
+        self.aceite_fat.setChecked(False)
         self.aceite_fat.hide()
         vault = self._caminho_cofre()
         linhas: list[Checagem] = []
@@ -1222,7 +1430,7 @@ class CopyWindow(QMainWindow):
                 res = winfs.resolve(vault)
                 self.aceite_fat.setVisible(winfs.is_fat(res.fs_name))
                 self._retomada_ok = True
-        except OwlVaultError as exc:
+        except (OwlVaultError, OSError) as exc:
             linhas.append(Checagem("Local do cofre", "falhou", str(exc)))
         linhas.append(
             Checagem(
@@ -1237,14 +1445,26 @@ class CopyWindow(QMainWindow):
         self._atualizar_primario()
 
     # ------------------------------------------------------------------ passo 4 — criar
+    def _senha_sumiu(self) -> bool:
+        """A senha foi descartada (janela fechada ou app bloqueado): volta ao passo 2."""
+        if self.c_senha.text():
+            return False
+        self._plan = None
+        self._retomada_ok = False
+        self._ir_passo(1)
+        mostrar_erro(self.erro_senha, S.COPIA_DIGITE_DE_NOVO)
+        return True
+
     def _iniciar_criacao(self) -> None:
+        if self._senha_sumiu():
+            return
         if self.retomando:
             self._iniciar_retomada_job()
             return
         plan = self._plan
         if plan is None or plan.blockers:
             return
-        password = self.c_senha.tomar()
+        senha = _Senha(self.c_senha.tomar())
         self.c_conf.setText("")  # setText também descarta o histórico de desfazer
         self.session_sources.append(plan.source_ext)
         fat_ack = plan.needs_fat_ack and self.aceite_fat.isChecked()
@@ -1254,7 +1474,7 @@ class CopyWindow(QMainWindow):
             return create_vault(
                 plan.source_ext,
                 plan.vault_ext,
-                password,
+                senha.tomar(),
                 plan=plan,
                 kdf_params=params,
                 kdf_policy=policy,
@@ -1271,7 +1491,7 @@ class CopyWindow(QMainWindow):
         src = self.c_origem.texto()
         if vault is None or not self._retomada_ok:
             return
-        password = self.c_senha.tomar()
+        senha = _Senha(self.c_senha.tomar())
         self.c_conf.setText("")
         self.session_sources.append(src)
         fat_ack = not self.aceite_fat.isHidden() and self.aceite_fat.isChecked()
@@ -1281,7 +1501,7 @@ class CopyWindow(QMainWindow):
             return resume_create(
                 vault,
                 src,
-                password,
+                senha.tomar(),
                 kdf_policy=policy,
                 protected=protected,
                 fat_acknowledged=fat_ack,
@@ -1298,7 +1518,19 @@ class CopyWindow(QMainWindow):
         mostrar_erro(self.erro_criar, "")
         self.resultado_criar.limpar()
         self.passo = 3
-        self._rodar(job, self._depois_criar, self._falhou_criar, self.painel_criar, "Criando…")
+        self._rodar(
+            job, self._depois_criar, self._falhou_criar, self.painel_criar, "Criando…", OP_CRIAR
+        )
+
+    @staticmethod
+    def _texto_fim(snapshot_label: str) -> str:
+        """Texto final da criação, com a data/hora local certa (ou sem data, se o motor não
+        mandou uma data reconhecível)."""
+        quando = _data_e_hora(snapshot_label)
+        if quando is None:
+            return S.COPIA_FIM_SEM_DATA
+        data, hora, da_conclusao = quando
+        return (S.COPIA_FIM_CONCLUIDO if da_conclusao else S.FIM_TEXTO).format(data=data, hora=hora)
 
     def _depois_criar(self, result: object) -> None:
         assert isinstance(result, CreateResult)
@@ -1307,15 +1539,18 @@ class CopyWindow(QMainWindow):
         self._plan = None
         ok = result.status == "success"
         self.p4_titulo.setText(S.COPIA_P4_TITULO_OK if ok else S.COPIA_P4_TITULO_DIVERGENCIAS)
-        data, _sep, hora = result.snapshot_label.partition(" ")
         if ok:
-            texto = S.FIM_TEXTO.format(data=data, hora=hora)
+            texto = self._texto_fim(result.snapshot_label)
             if result.removable_media:
                 texto += " " + S.COPIA_MIDIA_REMOVIVEL
         else:
             texto = result.message
+        mensagem = result.message
+        quando = _data_e_hora(result.snapshot_label)
+        if quando is not None and quando[2]:  # ISO UTC do motor → data e hora locais
+            mensagem = mensagem.replace(result.snapshot_label, f"{quando[0]} {quando[1]}")
         self.painel_criar.concluir("Concluído.", ok=True)
-        self.painel_criar.escrever(result.message, "ok" if ok else "aviso")
+        self.painel_criar.escrever(mensagem, "ok" if ok else "aviso")
         self.resultado_criar.mostrar(
             "Cópia criada e verificada" if ok else "Cópia criada, com divergências",
             "ok" if ok else "aviso",
@@ -1333,7 +1568,7 @@ class CopyWindow(QMainWindow):
 
     def _falhou_criar(self, exc: object) -> None:
         self.criacao = "falhou"
-        msg = mensagem_de_erro(exc)
+        msg = mensagem_de_erro(exc, OP_CRIAR, ha_incompleto=self._ha_incompleto())
         self.p4_titulo.setText(S.COPIA_P4_TITULO_PAROU)
         self.painel_criar.concluir("A criação parou.", ok=False)
         self.painel_criar.escrever(
@@ -1366,21 +1601,32 @@ class CopyWindow(QMainWindow):
 
     # ------------------------------------------------------------------ conferir uma cópia
     def _conferir_copia(self) -> None:
+        # o resultado anterior sai antes de validar: um erro nunca aparece junto de um ✓ velho
         mostrar_erro(self.erro_conferir, "")
+        self.resultado_conferir.limpar()
+        self.painel_conferir.hide()
+        self.rodape.definir_estado("Pronto.")
         vault, password = self.v_copia.texto(), self.v_senha.text()
         if not vault or not password:
             mostrar_erro(self.erro_conferir, "Informe o cofre e a senha.")
             return
         self.v_senha.limpar()
-        self.resultado_conferir.limpar()
         self.painel_conferir.show()
         policy = self._policy
+        senha = _Senha(password)
 
         def job(progress: QtProgress, cancel: CancelToken) -> VerifyReport:
-            return verify_vault(vault, password, policy=policy, progress=progress, cancel=cancel)
+            return verify_vault(
+                vault, senha.tomar(), policy=policy, progress=progress, cancel=cancel
+            )
 
         self._rodar(
-            job, self._depois_conferir, self._falhou_conferir, self.painel_conferir, "Conferindo…"
+            job,
+            self._depois_conferir,
+            self._falhou_conferir,
+            self.painel_conferir,
+            "Conferindo…",
+            OP_CONFERIR,
         )
 
     def _depois_conferir(self, report: object) -> None:
@@ -1433,7 +1679,7 @@ class CopyWindow(QMainWindow):
         )
 
     def _falhou_conferir(self, exc: object) -> None:
-        msg = mensagem_de_erro(exc)
+        msg = mensagem_de_erro(exc, OP_CONFERIR)
         self.painel_conferir.concluir("A conferência parou.", ok=False)
         self.painel_conferir.escrever(f"Erro: {msg}", "erro")
         mostrar_erro(self.erro_conferir, msg)
@@ -1441,7 +1687,11 @@ class CopyWindow(QMainWindow):
 
     # ------------------------------------------------------------------ abrir uma cópia
     def _abrir_copia(self) -> None:
+        # o resultado anterior sai antes de validar: um erro nunca aparece junto de um ✓ velho
         mostrar_erro(self.erro_abrir, "")
+        self.resultado_abrir.limpar()
+        self.painel_abrir.hide()
+        self.rodape.definir_estado("Pronto.")
         vault, password = self.r_copia.texto(), self.r_senha.text()
         parent, name = self.r_local.texto(), self.r_nome.text().strip()
         if not vault or not password or not parent or not name:
@@ -1449,12 +1699,16 @@ class CopyWindow(QMainWindow):
                 self.erro_abrir, "Informe o cofre, a senha, o destino e o nome da pasta nova."
             )
             return
+        problema = component_problem(name)
+        if problema is not None:
+            mostrar_erro(self.erro_abrir, S.COPIA_NOME_NOVO_INVALIDO.format(problema=problema))
+            return
         dest = os.path.join(parent, name)
         allow_resume = False
         try:
             state = inspect_destination(dest)
-        except OwlVaultError as exc:
-            mostrar_erro(self.erro_abrir, str(exc))
+        except (OwlVaultError, OSError) as exc:
+            mostrar_erro(self.erro_abrir, S.COPIA_DESTINO_ILEGIVEL.format(motivo=exc))
             return
         if state == "nonempty":
             mostrar_erro(
@@ -1470,19 +1724,19 @@ class CopyWindow(QMainWindow):
                 "onde parou? (arquivos existentes são conferidos pelo hash e nunca sobrescritos)",
                 [("Continuar de onde parou", "sim"), ("Cancelar", "nao")],
             )
-            if escolha != "sim":
+            if escolha != "sim" or self._bloqueada:
                 return
             allow_resume = True
-        password = self.r_senha.tomar()
+        senha = _Senha(self.r_senha.tomar())
         sources = list(self.session_sources)
         policy, protected = self._policy, self._protected
-        self.resultado_abrir.limpar()
+        self._destino_abrir = dest
         self.painel_abrir.show()
 
         def job(progress: QtProgress, cancel: CancelToken) -> RestoreReport:
             return restore_vault(
                 vault,
-                password,
+                senha.tomar(),
                 dest,
                 policy=policy,
                 protected=protected,
@@ -1492,7 +1746,9 @@ class CopyWindow(QMainWindow):
                 cancel=cancel,
             )
 
-        self._rodar(job, self._depois_abrir, self._falhou_abrir, self.painel_abrir, "Abrindo…")
+        self._rodar(
+            job, self._depois_abrir, self._falhou_abrir, self.painel_abrir, "Abrindo…", OP_ABRIR
+        )
 
     def _depois_abrir(self, report: object) -> None:
         assert isinstance(report, RestoreReport)
@@ -1528,13 +1784,23 @@ class CopyWindow(QMainWindow):
             ],
             [mostrar_pasta],
         )
-        self.r_nome.setText(self._nome_restaurado())
+        # sugere um nome que ainda não existe (o do mesmo minuto acabou de ser usado)
+        self.r_nome.setText(self._nome_restaurado(self.r_local.texto()))
         self.rodape.definir_estado(
             "Pronto." if report.ok else "Restauração parcial.", "" if report.ok else "erro"
         )
 
     def _falhou_abrir(self, exc: object) -> None:
-        msg = mensagem_de_erro(exc)
+        destino = self._destino_abrir
+        com_arquivos, retomavel = "", False
+        if destino:
+            try:
+                estado = inspect_destination(destino)
+            except (OwlVaultError, OSError):
+                estado = "?"  # não deu para olhar: avisa que pode ter ficado pela metade
+            if estado in ("resumable", "nonempty", "?"):
+                com_arquivos, retomavel = destino, estado == "resumable"
+        msg = mensagem_de_erro(exc, OP_ABRIR, ha_incompleto=retomavel, destino=com_arquivos)
         self.painel_abrir.concluir("A restauração parou.", ok=False)
         self.painel_abrir.escrever(f"Erro: {msg}", "erro")
         mostrar_erro(self.erro_abrir, msg)
@@ -1548,10 +1814,14 @@ class CopyWindow(QMainWindow):
         ao_falhar: Callable[[object], None],
         painel: PainelTrabalho | None,
         texto: str,
+        operacao: str = "",
     ) -> None:
+        if self._bloqueada:
+            return  # o app foi bloqueado: nada começa (o job e a senha são descartados)
         self._ao_terminar = ao_terminar
         self._ao_falhar = ao_falhar
         self._painel = painel
+        self._operacao = operacao
         self._pf_nome, self._pf_total, self._pf_feito = "", 0, 0
         if painel is not None:
             painel.reiniciar()
@@ -1560,10 +1830,14 @@ class CopyWindow(QMainWindow):
         self._mostrar()
 
     def _escrever(self, mensagem: str, tipo: str = "") -> None:
+        if self._bloqueada:
+            return  # bloqueado: nenhuma mensagem (pode ter nome de arquivo) volta à tela
         (self._painel or self.painel_criar).escrever(mensagem, tipo)
 
     @Slot(str, object, object)
     def _on_stage(self, name: str, total_bytes: object, total_items: object) -> None:
+        if self._bloqueada:
+            return
         tb = total_bytes if isinstance(total_bytes, int) else 0
         ti = total_items if isinstance(total_items, int) else 0
         if self._painel is not None:
@@ -1574,6 +1848,8 @@ class CopyWindow(QMainWindow):
 
     @Slot(object, object)
     def _on_advance(self, nbytes: object, nitems: object) -> None:
+        if self._bloqueada:
+            return
         nb = nbytes if isinstance(nbytes, int) else 0
         ni = nitems if isinstance(nitems, int) else 0
         if self._painel is not None:
@@ -1593,14 +1869,19 @@ class CopyWindow(QMainWindow):
         self.runner.cancel()
         self._escrever("Cancelamento solicitado: a operação vai parar no próximo ponto seguro.")
         self.cancelar.setEnabled(False)
-        self.rodape.definir_estado("Parando num ponto seguro…", "trabalhando")
+        if not self._bloqueada:
+            self.rodape.definir_estado("Parando num ponto seguro…", "trabalhando")
 
     @Slot(object)
     def _on_done(self, result: object) -> None:
         handler = self._ao_terminar
         self._ao_terminar = self._ao_falhar = None
         self._painel = None
-        if handler is not None:
+        if self._parado_pelo_bloqueio:
+            # o resultado (com caminhos) não volta à tela; só o fato, sem nomes
+            self._parado_pelo_bloqueio = False
+            self.rodape.definir_estado(S.COPIA_BLOQUEIO_TERMINOU)
+        elif handler is not None:
             handler(result)
         self._depois_do_trabalho()
 
@@ -1609,31 +1890,199 @@ class CopyWindow(QMainWindow):
         handler = self._ao_falhar
         self._ao_terminar = self._ao_falhar = None
         self._painel = None
-        if handler is not None:
+        if self._parado_pelo_bloqueio:
+            self._parado_pelo_bloqueio = False
+            self.rodape.definir_estado(S.COPIA_BLOQUEIO_PAROU, "erro")
+        elif handler is not None:
             handler(exc)
         else:
-            self.rodape.definir_estado(mensagem_de_erro(exc), "erro")
+            self.rodape.definir_estado(mensagem_de_erro(exc, self._operacao), "erro")
         self._depois_do_trabalho()
 
     def _depois_do_trabalho(self) -> None:
+        self._operacao = ""
+        self._destino_abrir = ""
         self._mostrar()
         if self._fechar_depois:
             self._fechar_depois = False
             QTimer.singleShot(0, self.close)
 
+    # ------------------------------------------------------------------ bloqueio (C1)
+    def bloquear(self) -> None:
+        """O app foi bloqueado (Bloquear agora, inatividade, Win+L, suspensão): contrato C1.
+
+        Ao voltar, nenhuma senha fica em campo (``CampoSenha.limpar``, "Mostrar" desligado) e
+        nenhum caminho ou nome de pasta fica em widget. Sem trabalho rodando, a janela fecha
+        já. Com trabalho, pede o cancelamento no próximo ponto seguro, some da tela e fecha
+        sozinha quando ele parar — sem perguntar nada. Pode ser chamado a qualquer momento,
+        com a janela visível ou não."""
+        self._bloqueada = True
+        # perguntas abertas por esta janela ("Continuar a restauração?", "Parar e fechar?")
+        for dlg in self.findChildren(QDialog):
+            if dlg.isVisible():
+                dlg.reject()
+        self._limpar_tela()
+        if self.runner.busy:
+            self._parado_pelo_bloqueio = True
+            self._ao_terminar = self._ao_falhar = None  # o resultado não volta à tela
+            self._painel = None
+            self._fechar_depois = True
+            self.runner.cancel()
+            self.cancelar.setEnabled(False)
+            self.hide()
+            return
+        self._fechar_depois = False
+        self.close()
+
+    def _limpar_tela(self) -> None:
+        """Senhas, caminhos, nomes, registros e resultados saem da janela; o assistente volta
+        ao começo (a pasta original e os cofres não são tocados)."""
+        self._descartar_senhas()
+        self._ocultar_senhas()
+        self._limpar_caminhos()
+        self.c_nome.setText(default_vault_name())
+        self.r_nome.setText(self._nome_restaurado())
+        for lbl in (
+            self.erro_pastas,
+            self.erro_senha,
+            self.erro_criar,
+            self.erro_abrir,
+            self.erro_conferir,
+        ):
+            mostrar_erro(lbl, "")
+        for resultado in (self.resultado_criar, self.resultado_abrir, self.resultado_conferir):
+            resultado.limpar()
+        for painel in (self.painel_criar, self.painel_abrir, self.painel_conferir):
+            painel.esvaziar()
+        self.painel_abrir.hide()
+        self.painel_conferir.hide()
+        self._definir_linhas([])
+        self._definir_detalhes([])
+        for c in self.aceites_todos:
+            c.setChecked(False)
+        self.aceite_fat.hide()
+        # o resumo da lateral mostra os caminhos do passo 1 (o título da seção fica)
+        for lbl in self.resumo.findChildren(QLabel):
+            if lbl.objectName() != "secaoLateral":
+                _apagar_textos(lbl)
+        self.resumo.definir_itens([])
+        self._lateral_chave = None
+        self._lateral_botoes = []
+        self.modo = CRIAR
+        self.passo = 0
+        self.retomando = False
+        self.criacao = ""
+        self._plan = None
+        self._resultado = None
+        self._retomada_ok = False
+        self._destino_abrir = ""
+        self.session_sources.clear()  # caminhos das origens desta sessão (só em memória)
+        self.p4_titulo.setText(S.COPIA_P4_TITULO)
+        self.rodape.definir_estado("Pronto.")
+        self._mostrar()
+
+    def _campos_caminho(self) -> list[CampoCaminho]:
+        return [self.c_origem, self.c_local, self.c_teste, self.r_copia, self.r_local, self.v_copia]
+
+    def _limpar_caminhos(self) -> None:
+        self._auto_test = None
+        for campo in self._campos_caminho():
+            campo.definir("")  # setText: sem histórico de desfazer; a dica também esvazia
+
+    def _descartar_caminho_se_bloqueada(self) -> None:
+        """O seletor de pastas do Windows não fecha sozinho: se o app bloqueou enquanto ele
+        estava aberto, o caminho escolhido não entra na janela."""
+        if self._bloqueada:
+            self._limpar_caminhos()
+
+    # ------------------------------------------------------------------ tela e tema
+    def showEvent(self, event: QShowEvent) -> None:
+        if self._bloqueada and not event.spontaneous():
+            # aberta de novo depois do desbloqueio: volta a funcionar (e não fecha sozinha)
+            self._bloqueada = False
+            self._fechar_depois = False
+        super().showEvent(event)
+        if not self._ajustou_tela:
+            self._ajustou_tela = True
+            handle = self.windowHandle()
+            if handle is not None:
+                handle.screenChanged.connect(lambda _s: self._caber_na_tela())
+        self._caber_na_tela()
+
+    def _caber_na_tela(self) -> None:
+        """Nunca maior que a área útil da tela (1366x768 a 125%/150%): o mínimo e o tamanho
+        encolhem até caber e o rodapé (Voltar, primário, Cancelar) fica sempre à vista; o
+        conteúdo do cartão e a lateral rolam."""
+        area = area_util(self)
+        if area is None:
+            return
+        quadro, janela = self.frameGeometry(), self.geometry()
+        moldura_h = max(quadro.height() - janela.height(), _MOLDURA_ALTURA)
+        moldura_w = max(quadro.width() - janela.width(), _MOLDURA_LARGURA)
+        max_w = max(200, area.width() - moldura_w)
+        max_h = max(200, area.height() - moldura_h)
+        precisa = self.minimumSizeHint()
+        self.setMinimumSize(
+            min(max(LARGURA_MINIMA, precisa.width()), max_w),
+            min(max(ALTURA_MINIMA, precisa.height()), max_h),
+        )
+        if self.isMaximized() or self.isFullScreen():
+            return
+        w, h = min(self.width(), max_w), min(self.height(), max_h)
+        if (w, h) != (self.width(), self.height()):
+            self.resize(w, h)
+        # a janela inteira (com a barra de título) dentro da área útil
+        quadro = self.frameGeometry()
+        x = min(max(quadro.left(), area.left()), area.right() + 1 - quadro.width())
+        y = min(max(quadro.top(), area.top()), area.bottom() + 1 - quadro.height())
+        if (x, y) != (quadro.left(), quadro.top()):
+            self.move(max(x, area.left()), max(y, area.top()))
+
+    def changeEvent(self, event: QEvent) -> None:
+        super().changeEvent(event)
+        if event.type() in (QEvent.Type.PaletteChange, QEvent.Type.StyleChange):
+            self._acompanhar_tema()
+
+    def _acompanhar_tema(self) -> None:
+        """C6: o que é pintado fora do QSS (sombras dos cartões e linhas coloridas dos
+        registros) passa para as cores do tema novo."""
+        tema = assinatura_do_tema()
+        if tema == getattr(self, "_tema", tema) or not hasattr(self, "painel_conferir"):
+            return  # o mesmo tema, ou a janela ainda está sendo montada
+        self._tema = tema
+        for frame in self.findChildren(QFrame):
+            if frame.objectName() in ("cartao", "cartaoLateral"):
+                sombra(frame)
+        for painel in (self.painel_criar, self.painel_abrir, self.painel_conferir):
+            painel.repintar()
+
     # ------------------------------------------------------------------ fechar
+    def hideEvent(self, event: QHideEvent) -> None:
+        super().hideEvent(event)
+        if not event.spontaneous():  # fechar/esconder (minimizar não apaga o que foi digitado)
+            self._descartar_senhas()
+
     def closeEvent(self, event: QCloseEvent) -> None:
         if self.runner.busy:
+            if self._bloqueada:
+                self.hide()  # fecha sozinha quando o trabalho parar
+                event.ignore()
+                return
             escolha = ask(
                 self,
                 "Há uma operação em andamento",
-                S.COPIA_FECHAR_TEXTO,
+                S.COPIA_FECHAR_TEXTOS.get(self._operacao, S.COPIA_FECHAR_TEXTO),
                 [("Parar e fechar", "stop"), ("Continuar trabalhando", "keep")],
                 primary="keep",
             )
-            if escolha == "stop" and self.runner.busy:
+            if escolha != "stop":
+                event.ignore()
+                return
+            if self.runner.busy:
                 self._fechar_depois = True
                 self._cancelar()
-            event.ignore()
-            return
+                event.ignore()
+                return
+            # o trabalho terminou enquanto a pergunta estava aberta: fecha, como foi pedido
+        self._descartar_senhas()
         event.accept()

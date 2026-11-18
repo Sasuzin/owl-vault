@@ -24,6 +24,10 @@ Componente                  objectName / propriedade
 ``LinhaChecagem``           checagemIcone[estado=ok|falhou|aviso], checagemTitulo, nota
 ``BotaoMais``               QToolButton#mais (⋯ e ☰)
 ==========================  ============================================================
+
+Texto vindo do usuário (nome de pasta, de cofre, caminho) nunca vira HTML: os rótulos daqui
+são ``Qt.PlainText`` e as dicas do mouse passam por ``dica_sem_html``. Só o ``Aviso`` aceita
+texto rico — quem chama escapa o que veio do usuário (``html.escape``).
 """
 
 from __future__ import annotations
@@ -31,8 +35,17 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from typing import ClassVar
 
-from PySide6.QtCore import QEvent, QObject, Qt, Signal
-from PySide6.QtGui import QColor, QResizeEvent
+from PySide6 import QtGui
+from PySide6.QtCore import QEvent, QObject, QPointF, QRect, QRectF, Qt, Signal
+from PySide6.QtGui import (
+    QColor,
+    QPainter,
+    QPainterPath,
+    QPaintEvent,
+    QPalette,
+    QPolygonF,
+    QResizeEvent,
+)
 from PySide6.QtWidgets import (
     QFrame,
     QGraphicsDropShadowEffect,
@@ -43,6 +56,8 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QSizePolicy,
+    QStyle,
+    QStyleOptionFrame,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -73,6 +88,7 @@ __all__ = [
     "botao_perigo",
     "botao_primario",
     "cartao",
+    "dica_sem_html",
     "erro",
     "lista_detalhes",
     "nota",
@@ -88,9 +104,22 @@ __all__ = [
 # --- textos ------------------------------------------------------------------------------
 
 
+def dica_sem_html(texto: str) -> str:
+    """Texto para ``setToolTip`` que aparece como está, mesmo com "<i>" ou "<b>".
+
+    A dica do mouse do Qt detecta HTML sozinha (não há ``setTextFormat`` para ela): um nome
+    "<i>Cofre</i>" sairia "Cofre" em itálico. Quando o texto parece HTML, ele vai escapado.
+    """
+    if not texto or not QtGui.Qt.mightBeRichText(texto):
+        return texto
+    return QtGui.Qt.convertFromPlainText(texto, Qt.WhiteSpaceMode.WhiteSpacePre)
+
+
 def _label(text: str, name: str, *, wrap: bool = True, selectable: bool = False) -> QLabel:
     lbl = QLabel(text)
     lbl.setObjectName(name)
+    # nomes de pastas, cofres e caminhos aparecem como estão ("<i>x</i>" não vira itálico)
+    lbl.setTextFormat(Qt.TextFormat.PlainText)
     lbl.setWordWrap(wrap)
     if selectable:
         lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -126,19 +155,23 @@ def mostrar_erro(lbl: QLabel, text: str) -> None:
 
 
 class RotuloCortado(QLabel):
-    """Uma linha que corta o meio com "…" (caminhos longos); o texto inteiro fica na dica."""
+    """Uma linha que corta o meio com "…" (caminhos longos); o texto inteiro fica na dica.
+
+    Mostra nomes de pastas e cofres: sempre texto puro (nunca HTML), também na dica.
+    """
 
     def __init__(self, text: str, name: str = "resumoValor") -> None:
         super().__init__(text)
         self.setObjectName(name)
+        self.setTextFormat(Qt.TextFormat.PlainText)
         self._full = text
-        self.setToolTip(text)
+        self.setToolTip(dica_sem_html(text))
         self.setMinimumWidth(40)
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
 
     def set_full_text(self, text: str) -> None:
         self._full = text
-        self.setToolTip(text)
+        self.setToolTip(dica_sem_html(text))
         self._elide()
 
     def resizeEvent(self, event: QResizeEvent) -> None:
@@ -190,7 +223,7 @@ class BotaoMais(QToolButton):
         self.setObjectName("mais")
         self.setText(texto)
         self.setAccessibleName(nome_acessivel)
-        self.setToolTip(nome_acessivel)
+        self.setToolTip(dica_sem_html(nome_acessivel))  # leva o nome da pasta
         self.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.setMenu(menu)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -210,13 +243,46 @@ def transparente(
     return w, lay
 
 
+class _SombraDoTema(QObject):
+    """Acompanha a troca de tema: ``apply_theme`` troca a paleta e a folha do app, e cada
+    widget recebe PaletteChange/StyleChange. A cor da sombra não vem do QSS, então é
+    refeita aqui com o token ``sombra`` do tema novo."""
+
+    NOME = "owlSombraDoTema"
+
+    def __init__(self, widget: QWidget) -> None:
+        super().__init__(widget)
+        self.setObjectName(self.NOME)
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:
+        if event.type() in (QEvent.Type.StyleChange, QEvent.Type.PaletteChange) and isinstance(
+            obj, QWidget
+        ):
+            efeito = obj.graphicsEffect()
+            if isinstance(efeito, QGraphicsDropShadowEffect):
+                cor = QColor(current_tokens()["sombra"])
+                if efeito.color() != cor:
+                    efeito.setColor(cor)
+        return False
+
+
 def sombra(widget: QWidget) -> None:
-    """Sombra dos cartões (QSS não tem box-shadow): blur 24, deslocamento (0, 1)."""
-    effect = QGraphicsDropShadowEffect(widget)
-    effect.setBlurRadius(24)
-    effect.setOffset(0, 1)
-    effect.setColor(QColor(current_tokens()["sombra"]))
-    widget.setGraphicsEffect(effect)
+    """Sombra dos cartões (QSS não tem box-shadow): blur 24, deslocamento (0, 1).
+
+    Pode ser chamada de novo (reaproveita o efeito); a cor segue a troca de tema sozinha.
+    """
+    efeito = widget.graphicsEffect()
+    if not isinstance(efeito, QGraphicsDropShadowEffect):
+        efeito = QGraphicsDropShadowEffect(widget)
+        efeito.setBlurRadius(24)
+        efeito.setOffset(0, 1)
+        widget.setGraphicsEffect(efeito)
+    efeito.setColor(QColor(current_tokens()["sombra"]))
+    achado = widget.findChild(
+        QObject, _SombraDoTema.NOME, Qt.FindChildOption.FindDirectChildrenOnly
+    )
+    if not isinstance(achado, _SombraDoTema):
+        widget.installEventFilter(_SombraDoTema(widget))
 
 
 def cartao(
@@ -255,23 +321,83 @@ class Dica(QFrame):
         self.setVisible(bool(titulo_texto or texto))
 
 
-class Aviso(QFrame):
-    """Caixa de aviso (``QFrame#aviso``) com ícone de alerta. Aceita texto rico (<b>)."""
+_ALERTA = "⚠"
+_VARIACOES = chr(0xFE0E) + chr(0xFE0F)  # seletores de variação: texto e emoji
 
-    def __init__(self, texto: str = "", icone: str = "⚠") -> None:
+
+def _triangulo_alerta() -> QPainterPath:
+    """O ícone de alerta do design (visual/referencia-estilo5.html), em coordenadas 24×24:
+    triângulo cheio com a barra e o ponto da exclamação vazados."""
+    triangulo = QPainterPath()
+    triangulo.addPolygon(QPolygonF([QPointF(12, 3), QPointF(1.5, 21), QPointF(22.5, 21)]))
+    triangulo.closeSubpath()
+    barra = QPainterPath()
+    barra.addRoundedRect(QRectF(11, 9, 2, 7), 1, 1)
+    ponto = QPainterPath()
+    ponto.addEllipse(QPointF(12, 17), 1.2, 1.2)
+    return triangulo.subtracted(barra.united(ponto))
+
+
+class _IconeAviso(QLabel):
+    """Ícone do ``Aviso`` (``QLabel#avisoIcone``).
+
+    O "⚠" é DESENHADO (18 px, como no design) na cor do QSS (``color: notice-ink``): como
+    caractere, o Windows pode trocá-lo pela fonte de emoji colorida, que ignora o tema.
+    Outro ícone passado em texto continua sendo um rótulo comum.
+    """
+
+    LADO = 18
+    DESCIDA = 1  # o design desce o ícone 1 px para alinhar com a 1ª linha do texto
+
+    def __init__(self, icone: str) -> None:
+        super().__init__(icone)
+        self.setObjectName("avisoIcone")
+        self.setTextFormat(Qt.TextFormat.PlainText)
+        self.setAccessibleName("Aviso")
+        self._desenhado = icone.rstrip(_VARIACOES) == _ALERTA
+        if self._desenhado:
+            self.setFixedSize(self.LADO, self.LADO + self.DESCIDA)
+        else:
+            self.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
+
+    def paintEvent(self, event: QPaintEvent) -> None:
+        if not self._desenhado:
+            super().paintEvent(event)
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        # a cor vem da folha de estilo (token notice-ink) e muda junto com o tema
+        p.setBrush(self.palette().color(QPalette.ColorRole.WindowText))
+        p.translate(0, self.DESCIDA)
+        p.scale(self.LADO / 24, self.LADO / 24)
+        p.drawPath(_triangulo_alerta())
+        p.end()
+
+
+class Aviso(QFrame):
+    """Caixa de aviso (``QFrame#aviso``) com ícone de alerta. Aceita texto rico (<b>).
+
+    Ícone e texto ficam juntos num bloco alinhado pelo topo (o ícone na altura da 1ª linha).
+    Quem acrescenta um botão ao lado (``layout().addWidget``, como a faixa da lista) tem o
+    bloco centralizado na altura do botão.
+    """
+
+    def __init__(self, texto: str = "", icone: str = _ALERTA) -> None:
         super().__init__()
         self.setObjectName("aviso")
         lay = QHBoxLayout(self)
         lay.setContentsMargins(16, 16, 16, 16)
         lay.setSpacing(12)
-        self._icone = QLabel(icone)
-        self._icone.setObjectName("avisoIcone")
-        self._icone.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
-        self._icone.setAccessibleName("Aviso")
+        corpo, cl = transparente(QHBoxLayout)
+        cl.setSpacing(12)
+        self._icone = _IconeAviso(icone)
         self._texto = _label("", "avisoTexto", selectable=True)
         self._texto.setTextFormat(Qt.TextFormat.RichText)
-        lay.addWidget(self._icone, 0, Qt.AlignmentFlag.AlignTop)
-        lay.addWidget(self._texto, 1)
+        self._texto.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        cl.addWidget(self._icone, 0, Qt.AlignmentFlag.AlignTop)
+        cl.addWidget(self._texto, 1)
+        lay.addWidget(corpo, 1, Qt.AlignmentFlag.AlignVCenter)
         self.definir(texto)
 
     def definir(self, texto: str) -> None:
@@ -356,6 +482,7 @@ class TrilhaPassos(QWidget):
             num.setObjectName("passoNumero")
             txt = QLabel(nome)
             txt.setObjectName("passoTexto")
+            txt.setTextFormat(Qt.TextFormat.PlainText)
             lay.addWidget(num, 0, Qt.AlignmentFlag.AlignVCenter)
             lay.addWidget(txt, 0, Qt.AlignmentFlag.AlignVCenter)
             self._numeros.append(num)
@@ -404,6 +531,7 @@ class Rodape(QFrame):
         self.ponto.setObjectName("estadoPonto")
         self.texto = QLabel("Pronto.")
         self.texto.setObjectName("estadoTexto")
+        self.texto.setTextFormat(Qt.TextFormat.PlainText)  # pode citar nomes de pastas
         self.texto.setWordWrap(False)
         lay.addWidget(self.ponto, 0, Qt.AlignmentFlag.AlignVCenter)
         lay.addWidget(self.texto, 0, Qt.AlignmentFlag.AlignVCenter)
@@ -411,7 +539,7 @@ class Rodape(QFrame):
     def definir_estado(self, texto: str, estado: str = "") -> None:
         """``estado``: "" (ok), "trabalhando" ou "erro"."""
         self.texto.setText(texto)
-        self.texto.setToolTip(texto)
+        self.texto.setToolTip(dica_sem_html(texto))
         self.ponto.setProperty("estado", estado)
         self.ponto.setAccessibleName(
             {"erro": "Erro", "trabalhando": "Trabalhando"}.get(estado, "Pronto")
@@ -527,8 +655,62 @@ class MedidorForca(QWidget):
         self.setAccessibleDescription(f"Força da senha: {self._veredito.text() or 'vazia'}")
 
 
+class _LinhaCaminho(QLineEdit):
+    """O QLineEdit somente leitura do ``CampoCaminho``.
+
+    Sem foco, quando o caminho não cabe, mostra "…" + o FIM do caminho — o nome da pasta
+    escolhida fica sempre à vista. Com foco é o QLineEdit normal (cursor no fim; Home vai ao
+    começo). ``text()`` é sempre o caminho inteiro, e ele também fica na dica do mouse.
+    """
+
+    # margens internas do QLineEdit (QLineEditPrivate::horizontalMargin/verticalMargin)
+    _MARGEM_H = 2
+    _MARGEM_V = 1
+
+    def _area_texto(self) -> QRect:
+        opt = QStyleOptionFrame()
+        self.initStyleOption(opt)
+        r = self.style().subElementRect(QStyle.SubElement.SE_LineEditContents, opt, self)
+        m = self.textMargins()
+        return r.adjusted(
+            m.left() + self._MARGEM_H,
+            m.top() + self._MARGEM_V,
+            -(m.right() + self._MARGEM_H),
+            -(m.bottom() + self._MARGEM_V),
+        )
+
+    def texto_exibido(self) -> str:
+        """O que aparece no campo quando ele não tem foco ("…\\Pasta" se não couber)."""
+        texto = self.text()
+        if not texto or self.hasFocus():
+            return texto
+        largura = max(0, self._area_texto().width())
+        return self.fontMetrics().elidedText(texto, Qt.TextElideMode.ElideLeft, largura)
+
+    def paintEvent(self, event: QPaintEvent) -> None:
+        exibido = self.texto_exibido()
+        if exibido == self.text():
+            super().paintEvent(event)
+            return
+        opt = QStyleOptionFrame()
+        self.initStyleOption(opt)
+        p = QPainter(self)
+        # fundo e borda pela folha de estilo, como o próprio QLineEdit faz
+        self.style().drawPrimitive(QStyle.PrimitiveElement.PE_PanelLineEdit, opt, p, self)
+        area = self._area_texto()
+        fm = self.fontMetrics()
+        topo = area.y() + (area.height() - fm.height() + 1) // 2  # igual ao QLineEdit
+        p.setClipRect(area)
+        p.setPen(self.palette().color(QPalette.ColorRole.Text))
+        p.drawText(QPointF(area.x(), topo + fm.ascent()), exibido)
+        p.end()
+
+
 class CampoCaminho(QWidget):
-    """Caminho escolhido no seletor do Windows (somente leitura) + "Escolher" dentro."""
+    """Caminho escolhido no seletor do Windows (somente leitura) + "Escolher" dentro.
+
+    Caminho longo: o campo mostra o fim (o nome da pasta) e a dica mostra o caminho inteiro.
+    """
 
     escolhido = Signal(str)
 
@@ -538,7 +720,7 @@ class CampoCaminho(QWidget):
         self._titulo_seletor = titulo_seletor
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
-        self.campo = QLineEdit()
+        self.campo: QLineEdit = _LinhaCaminho()
         self.campo.setReadOnly(True)
         self.campo.setPlaceholderText(placeholder)
         self.campo.setAccessibleName(placeholder)
@@ -559,8 +741,9 @@ class CampoCaminho(QWidget):
 
     def definir(self, path: str) -> None:
         self.campo.setText(path)
-        self.campo.setToolTip(path)
-        self.campo.setCursorPosition(0)
+        self.campo.setToolTip(dica_sem_html(path))
+        # cursor no FIM: com foco (ou caminho que não cabe) o que aparece é o nome da pasta
+        self.campo.setCursorPosition(len(path))
 
     def texto(self) -> str:
         return self.campo.text().strip()

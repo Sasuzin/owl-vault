@@ -7,15 +7,18 @@ por um gravador), dados sintéticos e nenhum acesso a pastas ou ao perfil real.
 
 from __future__ import annotations
 
+import itertools
 import os
 from collections.abc import Callable, Iterator
 
 import pytest
-from PySide6.QtCore import QCoreApplication, QEvent, Qt
-from PySide6.QtGui import QColor, QKeyEvent, QTextCursor
+from PySide6.QtCore import QCoreApplication, QEvent, QPoint, QRect, Qt
+from PySide6.QtGui import QColor, QKeyEvent, QScreen, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
+    QGraphicsDropShadowEffect,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -25,10 +28,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from owl_vault.application.preflight import CreatePlan
 from owl_vault.domain.limits import MIN_PASSWORD_LENGTH
-from owl_vault.ui import common
+from owl_vault.ui import common, dialogs
 from owl_vault.ui import folder_dialogs as fd
-from owl_vault.ui.componentes import Aviso, CampoSenha, LinhaChecagem
+from owl_vault.ui.componentes import Aviso, CampoSenha, LinhaChecagem, transparente
 from owl_vault.ui.theme import apply_theme, current_tokens
 from owl_vault.ui.workers import JobRunner
 
@@ -829,3 +833,527 @@ def test_tab_order_pula_quem_nao_recebe_tab(guarda: Callable[..., QWidget]) -> N
         lay.addWidget(w)
     fd.tab_order([a, b, x, c])
     _assert_ordem(janela, [a, x, c])
+
+
+# =========================================================================== regressões da revisão
+
+ARQUIVOS = [f"Documentos\\Projeto {i:02d}\\relatório revisado {i:02d}.docx" for i in range(40)]
+TEXTO_SENHA_NOVA = (
+    "As pastas trancadas continuam abrindo normalmente com o PIN. Para que elas também abram "
+    "com a senha nova em outro computador, abra e tranque cada uma de novo."
+)
+
+
+def _erro_visivel(dlg: QDialog) -> None:
+    err = getattr(dlg, "err", None)
+    assert isinstance(err, QLabel)
+    common.show_error(err, "Os dois campos não são iguais.")
+
+
+def _abre_detalhes(dlg: QDialog) -> None:
+    assert isinstance(dlg, fd.ChoiceDialog) and dlg.details_toggle is not None
+    dlg.details_toggle.setChecked(True)
+
+
+def _registro_cheio(dlg: QDialog) -> None:
+    assert isinstance(dlg, common.ProgressDialog)
+    for i in range(30):
+        dlg._log(f"etapa {i}")
+
+
+_DIALOGOS_ALTOS: list[tuple[str, Callable[[QWidget], QDialog], Callable[[QDialog], None] | None]]
+_DIALOGOS_ALTOS = [
+    (
+        "nova_senha_mestra",
+        lambda p: fd.NewSecretDialog(
+            p, master=True, title="Criar nova senha mestra", text=TEXTO_SENHA_NOVA
+        ),
+        None,
+    ),
+    (
+        "nova_senha_mestra_com_erro",
+        lambda p: fd.NewSecretDialog(
+            p, master=True, title="Criar nova senha mestra", text=TEXTO_SENHA_NOVA
+        ),
+        _erro_visivel,
+    ),
+    ("alterar_pin_com_erro", lambda p: fd.ChangePinDialog(p), _erro_visivel),
+    (
+        "versao_anterior_com_detalhes",
+        lambda p: fd.ChoiceDialog(
+            p,
+            "Versão anterior de 'Fotos'",
+            "Foi mantida uma versão anterior de 'Fotos' com 40 arquivos que não estão na pasta.",
+            [
+                ("Recuperar esses arquivos em outra pasta…", "restore"),
+                ("Apagar a versão anterior…", "delete"),
+                ("Fechar", "close"),
+            ],
+            details=ARQUIVOS,
+            primary="restore",
+            perigo="delete",
+        ),
+        _abre_detalhes,
+    ),
+    (
+        "proteger_primeira_vez",
+        lambda p: fd.ConfirmProtectDialog(p, NOME, 40_000, 80 * 1024**3, True),
+        None,
+    ),
+    ("limites", lambda p: fd.LimitsDialog(p), None),
+    (
+        "progresso_com_registro",
+        lambda p: common.ProgressDialog(
+            p, "Trancando", JobRunner(p), mode="lock", note="Não desligue o computador.", log=True
+        ),
+        _registro_cheio,
+    ),
+]
+
+
+@pytest.mark.parametrize(("largura", "altura"), [(1093, 566), (911, 464)], ids=["125", "150"])
+@pytest.mark.parametrize(
+    ("fabrica", "depois"),
+    [(f, d) for _n, f, d in _DIALOGOS_ALTOS],
+    ids=[n for n, _f, _d in _DIALOGOS_ALTOS],
+)
+def test_dialogo_cabe_na_area_util_e_os_botoes_ficam_a_vista(
+    guarda: Callable[..., QWidget],
+    monkeypatch: pytest.MonkeyPatch,
+    largura: int,
+    altura: int,
+    fabrica: Callable[[QWidget], QDialog],
+    depois: Callable[[QDialog], None] | None,
+) -> None:
+    """dialogos-1: 1366x768 a 125%/150% — o diálogo nunca passa da área útil, o conteúdo
+    rola e a linha de botões (fora da rolagem) fica inteira à vista."""
+    monkeypatch.setattr(QScreen, "availableGeometry", lambda _s: QRect(0, 0, largura, altura))
+    pai = guarda(QWidget())
+    pai.resize(700, 450)
+    dlg = guarda(fabrica(pai))
+    dlg.show()
+    _descarta()
+    if depois is not None:
+        depois(dlg)
+        for _ in range(3):
+            _descarta()
+    assert dlg.height() + common.FOLGA_MOLDURA <= altura
+    assert dlg.width() <= largura
+    rolagem = dlg.findChild(common.Rolagem)
+    assert rolagem is not None
+    botoes = [
+        b
+        for b in dlg.findChildren(QPushButton)
+        if b.isVisibleTo(dlg) and b.objectName() != "discreto" and b.parentWidget() is not None
+    ]
+    assert botoes
+    for b in botoes:
+        topo = b.mapTo(dlg, QPoint(0, 0)).y()
+        assert topo >= 0 and topo + b.height() <= dlg.height(), b.text()
+        assert not rolagem.isAncestorOf(b), b.text()  # fora da rolagem: nunca some
+    # o que não coube rola (nada é cortado sem barra)
+    conteudo = rolagem.widget()
+    assert conteudo is not None
+    if conteudo.height() > rolagem.viewport().height():
+        assert rolagem.verticalScrollBar().maximum() > 0
+
+
+def test_erro_novo_e_trazido_para_a_vista_numa_tela_baixa(
+    guarda: Callable[..., QWidget], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Com o corpo rolando (tela baixa), o erro que aparece embaixo não fica escondido."""
+    monkeypatch.setattr(QScreen, "availableGeometry", lambda _s: QRect(0, 0, 911, 464))
+    dlg = guarda(
+        fd.NewSecretDialog(
+            None, master=True, title="Criar nova senha mestra", text=TEXTO_SENHA_NOVA
+        )
+    )
+    assert isinstance(dlg, fd.NewSecretDialog)
+    dlg.show()
+    _descarta()
+    assert dlg.rolagem.verticalScrollBar().maximum() > 0  # o corpo rola
+    common.show_error(dlg.err, "Os dois campos não são iguais.")
+    for _ in range(4):
+        _descarta()
+    vista = dlg.rolagem.viewport()
+    topo = dlg.err.mapTo(vista, QPoint(0, 0)).y()
+    assert topo >= 0 and topo + dlg.err.height() <= vista.height()
+
+
+def test_dialogo_cresce_quando_aparece_um_erro(guarda: Callable[..., QWidget]) -> None:
+    """Com espaço na tela, o diálogo acompanha o conteúdo (o corpo numa rolagem não pode
+    deixar o erro escondido atrás de uma barra)."""
+    dlg = guarda(fd.NewSecretDialog(None, master=False, title="Novo PIN", text="Escolha."))
+    assert isinstance(dlg, fd.NewSecretDialog)
+    dlg.show()
+    _descarta()
+    antes = dlg.height()
+    common.show_error(dlg.err, "Os dois campos não são iguais.")
+    for _ in range(3):
+        _descarta()
+    assert dlg.height() > antes
+    assert dlg.rolagem.verticalScrollBar().maximum() == 0  # cabe inteiro, sem barra
+
+
+def test_preflight_e_relatorio_antigos_tambem_cabem_na_tela(
+    guarda: Callable[..., QWidget], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(QScreen, "availableGeometry", lambda _s: QRect(0, 0, 911, 464))
+    plan = CreatePlan("C:\\o", "C:\\c\\Cofre", "C:\\t", 64 * 1024)
+    plan.warnings = list(ARQUIVOS)
+    for dlg in (
+        dialogs.PreflightDialog(plan),
+        dialogs.ReportDialog("Relatório", "Resumo", [("Avisos", ARQUIVOS), ("Notas", ARQUIVOS)]),
+    ):
+        guarda(dlg)
+        dlg.show()
+        _descarta()
+        assert dlg.height() + common.FOLGA_MOLDURA <= 464
+        for b in dlg.findChildren(QPushButton):
+            if b.isVisibleTo(dlg):
+                topo = b.mapTo(dlg, QPoint(0, 0)).y()
+                assert topo + b.height() <= dlg.height(), b.text()
+
+
+def test_trocar_o_tema_repinta_o_registro_e_a_sombra_do_progresso(
+    guarda: Callable[..., QWidget], qapp: QApplication
+) -> None:
+    """visual-10 (C6) na tela de progresso: as linhas coloridas e a sombra do cartão
+    passam para o tema novo."""
+    folha, paleta, estilo = qapp.styleSheet(), qapp.palette(), qapp.style().name()
+    anterior = qapp.property("owlTheme")
+    try:
+        apply_theme(qapp, "dark")
+        pai = guarda(QWidget())
+        runner = JobRunner(pai)
+        dlg = guarda(common.ProgressDialog(pai, "Trancando", runner, mode="lock", log=True))
+        assert isinstance(dlg, common.ProgressDialog)
+        dlg.show()
+        _descarta()
+        runner.bridge.warning.emit("Arquivo em uso: a.docx")
+        apply_theme(qapp, "light")
+        _descarta()
+        tokens = current_tokens()
+        assert dlg.log_box is not None
+        aviso = QTextCursor(dlg.log_box.document().lastBlock())
+        aviso.movePosition(QTextCursor.MoveOperation.EndOfBlock)
+        assert aviso.charFormat().foreground().color() == QColor(tokens["warn"])
+        efeito = dlg.card.graphicsEffect()
+        assert isinstance(efeito, QGraphicsDropShadowEffect)
+        assert efeito.color() == QColor(tokens["sombra"])
+        dlg.finish()
+    finally:
+        qapp.setStyleSheet(folha)
+        qapp.setStyle(QStyleFactory.create(estilo) or QStyleFactory.create("Fusion"))
+        qapp.setPalette(paleta)
+        qapp.setProperty("owlTheme", anterior)
+        _descarta()
+
+
+def test_fmt_size_um_byte_no_singular() -> None:
+    """fmt-1: "1 arquivo(s) · 1 byte", nunca "1 bytes"."""
+    assert common.fmt_size(1) == "1 byte"
+    assert common.fmt_size(0) == "0 bytes"
+    assert common.fmt_size(2) == "2 bytes"
+
+
+@pytest.mark.parametrize(
+    ("segundos", "esperado"),
+    [
+        (150, "cerca de 3 minutos"),  # 2,5 min: o round() do Python dava 2
+        (5400, "cerca de 2 horas"),  # 1h30
+        (8970, "cerca de 2 horas"),  # 2h29m30s
+        (9000, "cerca de 3 horas"),  # 2h30: o round() do Python dava 2
+        (float("nan"), "tempo incerto"),
+        (float("inf"), "tempo incerto"),
+        (float("-inf"), "tempo incerto"),
+    ],
+)
+def test_fmt_duration_arredonda_meio_para_cima_e_nunca_quebra(
+    segundos: float, esperado: str
+) -> None:
+    assert common.fmt_duration(segundos) == esperado
+
+
+def test_fmt_int_com_float() -> None:
+    assert common.fmt_int(1234.5) == "1.235"  # nunca "1.234.5"
+    assert common.fmt_int(1234567) == "1.234.567"
+
+
+# =========================================================================== v2-visual-1 / v2-visual-2
+
+TEXTO_RESOLVER = (
+    "Seus arquivos já estão guardados. 3 item(ns) ainda não foram apagados da pasta: 2 estavam "
+    "abertos ou mudaram, e 1 item novo foi colocado durante o trancamento e NÃO está guardado. "
+    "Feche os arquivos, mova o item novo para outro lugar e clique em 'Continuar trancando'."
+)
+BOTOES_RESOLVER_APAGANDO = [
+    ("Continuar trancando", "cont"),
+    ("Desfazer (deixar a pasta aberta)", "undo"),
+    ("Mostrar no Explorer", "show"),
+    ("Tirar da lista", "forget"),
+    ("Fechar", "close"),
+]
+PENDENTES = [
+    "Notas\\2024\\março.xlsx (em uso)",
+    "Notas\\2024\\abril.xlsx (mudou)",
+    "Nova pasta (item novo)",
+]
+
+
+def _tela(monkeypatch: pytest.MonkeyPatch, largura: int, altura: int) -> None:
+    monkeypatch.setattr(QScreen, "availableGeometry", lambda _s: QRect(0, 0, largura, altura))
+
+
+def _resolver_apagando(pai: QWidget | None) -> fd.ChoiceDialog:
+    """O Resolver de 'apagando' com pendências (owl_window._resolve_deleting): 5 botões."""
+    return fd.ChoiceDialog(
+        pai,
+        "Trancamento de 'Notas fiscais' interrompido",
+        TEXTO_RESOLVER,
+        BOTOES_RESOLVER_APAGANDO,
+        details=PENDENTES,
+        details_open=True,
+    )
+
+
+def _mostra(dlg: QDialog) -> None:
+    dlg.show()
+    for _ in range(4):
+        _descarta()
+
+
+def _natural(dlg: QDialog) -> int:
+    """Altura que o conteúdo pede na largura atual do diálogo (sem teto nenhum)."""
+    lay = dlg.layout()
+    assert lay is not None
+    return lay.totalHeightForWidth(dlg.width())
+
+
+def _geometrias(dlg: fd.ChoiceDialog) -> list[QRect]:
+    return [QRect(b.mapTo(dlg, QPoint(0, 0)), b.size()) for b in dlg.buttons.values()]
+
+
+def _assert_botoes_inteiros_e_separados(dlg: fd.ChoiceDialog) -> None:
+    """Nenhum par se cruza, o vão entre vizinhos é 12 (linhas e colunas) e todos ficam
+    inteiros dentro do diálogo, abaixo da rolagem."""
+    geos = _geometrias(dlg)
+    for i, a in enumerate(geos):
+        for b in geos[i + 1 :]:
+            assert not a.intersects(b), (a, b)
+    linhas = sorted({g.y() for g in geos})
+    for cima, baixo in itertools.pairwise(linhas):
+        altura = max(g.height() for g in geos if g.y() == cima)
+        assert baixo - (cima + altura) == fd.VAO_BOTOES
+    for y in linhas:
+        lado = sorted((g for g in geos if g.y() == y), key=lambda g: g.x())
+        for esq, dir_ in itertools.pairwise(lado):
+            assert dir_.x() - (esq.x() + esq.width()) == fd.VAO_BOTOES
+    rolagem = QRect(dlg.rolagem.mapTo(dlg, QPoint(0, 0)), dlg.rolagem.size())
+    for g in geos:
+        assert g.top() >= 0 and g.bottom() < dlg.height()
+        assert not g.intersects(rolagem)
+
+
+@pytest.mark.parametrize(
+    ("largura", "altura"),
+    [(1093, 566), (1093, 590), (1366, 720), (1280, 672), (911, 464), (1024, 528)],
+    ids=["hd125a", "hd125b", "hd100", "fhd150", "hd150", "720p125"],
+)
+def test_resolver_de_cinco_botoes_nunca_sobrepoe_os_botoes(
+    tema: str,
+    guarda: Callable[..., QWidget],
+    monkeypatch: pytest.MonkeyPatch,
+    largura: int,
+    altura: int,
+) -> None:
+    """v2-visual-1: com o diálogo encolhido para caber na tela, o que falta sai só da
+    rolagem. Antes, em 1093x566, cada botão entrava 5-6 px no de cima (um clique na borda de
+    'Continuar trancando' acionava 'Desfazer'); em 1280x672 o vão era 0."""
+    _tela(monkeypatch, largura, altura)
+    pai = guarda(QWidget())
+    pai.resize(900, 500)
+    dlg = guarda(_resolver_apagando(pai))
+    assert isinstance(dlg, fd.ChoiceDialog)
+    _mostra(dlg)
+    _assert_botoes_inteiros_e_separados(dlg)
+    assert dlg.height() + common.FOLGA_TITULO <= altura  # cabe na tela, com a barra de título
+    assert dlg.width() <= largura
+    if dlg.rolagem.maximumHeight() < common.SEM_TETO:
+        assert dlg.rolagem.verticalScrollBar().maximum() > 0  # o corpo rola, nada é cortado
+    else:
+        assert dlg.height() == _natural(dlg)
+
+
+def test_resolver_de_cinco_botoes_mantem_a_coluna_quando_cabe(
+    tema: str, guarda: Callable[..., QWidget], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Em 1366x768 a 100% (720 úteis) os 5 botões continuam um embaixo do outro, com 12 px
+    entre eles (antes, 5 px) e o corpo com pelo menos ``CORPO_MINIMO``."""
+    _tela(monkeypatch, 1366, 720)
+    dlg = guarda(_resolver_apagando(None))
+    assert isinstance(dlg, fd.ChoiceDialog)
+    _mostra(dlg)
+    assert isinstance(dlg.button_box, QVBoxLayout)
+    assert dlg.height() + common.FOLGA_MOLDURA <= 720
+    assert dlg.rolagem.height() >= common.CORPO_MINIMO
+    _assert_botoes_inteiros_e_separados(dlg)
+
+
+def test_tela_baixa_demais_poe_os_botoes_em_duas_colunas(
+    tema: str, guarda: Callable[..., QWidget], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Em 911x464 a coluna de 5 botões (298 px) não cabe junto com o corpo: antes 'Tirar da
+    lista' ficava com 21 de 50 px e 'Fechar' fora da tela. Agora vão em duas colunas iguais,
+    na ordem de leitura, e o Tab segue a mesma ordem."""
+    _tela(monkeypatch, 911, 464)
+    dlg = guarda(_resolver_apagando(None))
+    assert isinstance(dlg, fd.ChoiceDialog)
+    _mostra(dlg)
+    assert isinstance(dlg.button_box, QGridLayout)
+    geos = _geometrias(dlg)
+    assert geos[0].y() == geos[1].y() and geos[0].x() < geos[1].x()  # leitura: linha a linha
+    assert geos[0].width() == geos[1].width() == geos[2].width() == geos[3].width()
+    assert geos[4].width() > geos[0].width()  # o último, sozinho, ocupa a linha toda
+    _assert_botoes_inteiros_e_separados(dlg)
+    assert dlg.height() + common.FOLGA_TITULO <= 464
+    assert dlg.rolagem.height() >= common.CORPO_APERTADO
+    _assert_ordem(dlg, list(dlg.buttons.values()))
+
+
+def test_teto_da_rolagem_sai_quando_a_tela_cresce(
+    tema: str, guarda: Callable[..., QWidget], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """O teto vale para a tela atual: numa tela maior o diálogo volta à altura natural (sem
+    barra), e o ajuste para de mudar sozinho (nenhum laço de LayoutRequest)."""
+    _tela(monkeypatch, 1280, 672)
+    dlg = guarda(_resolver_apagando(None))
+    assert isinstance(dlg, fd.ChoiceDialog)
+    _mostra(dlg)
+    assert dlg.rolagem.maximumHeight() < common.SEM_TETO
+    antes = (dlg.size(), dlg.rolagem.maximumHeight())
+    for _ in range(5):
+        _descarta()
+    assert (dlg.size(), dlg.rolagem.maximumHeight()) == antes  # estável
+    _tela(monkeypatch, 1920, 1032)
+    dlg.fit()
+    for _ in range(4):
+        _descarta()
+    assert dlg.rolagem.maximumHeight() == common.SEM_TETO
+    assert dlg.height() == _natural(dlg)
+    assert dlg.rolagem.verticalScrollBar().maximum() == 0
+    _assert_botoes_inteiros_e_separados(dlg)
+
+
+@pytest.mark.parametrize(
+    ("titulo", "texto"),
+    [
+        ("Nada encontrado", "Não há pasta protegida pelo Owl Vault aqui."),
+        ("Aguarde", "Espere a operação atual terminar e use o atalho de novo."),
+        ("Não conferiu", "Senha mestra incorreta."),
+    ],
+)
+def test_dialogo_curto_tem_a_altura_natural(
+    tema: str, guarda: Callable[..., QWidget], titulo: str, texto: str
+) -> None:
+    """v2-visual-2: o mínimo fixo de 120 px da rolagem esticava os diálogos curtos (520x227
+    viravam 520x286) e o título e o texto repartiam a sobra (54 px cada, ~45 px de vão)."""
+    dlg = guarda(fd.ChoiceDialog(None, titulo, texto, [("OK", "ok")], details_open=True))
+    assert isinstance(dlg, fd.ChoiceDialog)
+    _mostra(dlg)
+    t, x = dlg.title_label, dlg.text_label
+    assert t.height() == t.heightForWidth(t.width())
+    assert x.height() == x.heightForWidth(x.width())
+    vao = x.mapTo(dlg, QPoint(0, 0)).y() - (t.mapTo(dlg, QPoint(0, 0)).y() + t.height())
+    assert vao == 12
+    ok = dlg.buttons["ok"]
+    cromo = 2 * fd.MARGEM + 2 * 24 + 12 + fd.ESPACO_ANTES_DOS_BOTOES
+    assert dlg.height() == cromo + t.height() + 12 + x.height() + ok.height()
+    assert dlg.rolagem.minimumSizeHint().height() < common.CORPO_MINIMO
+    assert dlg.rolagem.verticalScrollBar().maximum() == 0
+
+
+def test_sobra_de_altura_vai_para_baixo_e_nao_estica_os_textos(
+    tema: str, guarda: Callable[..., QWidget]
+) -> None:
+    """Se o diálogo ficar mais alto que o conteúdo, o título e o texto mantêm a altura e o
+    vão de 12 px; a sobra fica embaixo deles."""
+    dlg = guarda(fd.ChoiceDialog(None, "Nada encontrado", "Não há pasta aqui.", [("OK", "ok")]))
+    assert isinstance(dlg, fd.ChoiceDialog)
+    _mostra(dlg)
+    dlg.setFixedSize(dlg.width(), dlg.height() + 120)
+    for _ in range(3):
+        _descarta()
+    t, x = dlg.title_label, dlg.text_label
+    assert t.height() == t.heightForWidth(t.width())
+    assert x.height() == x.heightForWidth(x.width())
+    assert x.y() - (t.y() + t.height()) == 12
+
+
+def test_inform_curto_nao_cresce(
+    tema: str, guarda: Callable[..., QWidget], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``inform`` (o caminho real dos avisos de uma linha) também fica na altura natural."""
+    vistos: list[fd.ChoiceDialog] = []
+
+    def exec_falso(self: fd.ChoiceDialog) -> int:
+        guarda(self)
+        vistos.append(self)
+        _mostra(self)
+        return 0
+
+    monkeypatch.setattr(fd.ChoiceDialog, "exec", exec_falso)
+    fd.inform(None, "PIN desativado", "Use a senha mestra.")
+    dlg = vistos[0]
+    assert dlg.height() == _natural(dlg)
+    conteudo = dlg.rolagem.widget()
+    assert conteudo is not None
+    assert dlg.rolagem.height() == conteudo.heightForWidth(dlg.rolagem.width())
+
+
+def _largura_com_quebra_diferente(rot: QLabel, barra: int) -> int:
+    """Uma largura em que o texto fica mais alto quando perde ``barra`` px (vira mais linhas)."""
+    for w in range(160, 700):
+        if rot.heightForWidth(w) < rot.heightForWidth(w - barra):
+            return w
+    raise AssertionError("nenhuma largura muda a quebra do texto")
+
+
+def test_rolagem_some_com_a_barra_quando_o_conteudo_cabe(guarda: Callable[..., QWidget]) -> None:
+    """Uma barra que apareceu num passo intermediário do layout nunca sumia: com ela o texto
+    quebra numa largura menor, fica mais alto e continua "precisando" dela (o diálogo de
+    Limites, numa tela grande, mostrava uma barra com 16 px para rolar)."""
+    conteudo, lay = transparente()
+    rot = QLabel(" ".join(["palavra"] * 60))
+    rot.setWordWrap(True)
+    lay.addWidget(rot)
+    rolagem = common.Rolagem(conteudo)
+    guarda(rolagem)
+    barra = rolagem.verticalScrollBar().sizeHint().width()
+    w = _largura_com_quebra_diferente(rot, barra)
+    rolagem.resize(w, 40)  # baixa: a barra aparece
+    rolagem.show()
+    _descarta()
+    assert rolagem.verticalScrollBar().isVisible()
+    rolagem.resize(w, rolagem.heightForWidth(w))  # agora cabe inteiro na largura toda
+    _descarta()
+    assert not rolagem.verticalScrollBar().isVisible()
+    assert rolagem.viewport().width() == w
+    assert conteudo.height() <= rolagem.viewport().height()
+    rolagem.resize(w, 40)  # e volta quando não cabe
+    _descarta()
+    assert rolagem.verticalScrollBar().isVisible()
+    assert rolagem.verticalScrollBar().maximum() > 0
+
+
+def test_limites_em_tela_grande_sem_barra(
+    tema: str, guarda: Callable[..., QWidget], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _tela(monkeypatch, 1920, 1032)
+    dlg = guarda(fd.LimitsDialog(None))
+    assert isinstance(dlg, fd.LimitsDialog)
+    _mostra(dlg)
+    assert not dlg.rolagem.verticalScrollBar().isVisible()
+    conteudo = dlg.rolagem.widget()
+    assert conteudo is not None
+    assert conteudo.height() <= dlg.rolagem.viewport().height()

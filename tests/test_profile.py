@@ -24,6 +24,7 @@ from owl_vault.application import profile as profile_mod
 from owl_vault.application.keysource import KeySource
 from owl_vault.application.profile import (
     MAX_PIN_FAILURES,
+    NOTE_BACKUP_PENDING,
     NOTE_BACKUP_USED,
     PRACTICE_EVERY_DAYS,
     PRACTICE_FIRST_DAYS,
@@ -1589,6 +1590,221 @@ def test_change_master_recusa_senha_fraca(
     assert (both.path.read_bytes(), both.bak.read_bytes()) == antes
     assert not calibracao_rapida
     both.unlock_with_master(MASTER).close()
+
+
+# --- gravação das duas cópias: tudo ou nada para quem chama (perfil-2) --------------------
+
+
+def _em_uso() -> PermissionError:
+    exc = PermissionError(13, "arquivo em uso (falha simulada)")
+    exc.winerror = 32  # type: ignore[attr-defined]
+    return exc
+
+
+class FalhasNaGravacao:
+    """Falhas de E/S simuladas dentro de ``write_both``.
+
+    * ``principal``: trocar o principal falha (o principal NÃO muda);
+    * ``reler``: ler o principal DEPOIS que ele foi trocado falha (antivírus segurando);
+    * ``bak``: trocar o .bak DEPOIS que o principal foi trocado falha (tentativas esgotadas).
+    """
+
+    def __init__(self, store: ProfileStore, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.store = store
+        self.armado = False
+        self.principal = self.reler = self.bak = False
+        self.disparos = 0
+        self._dentro = self._trocou = False
+        orig_wb = ProfileStore.write_both
+        orig_install = ProfileStore._install
+        orig_read = Path.read_bytes
+        f = self
+
+        def write_both(st: ProfileStore, obj: dict[str, Any]) -> Any:
+            f._dentro, f._trocou = st is f.store, False
+            try:
+                return orig_wb(st, obj)
+            finally:
+                f._dentro = False
+
+        def install(st: ProfileStore, tmp: Path, dest: Path) -> None:
+            if f.armado and f._dentro:
+                if dest == st.path and f.principal:
+                    f.disparos += 1
+                    tmp.unlink()
+                    raise _em_uso()
+                if dest == st.bak and f.bak and f._trocou:
+                    f.disparos += 1
+                    tmp.unlink()
+                    raise _em_uso()
+            orig_install(st, tmp, dest)
+            if f._dentro and dest == st.path:
+                f._trocou = True
+
+        def read_bytes(p: Path) -> bytes:
+            if f.armado and f.reler and f._dentro and f._trocou and p == f.store.path:
+                f.disparos += 1
+                raise _em_uso()
+            return orig_read(p)
+
+        monkeypatch.setattr(ProfileStore, "write_both", write_both)
+        monkeypatch.setattr(ProfileStore, "_install", install)
+        monkeypatch.setattr(Path, "read_bytes", read_bytes)
+
+    @contextlib.contextmanager
+    def ativas(self, *, principal: bool = False, reler: bool = False, bak: bool = False) -> Any:
+        self.principal, self.reler, self.bak, self.armado = principal, reler, bak, True
+        try:
+            yield self
+        finally:
+            self.armado = False
+
+
+@pytest.fixture
+def falhas(both: ProfileStore, monkeypatch: pytest.MonkeyPatch) -> FalhasNaGravacao:
+    return FalhasNaGravacao(both, monkeypatch)
+
+
+def _sem_principal(store: ProfileStore) -> None:
+    """Deixa só o .bak (o principal some)."""
+    store.path.unlink()
+
+
+def test_set_pin_com_releitura_falhando_vale_nas_duas_copias(
+    both: ProfileStore, falhas: FalhasNaGravacao
+) -> None:
+    """Antes: write_both relia o principal recém-trocado; uma falha nessa releitura virava
+    "Erro inesperado" com o PIN novo já valendo no principal e o antigo no .bak."""
+    s = both.unlock_with_master(MASTER)
+    with falhas.ativas(reler=True):
+        s.set_pin(NEW_PIN)  # não pode levantar: nada relê o principal depois de trocá-lo
+    s.close()
+    assert read_json(both.path)["pin"] == read_json(both.bak)["pin"]
+    assert not both.backup_pending
+    assert NOTE_BACKUP_PENDING not in s.notes
+    with pytest.raises(PinError):
+        both.unlock_with_pin(PIN)
+    _sem_principal(both)
+    with pytest.raises(PinError):
+        both.unlock_with_pin(PIN)  # nem o .bak aceita o PIN antigo
+    both.unlock_with_pin(NEW_PIN).close()
+
+
+def test_set_pin_com_bak_travado_vale_e_o_bak_e_refeito_na_proxima_gravacao(
+    both: ProfileStore, falhas: FalhasNaGravacao
+) -> None:
+    s = both.unlock_with_master(MASTER)
+    with falhas.ativas(bak=True):
+        s.set_pin(NEW_PIN)  # antes: PermissionError ("Erro inesperado"), mas o PIN já tinha mudado
+    assert falhas.disparos == 1
+    assert both.backup_pending
+    assert NOTE_BACKUP_PENDING in s.notes
+    assert read_json(both.bak)["pin"] != read_json(both.path)["pin"]  # .bak ficou para depois
+    s.save()  # qualquer gravação seguinte passa o principal para o .bak
+    assert not both.backup_pending
+    assert NOTE_BACKUP_PENDING not in s.notes
+    assert read_json(both.bak)["pin"] == read_json(both.path)["pin"]
+    s.close()
+    both.unlock_with_pin(NEW_PIN).close()
+    _sem_principal(both)
+    with pytest.raises(PinError):
+        both.unlock_with_pin(PIN)
+    both.unlock_with_pin(NEW_PIN).close()
+
+
+@pytest.mark.parametrize("falha", ["reler", "bak"])
+def test_change_master_com_falha_depois_do_principal_vale(
+    both: ProfileStore,
+    falhas: FalhasNaGravacao,
+    calibracao_rapida: list[tuple[Any, ...]],
+    falha: str,
+) -> None:
+    """Antes: change_master levantava com a senha nova já no principal e na sessão (as próximas
+    trancagens usavam a senha que a interface disse não ter sido salva)."""
+    s = both.unlock_with_master(MASTER)
+    with falhas.ativas(reler=falha == "reler", bak=falha == "bak"):
+        s.change_master(NEW_MASTER)
+    nova = s.index.keks[0]
+    assert len(s.index.keks) == 2
+    assert nova.kek == derive_kek(NEW_MASTER, nova.salt, NEW_PARAMS, TESTING_POLICY)
+    assert read_json(both.path)["kdf"]["salt"] == nova.salt.hex()
+    if falha == "bak":
+        assert NOTE_BACKUP_PENDING in s.notes
+        s.save()
+    assert read_json(both.bak)["kdf"]["salt"] == nova.salt.hex()
+    s.close()
+    with pytest.raises(AuthenticationError, match="Senha mestra incorreta"):
+        both.unlock_with_master(MASTER)
+    _sem_principal(both)
+    with pytest.raises(AuthenticationError, match="Senha mestra incorreta"):
+        both.unlock_with_master(MASTER)
+    both.unlock_with_master(NEW_MASTER).close()
+
+
+def test_set_pin_que_falha_antes_de_gravar_nao_vale_nem_depois(
+    both: ProfileStore, falhas: FalhasNaGravacao
+) -> None:
+    """Exceção = nada mudou, nem na memória: um ``save`` depois não grava o PIN que a
+    interface disse que falhou."""
+    s = both.unlock_with_master(MASTER)
+    antes = read_json(both.path)["pin"]
+    with falhas.ativas(principal=True), pytest.raises(PermissionError):
+        s.set_pin(NEW_PIN)
+    assert read_json(both.path)["pin"] == antes
+    assert s.obj["pin"] == antes
+    s.save()
+    s.close()
+    assert read_json(both.path)["pin"] == antes
+    both.unlock_with_pin(PIN).close()
+    with pytest.raises(PinError):
+        both.unlock_with_pin(NEW_PIN)
+
+
+def test_change_master_que_falha_antes_de_gravar_nao_vale_nem_depois(
+    both: ProfileStore, falhas: FalhasNaGravacao, calibracao_rapida: list[tuple[Any, ...]]
+) -> None:
+    s = both.unlock_with_master(MASTER)
+    keks_antes = [(k.kek, k.salt, k.origin) for k in s.index.keks]
+    kdf_antes = dict(s.obj["kdf"])
+    with falhas.ativas(principal=True), pytest.raises(PermissionError):
+        s.change_master(NEW_MASTER)
+    # a sessão continua com a senha mestra antiga: as próximas trancagens usam a antiga
+    assert [(k.kek, k.salt, k.origin) for k in s.index.keks] == keks_antes
+    assert s.key_source().kek == keks_antes[0][0]
+    assert s.obj["kdf"] == kdf_antes
+    s.save()
+    s.close()
+    both.unlock_with_master(MASTER).close()
+    with pytest.raises(AuthenticationError, match="Senha mestra incorreta"):
+        both.unlock_with_master(NEW_MASTER)
+
+
+def test_desbloqueio_pelo_pin_com_bak_travado_nao_vira_erro(
+    both: ProfileStore, falhas: FalhasNaGravacao
+) -> None:
+    """Antes: o PIN certo dava erro. Agora o desbloqueio vale; o .bak que não pôde ser trocado
+    ainda tem a tentativa contada antes de derivar, e o efetivo continua sendo o máximo das
+    cópias (nunca baixa por conta da memória) até o próximo desbloqueio refazer as duas."""
+    with falhas.ativas(bak=True):
+        s = both.unlock_with_pin(PIN)
+    assert NOTE_BACKUP_PENDING in s.notes
+    assert failures(both) == (0, 1)
+    s.close()
+    both.unlock_with_pin(PIN).close()
+    assert failures(both) == (0, 0)
+    assert not both.backup_pending
+    assert wrong_pin(both) == MAX_PIN_FAILURES - 1
+
+
+def test_write_both_grava_no_bak_os_mesmos_bytes_do_principal(both: ProfileStore) -> None:
+    s = both.unlock_with_master(MASTER)
+    add_folder(s)
+    s.save()
+    assert both.bak.read_bytes() != both.path.read_bytes()
+    assert both.write_both(s.obj) is True
+    assert both.bak.read_bytes() == both.path.read_bytes()
+    assert not both.backup_pending
+    s.close()
 
 
 # --- prática da senha mestra ---------------------------------------------------------------

@@ -28,7 +28,7 @@ criptografados: só abrem pelo Owl Vault, com o seu **PIN** (ou a **senha mestra
 |----------|-------|-----------------|
 | Trancada / Escondida | **Abrir** | arquivos criptografados dentro da pasta |
 | Aberta — visível neste computador | **Trancar** | arquivos legíveis; tranque ao terminar |
-| Precisa de atenção | **Resolver…** | algo foi interrompido ou mudou; o programa explica e oferece no máximo 2 saídas |
+| Precisa de atenção | **Resolver…** | algo foi interrompido ou mudou; o programa explica o problema e oferece as saídas (sempre há **Tirar da lista**, que não apaga nada) |
 
 O programa trava sozinho depois de 5 minutos sem uso, ao bloquear o Windows (Win+L) e ao
 suspender. Ao sair com pastas abertas, ele oferece **Trancar e sair**.

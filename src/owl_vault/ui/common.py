@@ -9,11 +9,12 @@ Os helpers antigos (``title_label``, ``body``, ``hint``, ``link_button``, ``prim
 from __future__ import annotations
 
 import html
+import math
 import os
 import time
 from collections.abc import Callable, Sequence
 
-from PySide6.QtCore import QEvent, QSettings, QSize, Qt, SignalInstance, Slot
+from PySide6.QtCore import QEvent, QObject, QRect, QSettings, QSize, Qt, SignalInstance, Slot
 from PySide6.QtGui import (
     QCloseEvent,
     QColor,
@@ -21,19 +22,25 @@ from PySide6.QtGui import (
     QImage,
     QKeyEvent,
     QPixmap,
+    QResizeEvent,
     QShowEvent,
+    QTextBlock,
+    QTextBlockFormat,
     QTextCharFormat,
     QTextCursor,
 )
 from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
+    QLayout,
     QLineEdit,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
@@ -109,26 +116,216 @@ def brand_header(subtitle: str = "Pastas protegidas") -> QWidget:
     return header
 
 
-def fit_to_content(window: QWidget, width: int, *, clamp_to_screen: bool = False) -> None:
+#: folga para a moldura do Windows (barra de título e bordas) ao caber na área útil da tela
+FOLGA_MOLDURA = 80
+FOLGA_LARGURA = 16
+#: o mínimo que a barra de título e as bordas ocupam: passar disso tira a janela da tela
+FOLGA_TITULO = 40
+#: o corpo (``Rolagem``) de um diálogo encolhido para caber na tela fica com pelo menos isto
+#: (ou menos, se o conteúdo inteiro for menor)
+CORPO_MINIMO = 120
+#: numa tela baixa demais até para isso, o corpo encolhe até aqui (e rola): os botões
+#: continuam inteiros à vista
+CORPO_APERTADO = 64
+#: altura máxima de um QWidget no Qt (QWIDGETSIZE_MAX): a Rolagem sem teto
+SEM_TETO = 16777215
+
+
+def area_util(window: QWidget) -> QRect | None:
+    """Área útil da tela onde a janela está (sem a barra de tarefas), em pixels lógicos."""
+    screen = window.screen() or QGuiApplication.primaryScreen()
+    return screen.availableGeometry() if screen is not None else None
+
+
+def fit_to_content(window: QWidget, width: int, *, clamp_to_screen: bool = True) -> None:
     """Tamanho fixo pelo conteúdo, como o QMessageBox: largura ``width`` (ou mais, se o
     conteúdo pedir) e a altura que os textos com quebra de linha precisam NESSA largura.
 
     Sem isso o Qt mede os textos numa largura menor (sobra um vão) e ainda limita a janela a
-    2/3 da tela (corta texto). ``clamp_to_screen``: não passa da altura útil da tela — só para
-    janelas com uma área de rolagem que pode encolher.
+    2/3 da tela (corta texto). ``clamp_to_screen`` (padrão): nunca passa da área útil da tela
+    (1366x768 a 125%/150%); o corpo dos diálogos fica numa ``Rolagem`` que encolhe e rola, e
+    a linha de botões, fora dela, continua à vista.
+
+    Quando a altura fica menor que a natural, o que falta sai SÓ da ``Rolagem`` (ela ganha um
+    teto). Sem o teto, o QBoxLayout trata a altura do conteúdo como mínimo da Rolagem e tira a
+    diferença de quem for mais alto — a coluna de botões empilhados, que se sobrepunham.
+    Piso: a linha de botões inteira mais ``CORPO_MINIMO`` de corpo. Só se nem isso couber na
+    tela (descontada só a barra de título, ``FOLGA_TITULO``) o corpo encolhe mais, até
+    ``CORPO_APERTADO``.
     """
     lay = window.layout()
     if lay is None:
         return
+    rolagens = _rolagens(window)
     minimo = lay.totalMinimumSize()
     w = max(width, minimo.width())
-    h = lay.totalHeightForWidth(w) if lay.hasHeightForWidth() else lay.totalSizeHint().height()
-    h = max(h, minimo.height())
-    screen = window.screen()
-    if clamp_to_screen and screen is not None:
-        h = max(minimo.height(), min(h, screen.availableGeometry().height() - 80))
+    area = area_util(window) if clamp_to_screen else None
+    if area is not None:
+        w = max(minimo.width(), min(w, area.width() - FOLGA_LARGURA))
+    # medidas SEM o teto que um ajuste anterior pôs na Rolagem (o layout já o aplica)
+    naturais = [r.heightForWidth(_largura_para(r, window, w)) for r in rolagens]
+    minimos = [r.minimumSizeHint().height() for r in rolagens]
+    tetos = [r.maximumHeight() for r in rolagens]
+    natural = (
+        lay.totalHeightForWidth(w) if lay.hasHeightForWidth() else lay.totalSizeHint().height()
+    )
+    natural += sum(n - min(n, t) for n, t in zip(naturais, tetos, strict=True))
+    piso = minimo.height() + sum(m - min(m, t) for m, t in zip(minimos, tetos, strict=True))
+    limite = area.height() - FOLGA_MOLDURA if area is not None else None
+    if area is not None and limite is not None and piso > limite:
+        # o piso passa da folga confortável: pode ir até perto da barra de título; se nem
+        # assim couber, o corpo encolhe mais e os botões continuam inteiros à vista
+        apertado = piso - sum(m - min(m, CORPO_APERTADO) for m in minimos)
+        piso = max(apertado, min(piso, area.height() - FOLGA_TITULO))
+    h = natural if limite is None else min(natural, limite)
+    h = max(h, piso)
+    falta = max(0, natural - h)
+    for i in sorted(range(len(rolagens)), key=lambda k: -naturais[k]):
+        tira = min(falta, max(0, naturais[i] - min(minimos[i], CORPO_APERTADO)))
+        falta -= tira
+        _por_teto(rolagens[i], window, naturais[i] - tira if tira else SEM_TETO)
     if window.minimumSize() != QSize(w, h) or window.maximumSize() != QSize(w, h):
         window.setFixedSize(w, h)
+
+
+def _rolagens(window: QWidget) -> list[Rolagem]:
+    """As ``Rolagem`` visíveis da janela que não estão dentro de outra Rolagem."""
+    achadas = []
+    for r in window.findChildren(Rolagem):
+        if not r.isVisibleTo(window):
+            continue
+        pai = r.parentWidget()
+        while pai is not None and pai is not window and not isinstance(pai, Rolagem):
+            pai = pai.parentWidget()
+        if not isinstance(pai, Rolagem):
+            achadas.append(r)
+    return achadas
+
+
+def _largura_para(alvo: QWidget, janela: QWidget, largura: int) -> int:
+    """Largura que ``alvo`` recebe quando ``janela`` tem ``largura``: desconta, de cada nível
+    até a janela, as margens do widget (molduras) e as do layout. Vale para quem ocupa a
+    largura toda do layout, como a Rolagem dos diálogos (antes de o layout rodar, a largura
+    atual dela ainda não é a final)."""
+    pai = alvo.parentWidget()
+    while pai is not None:
+        m = pai.contentsMargins()
+        largura -= m.left() + m.right()
+        lay = pai.layout()
+        if lay is not None:
+            lm = lay.contentsMargins()
+            largura -= lm.left() + lm.right()
+        if pai is janela:
+            break
+        pai = pai.parentWidget()
+    return max(1, largura)
+
+
+def _por_teto(rolagem: Rolagem, janela: QWidget, teto: int) -> None:
+    """Teto de altura da Rolagem. As medidas guardadas pelos layouts até a janela ficam
+    velhas: são descartadas, para o próximo ajuste medir certo (e parar de mudar)."""
+    teto = max(0, min(teto, SEM_TETO))
+    if rolagem.maximumHeight() == teto:
+        return
+    rolagem.setMaximumHeight(teto)
+    w: QWidget | None = rolagem
+    while w is not None:
+        w.updateGeometry()
+        lay = w.layout()
+        if lay is not None:
+            _invalida(lay)
+        if w is janela:
+            break
+        w = w.parentWidget()
+
+
+def _invalida(lay: QLayout) -> None:
+    lay.invalidate()
+    for i in range(lay.count()):
+        item = lay.itemAt(i)
+        sub = item.layout() if item is not None else None
+        if sub is not None:
+            _invalida(sub)
+
+
+class Rolagem(QScrollArea):
+    """Rolagem vertical sem moldura que pede a altura do conteúdo na largura dada (como um
+    texto com quebra de linha). Numa tela baixa a janela a encolhe (``fit_to_content`` põe um
+    teto nela) e o conteúdo rola."""
+
+    def __init__(self, content: QWidget) -> None:
+        super().__init__()
+        self.setObjectName("transparente")
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # o Tab vai direto aos campos
+        self.setWidget(content)
+        content.installEventFilter(self)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        content = self.widget()
+        if content is None:
+            return super().heightForWidth(width)
+        frame = 2 * self.frameWidth()
+        h = content.heightForWidth(max(1, width - frame))
+        if h < 0:
+            h = content.sizeHint().height()
+        return h + frame
+
+    def sizeHint(self) -> QSize:
+        content = self.widget()
+        if content is None:
+            return super().sizeHint()
+        frame = 2 * self.frameWidth()
+        return content.sizeHint() + QSize(frame, frame)
+
+    def minimumSizeHint(self) -> QSize:
+        """Altura: ``CORPO_MINIMO``, ou menos se o conteúdo inteiro cabe em menos (o mínimo
+        dele é uma linha por texto). Um mínimo maior que o conteúdo esticava os diálogos
+        curtos: o título e o texto repartiam a sobra e ficavam longe um do outro."""
+        content = self.widget()
+        largura = super().minimumSizeHint().width()
+        altura = CORPO_MINIMO
+        if content is not None:
+            barra = self.verticalScrollBar().sizeHint().width()
+            largura = max(largura, content.minimumSizeHint().width() + barra)
+            frame = 2 * self.frameWidth()
+            altura = min(CORPO_MINIMO, max(0, content.minimumSizeHint().height()) + frame)
+        return QSize(largura, altura)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if watched is self.widget() and event.type() == QEvent.Type.LayoutRequest:
+            self.updateGeometry()  # um erro ou os detalhes apareceram: a janela acompanha
+            self._ajusta_barra()
+        return super().eventFilter(watched, event)
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._ajusta_barra()
+
+    def _ajusta_barra(self) -> None:
+        """A barra vertical só aparece se o conteúdo NÃO cabe na largura toda. Sem isso, uma
+        barra que apareceu num passo intermediário do layout nunca mais sumia: com ela o
+        texto quebra numa largura menor, fica mais alto e continua "precisando" dela."""
+        content = self.widget()
+        if content is None:
+            return
+        caixa = self.maximumViewportSize()
+        altura = content.heightForWidth(caixa.width())
+        if altura < 0:
+            altura = content.sizeHint().height()
+        altura = max(altura, content.minimumSizeHint().height())
+        politica = (
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            if altura <= caixa.height()
+            else Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        if self.verticalScrollBarPolicy() != politica:
+            self.setVerticalScrollBarPolicy(politica)
 
 
 def wipe(edit: QLineEdit) -> None:
@@ -208,7 +405,8 @@ def fmt_size(n: int) -> str:
     """Tamanho em português ("1,5 KB"). Arredonda ANTES de escolher a unidade: 1 MiB - 1 byte
     vira "1,0 MB", nunca "1024,0 KB"."""
     if n < 1024:
-        return f"{int(n)} bytes"
+        inteiro = int(n)
+        return "1 byte" if inteiro == 1 else f"{inteiro} bytes"
     units = ["KB", "MB", "GB", "TB"]
     value = n / 1024
     for unit in units:
@@ -220,19 +418,28 @@ def fmt_size(n: int) -> str:
 
 
 def fmt_int(n: int) -> str:
-    return f"{n:,}".replace(",", ".")
+    """Inteiro com ponto de milhar ("1.234"); um float é arredondado antes."""
+    inteiro = _arredonda(n) if isinstance(n, float) else n
+    return f"{inteiro:,}".replace(",", ".")
+
+
+def _arredonda(x: float) -> int:
+    """Meio para cima (o ``round`` do Python leva 2,5 a 2: 2h30 viraria "cerca de 2 horas")."""
+    return math.floor(x + 0.5)
 
 
 def fmt_duration(seconds: float) -> str:
+    if not math.isfinite(seconds):
+        return "tempo incerto"  # nenhuma conta deveria chegar aqui; nunca quebra a tela
     if seconds < 90:
         return "menos de 2 minutos"
-    minutes = round(seconds / 60)
+    minutes = _arredonda(seconds / 60)
     if minutes < 60:
         return f"cerca de {minutes} minutos"
-    hours = minutes / 60
+    hours = seconds / 3600  # das horas exatas (arredondar duas vezes levaria 2h29 a 3 horas)
     if hours < 1.5:
         return "cerca de 1 hora"
-    return f"cerca de {round(hours)} horas"
+    return f"cerca de {_arredonda(hours)} horas"
 
 
 def short_list(items: Sequence[str], limit: int = 5) -> str:
@@ -251,6 +458,45 @@ def list_box(items: Sequence[str], height: int = 110) -> QPlainTextEdit:
     text.setMaximumHeight(height + 60)
     text.setAccessibleName("Detalhes")
     return text
+
+
+# --- tema: o que é pintado fora do QSS acompanha a troca de tema ------------------------
+
+#: token de cada tipo de linha colorida de um registro; o índice fica em QTextBlock.userState
+CORES_DO_REGISTRO = ("", "warn", "danger", "ok")
+
+
+def assinatura_do_tema() -> tuple[tuple[str, str], ...]:
+    """Muda quando o tema muda (para repintar só uma vez por troca)."""
+    return tuple(sorted(current_tokens().items()))
+
+
+def _pintar_bloco(block: QTextBlock, estado: int, tokens: dict[str, str]) -> None:
+    if not 0 < estado < len(CORES_DO_REGISTRO):
+        return
+    fmt = QTextCharFormat()
+    fmt.setForeground(QColor(tokens[CORES_DO_REGISTRO[estado]]))
+    cur = QTextCursor(block)
+    cur.movePosition(QTextCursor.MoveOperation.StartOfBlock)
+    cur.movePosition(QTextCursor.MoveOperation.EndOfBlock, QTextCursor.MoveMode.KeepAnchor)
+    cur.mergeCharFormat(fmt)
+
+
+def colorir_linha(block: QTextBlock, cor: str) -> None:
+    """Pinta a linha com o token ``cor`` ("warn", "danger", "ok"; "" = cor do QSS) e guarda o
+    tipo no bloco, para ``repintar_registro`` refazer a cor quando o tema mudar."""
+    estado = CORES_DO_REGISTRO.index(cor) if cor in CORES_DO_REGISTRO else 0
+    block.setUserState(estado)
+    _pintar_bloco(block, estado, current_tokens())
+
+
+def repintar_registro(edit: QPlainTextEdit) -> None:
+    """Depois de trocar o tema: as linhas coloridas passam para as cores do tema novo."""
+    tokens = current_tokens()
+    block = edit.document().firstBlock()
+    while block.isValid():
+        _pintar_bloco(block, block.userState(), tokens)
+        block = block.next()
 
 
 # --- progresso (T6) ---------------------------------------------------------------------
@@ -326,10 +572,16 @@ class ProgressDialog(QDialog):
         self._done = [0, 0]
         self._t0 = time.monotonic()
         self._stage_text = "Preparando…"
+        self._tema = assinatura_do_tema()
         outer = QVBoxLayout(self)
         outer.setContentsMargins(24, 24, 24, 24)
-        self.card, lay = comp.cartao()
+        self.card, card_lay = comp.cartao()
         outer.addWidget(self.card)
+        # tudo menos o Cancelar rola numa tela baixa: o botão fica sempre à vista
+        conteudo, lay = comp.transparente()
+        lay.setSpacing(12)
+        self.rolagem = Rolagem(conteudo)
+        card_lay.addWidget(self.rolagem, 1)
         self.title = comp.titulo(title)
         self.title.setTextFormat(Qt.TextFormat.PlainText)
         lay.addWidget(self.title)
@@ -350,6 +602,7 @@ class ProgressDialog(QDialog):
             box = QPlainTextEdit()
             box.setObjectName("log")
             box.setReadOnly(True)
+            box.setUndoRedoEnabled(False)  # o registro não guarda histórico de edição
             box.setTabChangesFocus(True)
             box.setMaximumBlockCount(5000)
             box.setMinimumHeight(160)
@@ -358,7 +611,7 @@ class ProgressDialog(QDialog):
             self.log_box = box
         self.notice = comp.Aviso(html.escape(note))
         lay.addWidget(self.notice)
-        lay.addSpacing(8)
+        card_lay.addSpacing(8)
         row = QHBoxLayout()
         row.setSpacing(12)
         row.addStretch(1)
@@ -366,7 +619,7 @@ class ProgressDialog(QDialog):
         self.cancel_button.clicked.connect(self._cancel)
         self.cancel_button.setVisible(cancellable)
         row.addWidget(self.cancel_button)
-        lay.addLayout(row)
+        card_lay.addLayout(row)
         b = runner.bridge
         b.stage.connect(self._on_stage)
         b.advance.connect(self._on_advance)
@@ -384,20 +637,31 @@ class ProgressDialog(QDialog):
             fit_to_content(self, 520)  # um texto mudou de tamanho: a altura acompanha
         return handled
 
+    def changeEvent(self, event: QEvent) -> None:
+        super().changeEvent(event)
+        if event.type() in (QEvent.Type.PaletteChange, QEvent.Type.StyleChange):
+            tema = assinatura_do_tema()
+            # o tema mudou (e o diálogo já foi montado): sombra e linhas coloridas acompanham
+            if tema != getattr(self, "_tema", tema):
+                self._tema = tema
+                from owl_vault.ui.componentes import sombra  # noqa: PLC0415
+
+                sombra(self.card)
+                if self.log_box is not None:
+                    repintar_registro(self.log_box)
+
     # ------------------------------------------------------------------ registro
     def _log(self, text: str, cor: str = "") -> None:
         """Uma linha no registro; cor por ``QTextCharFormat`` (nunca HTML)."""
         box = self.log_box
         if box is None:
             return
-        fmt = QTextCharFormat()
-        if cor:
-            fmt.setForeground(QColor(current_tokens()[cor]))
         cursor = QTextCursor(box.document())
         cursor.movePosition(QTextCursor.MoveOperation.End)
         if not box.document().isEmpty():
-            cursor.insertBlock()
-        cursor.insertText(f"{time.strftime('%H:%M:%S')}  {text}", fmt)
+            cursor.insertBlock(QTextBlockFormat(), QTextCharFormat())
+        cursor.insertText(f"{time.strftime('%H:%M:%S')}  {text}", QTextCharFormat())
+        colorir_linha(box.document().lastBlock(), cor)
         bar = box.verticalScrollBar()
         bar.setValue(bar.maximum())
 

@@ -21,11 +21,13 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import os
 import re
 import secrets
 from collections.abc import Callable, Set
 from dataclasses import dataclass, field
+from typing import Any
 
 from owl_vault.application.common import read_zone_id, round_up, write_motw
 from owl_vault.application.create import CreateResult, create_vault
@@ -123,9 +125,33 @@ MANTIDO = "mantido"
 #: papel de cofre já aprovado pela regra de ouro cuja exclusão começou (retomada ao iniciar)
 DESCARTANDO = "descartando"
 
+# issues (``FolderView.issue``) além dos estados intermediários; a interface trata QUALQUER
+# issue que não conhece com um "Resolver" genérico (attention + Procurar a pasta… + Tirar da
+# lista), então nenhuma linha fica sem saída.
+#: a cópia criptografada de que o estado intermediário precisa (área temporária
+#: ``.owlvault-<id>`` ou dentro da pasta) sumiu ou não pode ser lida: nem Continuar nem Desfazer
+COFRE_INACESSIVEL = "cofre_inacessivel"
+#: ``P\\.owlvault`` de uma pasta trancada NÃO é o cofre registrado (ex.: backup antigo no lugar)
+COFRE_DIFERENTE = "cofre_diferente"
+#: o Windows não deixa o Owl Vault ler a pasta (permissões)
+SEM_ACESSO = "sem_acesso"
+#: outro erro ao conferir a pasta (a lista continua mostrando as outras)
+ERRO_LEITURA = "erro_leitura"
+
 #: mesmo limite de caminho usado por ``restore_vault`` (nome do temporário mais longo)
 _LONGEST_TEMP = len(".owl-") + 32 + 1 + 32 + len(".part")
 _STAGING_VAULT_RE = re.compile(r"(?:novo|anterior)-[0-9a-f]{16}")
+_INTERRUPTED_LOCK = (
+    "O trancamento foi interrompido. O que já saiu da pasta está guardado; clique em "
+    "'Continuar trancando' ou 'Desfazer'."
+)
+_NEW_ITEM = "item novo colocado na pasta durante o trancamento (não está guardado)"
+_CHANGED = "o arquivo mudou depois de ser criptografado; não foi apagado"
+_UNDO_LEFTOVER = (
+    "pedaço de arquivo deixado por um 'Desfazer' interrompido (o arquivo está guardado); não "
+    "pôde ser apagado agora"
+)
+_RESTORE_ID_RE = re.compile(r"[0-9a-f]{32}")
 
 
 class FolderUnavailableError(StateError):
@@ -144,7 +170,8 @@ class FolderView:
     attention: str = ""
     available: bool = True
     #: "" | apagando | abertura_incompleta | abrindo | trancando | itens_extras | sem_dados |
-    #: nao_encontrada | indisponivel | versao_anterior | versao_anterior_ilegivel | senha_antiga
+    #: nao_encontrada | indisponivel | versao_anterior | versao_anterior_ilegivel | senha_antiga |
+    #: cofre_inacessivel | cofre_diferente | sem_acesso | erro_leitura
     issue: str = ""
     base_action: str = ""  # ação normal do estado (para o menu ⋯ quando há atenção)
 
@@ -263,6 +290,11 @@ class LockerManager:
             return False
 
     def _prepare_staging(self, staging: str) -> None:
+        if winfs.is_plain_file_at(staging):
+            raise UnsafePathError(
+                f"Já existe um arquivo chamado '{winfs.name_of(staging)}' ao lado da pasta, e o "
+                "Owl Vault precisa desse nome. Mova esse arquivo para outro lugar e tente de novo."
+            )
         winfs.ensure_own_dir(staging)
         shell.change_attributes(staging, add=HIDE)
         self._restrict(staging, directory=True)
@@ -297,9 +329,14 @@ class LockerManager:
             or res.identity.file_id.hex() != rec.file_id
             or res.volume != rec.volume
         ):
+            hint = (
+                " Ela está escondida: em 'Procurar a pasta…', escolha a pasta onde ela fica."
+                if rec.hidden
+                else ""
+            )
             raise FolderMovedError(
                 f"A pasta '{rec.name}' não está mais em {winfs.strip_extended(rec.path)} (foi "
-                "movida, renomeada ou substituída). Use 'Procurar a pasta…'."
+                f"movida, renomeada ou substituída). Use 'Procurar a pasta…'.{hint}"
             )
         return rec.path
 
@@ -326,9 +363,141 @@ class LockerManager:
         )
 
     def keys_for_vault(self, vault_dir: str) -> KeySource:
-        """Escolhe a KEK do perfil cujo salt/params batem com o cabeçalho do cofre."""
+        """Escolhe a KEK do perfil cujo salt/params batem com o cabeçalho do cofre.
+
+        O ``.owlvault`` de uma pasta TRANCADA da lista só é aceito se for o cofre registrado
+        (senão StateError): o cofre errado nunca é aberto nem conferido como se fosse o da pasta
+        ('Verificar arquivos' não diz "Tudo certo" de uma cópia antiga posta no lugar).
+        """
+        self._check_registered_inner(vault_dir)
         k = self._kek_for_vault(vault_dir)
         return KeySource(salt=k.salt, params=k.params, kek=k.kek)
+
+    def _check_registered_inner(self, vault_dir: str) -> None:
+        wanted = os.path.normcase(winfs.strip_extended(vault_dir)).rstrip("\\")
+        for rec in self.folders:
+            current = rec.vault("atual")
+            if rec.state != TRANCADA or current is None or not current.vault_id:
+                continue
+            inner = winfs.strip_extended(winfs.join(rec.path, VAULT_DIR))
+            if os.path.normcase(inner).rstrip("\\") != wanted:
+                continue
+            try:
+                found = self._vault_id_of(vault_dir)
+            except OSError:
+                return  # ilegível: quem abrir o cofre explica
+            if found != current.vault_id:
+                raise StateError(self._different_vault_text(rec))
+            return
+
+    @staticmethod
+    def _different_vault_text(rec: FolderRecord) -> str:
+        return (
+            f"Os dados criptografados que estão em '{rec.name}' não são os que o Owl Vault "
+            "guardou por último nesta pasta (talvez uma cópia antiga tenha sido colocada no "
+            "lugar). Por segurança, eles não são abertos nem conferidos como se fossem os da "
+            "pasta. Se você tem a cópia certa, coloque-a de volta. Para usar a que está na pasta, "
+            "tire a pasta da lista e use '☰ > Recuperar uma pasta protegida' com a senha mestra."
+        )
+
+    def _inner_differs(self, rec: FolderRecord) -> bool:
+        """Pasta trancada cujo ``P\\.owlvault`` tem OUTRO vault_id que o 'atual' registrado."""
+        current = rec.vault("atual")
+        inner = winfs.join(rec.path, VAULT_DIR)
+        if current is None or not current.vault_id or not winfs.is_plain_dir_at(inner):
+            return False
+        try:
+            return self._vault_id_of(inner) != current.vault_id
+        except OSError:
+            return False
+
+    def _vault_problem(self, location: str) -> str:
+        """Texto vazio se o cofre existe e o cabeçalho abre com uma KEK do perfil; senão
+        "ausente" ou "ilegivel" (um cofre assim nunca conta como vazio)."""
+        if not os.path.lexists(location):
+            return "ausente"
+        if not winfs.is_plain_dir_at(location):
+            return "ilegivel"
+        try:
+            self._kek_for_vault(location)
+        except (OwlVaultError, OSError):
+            return "ilegivel"
+        return ""
+
+    @staticmethod
+    def _inaccessible_text(rec: FolderRecord, v: VaultRef, problem: str) -> str:
+        """Explica que a cópia criptografada de um estado intermediário sumiu ou não abre."""
+        area = winfs.parent_of(v.location)
+        where = winfs.strip_extended(area)
+        if rec.state == APAGANDO:
+            what = f"A cópia criptografada com os arquivos que já saíram de '{rec.name}'"
+            after = (
+                "Por isso não dá para continuar nem desfazer o trancamento. Os arquivos que "
+                "ainda estão na pasta continuam lá."
+            )
+        elif rec.state == ABERTURA_INCOMPLETA:
+            what = f"A cópia criptografada de '{rec.name}'"
+            after = (
+                "Por isso não dá para tentar abrir de novo. Os arquivos que voltaram para a pasta "
+                "continuam lá; para ficar só com eles, clique em 'Continuar sem eles'."
+            )
+        else:
+            what = f"A cópia criptografada de '{rec.name}'"
+            after = (
+                "Por isso não dá para continuar abrindo. Os arquivos que já voltaram para a "
+                "pasta continuam lá."
+            )
+        if problem == "ausente":
+            first = f"{what} não foi encontrada em {where} (uma pasta oculta)."
+            fix = (
+                f"Se você moveu ou apagou a pasta oculta '{winfs.name_of(area)}', coloque-a de "
+                "volta ao lado da pasta."
+            )
+        else:
+            first = (
+                f"{what} está em {where} (uma pasta oculta), mas não pode ser lida (pode estar "
+                "danificada)."
+            )
+            fix = "Se você tem uma cópia dela, coloque-a no lugar."
+        return f"{first} {after} {fix} Se não for possível, use 'Tirar da lista' (nada é apagado)."
+
+    def _located(self, rec: FolderRecord) -> bool:
+        """A pasta registrada está no lugar (mesma identidade)? Sem levantar erro."""
+        try:
+            self._locate(rec)
+        except (StateError, OSError):
+            return False
+        return True
+
+    def _require_vault(self, rec: FolderRecord, v: VaultRef) -> None:
+        problem = self._vault_problem(v.location)
+        if problem:
+            raise StateError(self._inaccessible_text(rec, v, problem))
+
+    def _intermediate_vault(self, rec: FolderRecord) -> VaultRef | None:
+        """O cofre de que um estado intermediário precisa, se ele NÃO está dentro da pasta.
+
+        APAGANDO: o 'novo' (a não ser que já tenha entrado em P); ABRINDO/RESTAURANDO/
+        ABERTURA_INCOMPLETA: o 'anterior' mais recente (em ABRINDO ele pode ainda estar em P).
+        """
+        if rec.state == APAGANDO:
+            novo = rec.vault("novo")
+            if novo is None or self._novo_moved_into_folder(rec, novo):
+                return None
+            return novo
+        if rec.state in (ABRINDO, RESTAURANDO, ABERTURA_INCOMPLETA):
+            prev = self._latest_previous_or_none(rec)
+            if prev is None:
+                return None
+            inner = winfs.join(rec.path, VAULT_DIR)
+            if rec.state == ABRINDO and not os.path.lexists(prev.location):
+                try:
+                    if winfs.is_plain_dir_at(inner) and self._vault_id_of(inner) == prev.vault_id:
+                        return None  # o cofre ainda está na pasta (não saiu)
+                except OSError:
+                    pass
+            return prev
+        return None
 
     @staticmethod
     def _vault_id_of(vault_dir: str) -> str:
@@ -347,12 +516,39 @@ class LockerManager:
 
     # ------------------------------------------------------------------ estado exibido
     def views(self) -> list[FolderView]:
-        out: list[FolderView] = []
-        for rec in self.folders:
-            out.append(self.view(rec))
-        return out
+        """Uma linha por pasta: um problema numa pasta nunca esconde as outras (§4.5)."""
+        return [self.view(rec) for rec in self.folders]
 
     def view(self, rec: FolderRecord) -> FolderView:
+        """Estado exibido de uma pasta. Nunca levanta erro de disco: uma pasta que não pode ser
+        conferida vira "Precisa de atenção" com o motivo (sem caminho cru do Windows)."""
+        try:
+            return self._view(rec)
+        except PermissionError:
+            return FolderView(
+                rec,
+                "Precisa de atenção",
+                "resolver",
+                f"O Windows não deixa o Owl Vault ler a pasta '{rec.name}' (acesso negado). "
+                "Confira as permissões dela; se ela veio de outro computador ou de outra "
+                "instalação do Windows, pode ser preciso tomar posse dela.",
+                issue=SEM_ACESSO,
+            )
+        except (OwlVaultError, OSError) as exc:
+            # str() de um OSError traz o caminho cru do Windows: só o motivo vai para a tela
+            why = (
+                str(exc) if isinstance(exc, OwlVaultError) else (exc.strerror or "erro do sistema")
+            )
+            return FolderView(
+                rec,
+                "Precisa de atenção",
+                "resolver",
+                f"Não foi possível conferir a pasta '{rec.name}' agora ({why}). Tente de novo "
+                "mais tarde.",
+                issue=ERRO_LEITURA,
+            )
+
+    def _view(self, rec: FolderRecord) -> FolderView:
         attention = "Precisa de atenção"
         try:
             self._locate(rec)
@@ -370,10 +566,7 @@ class LockerManager:
             return FolderView(rec, attention, "resolver", str(exc), issue="nao_encontrada")
         opening = "A abertura foi interrompida. Clique em 'Continuar abrindo'."
         texts = {
-            APAGANDO: (
-                "O trancamento foi interrompido. Seus arquivos já estão guardados; "
-                "clique em 'Continuar trancando' ou 'Desfazer'."
-            ),
+            APAGANDO: _INTERRUPTED_LOCK,
             ABERTURA_INCOMPLETA: "Alguns arquivos não puderam ser abertos.",
             ABRINDO: opening,
             RESTAURANDO: opening,
@@ -384,6 +577,14 @@ class LockerManager:
         }
         if rec.state in texts:
             issue = ABRINDO if rec.state == RESTAURANDO else rec.state
+            needed = self._intermediate_vault(rec)
+            problem = self._vault_problem(needed.location) if needed is not None else ""
+            if needed is not None and problem:
+                if rec.state != ABERTURA_INCOMPLETA:
+                    # nem Continuar nem Desfazer funcionam: Procurar a pasta… / Tirar da lista
+                    issue = COFRE_INACESSIVEL
+                text = self._inaccessible_text(rec, needed, problem)
+                return FolderView(rec, attention, "resolver", text, issue=issue)
             return FolderView(
                 rec, attention, "resolver", rec.attention or texts[rec.state], issue=issue
             )
@@ -394,6 +595,14 @@ class LockerManager:
                 issue = "sem_dados" if "não foram encontrados" in problem else "itens_extras"
                 return FolderView(
                     rec, attention, "resolver", problem, issue=issue, base_action=base
+                )
+            if self._inner_differs(rec):
+                return FolderView(
+                    rec,
+                    attention,
+                    "resolver",
+                    self._different_vault_text(rec),
+                    issue=COFRE_DIFERENTE,
                 )
         if any(v.role == MANTIDO for v in rec.vaults):
             try:
@@ -447,21 +656,135 @@ class LockerManager:
         return entry.origin == KEK_TROCADA
 
     def forget_warning(self, folder_id: str) -> str:
-        """Texto de aviso para 'Tirar da lista' ("" se nada fica para trás fora da pasta).
+        """Aviso para a confirmação de 'Tirar da lista' — vale em QUALQUER estado e é verdadeiro
+        para o estado atual. "" só numa pasta trancada com tudo dentro dela (o texto padrão da
+        interface — 'Recuperar uma pasta protegida' a acha — vale). 'Tirar da lista' nunca apaga
+        nada; a interface põe "Nada será apagado." antes deste texto.
 
-        Cofres fora de P (área temporária) não são achados por 'Recuperar uma pasta protegida':
-        tirar da lista uma pasta nesse estado deixa a única cópia de arquivos numa pasta oculta.
+        Diz onde ficam os arquivos legíveis (se ficam), onde fica cada cópia criptografada fora
+        da pasta (área temporária ``.owlvault-<id>``, versão mantida) e que 'Recuperar uma pasta
+        protegida' NÃO acha essas cópias (só o ``.owlvault`` de dentro da pasta). Um erro de
+        disco nunca vira "" (que a interface leria como "use Recuperar").
         """
         rec = self._get(folder_id)
-        outside = [v for v in rec.vaults if not _inside(v.location, rec.path)]
-        if rec.state == TRANCADA and not outside:
-            return ""
-        where = winfs.strip_extended(self.staging_of(rec))
-        return (
-            f"'{rec.name}' tem arquivos guardados fora da pasta (em {where}, uma pasta oculta). "
-            "Depois de tirar da lista, eles NÃO aparecem em 'Recuperar uma pasta protegida'. "
-            "Prefira 'Procurar a pasta…' ou resolver a pasta antes."
-        )
+        try:
+            return self._forget_warning(rec)
+        except (OwlVaultError, OSError):
+            return (
+                f"Não foi possível conferir agora onde estão os arquivos de '{rec.name}'. Se ela "
+                f"tem cópias criptografadas fora da pasta (na pasta oculta '.owlvault-{rec.id}', "
+                "ao lado dela), essas cópias NÃO aparecem em 'Recuperar uma pasta protegida'."
+            )
+
+    def _forget_warning(self, rec: FolderRecord) -> str:
+        name = rec.name
+        # ABRINDO com o cofre ainda em P / APAGANDO com o 'novo' já em P: o destino gravado na
+        # área temporária ainda (ou já) não existe, e não é uma cópia que sumiu
+        inside_now = rec.state in (ABRINDO, APAGANDO) and self._intermediate_vault(rec) is None
+        outside: list[VaultRef] = []
+        for v in rec.vaults:
+            if v.role == DESCARTANDO or _inside(v.location, rec.path):
+                continue  # exclusão já aprovada (nada único) / cofre dentro da pasta
+            if inside_now and v.role in ("anterior", "novo") and not os.path.lexists(v.location):
+                continue
+            outside.append(v)
+        present = [v for v in outside if os.path.lexists(v.location)]
+        missing = [v for v in outside if not os.path.lexists(v.location)]
+        parts: list[str] = []
+        if rec.state == TRANCADA:
+            in_place = os.path.lexists(rec.path) and self._located(rec)
+            if self._inner_differs(rec):
+                parts.append(
+                    f"Os dados criptografados que estão em '{name}' não são os registrados (podem "
+                    "ser de uma versão mais antiga). Depois de tirar da lista, '☰ > Recuperar uma "
+                    "pasta protegida' abre essa cópia que está na pasta, com a senha mestra."
+                )
+            elif in_place and not winfs.is_plain_dir_at(winfs.join(rec.path, VAULT_DIR)):
+                parts.append(
+                    f"Os arquivos criptografados de '{name}' não estão na pasta (a pasta oculta "
+                    f"'{VAULT_DIR}' sumiu). Se você a moveu, coloque-a de volta: só assim "
+                    "'☰ > Recuperar uma pasta protegida' encontra os arquivos depois de tirar a "
+                    "pasta da lista."
+                )
+            elif present or missing:
+                parts.append(
+                    f"Os arquivos de '{name}' continuam criptografados dentro da pasta; para "
+                    "voltar a usá-la, use '☰ > Recuperar uma pasta protegida'."
+                )
+            else:
+                return ""
+        elif rec.state == ABERTA:
+            parts.append(
+                f"Os arquivos legíveis continuam na pasta '{name}'; para trancá-la de novo, use "
+                "'+ Proteger uma pasta…'."
+            )
+        elif rec.state == TRANCANDO:
+            parts.append(f"Os arquivos legíveis que estão na pasta '{name}' continuam lá.")
+        elif rec.state == APAGANDO:
+            parts.append(
+                f"O trancamento de '{name}' parou no meio: parte dos arquivos (talvez todos) já "
+                "saiu da pasta e só existe na cópia criptografada."
+            )
+            if inside_now:
+                parts.append(
+                    "Essa cópia já está dentro da pasta; depois de tirar da lista, '☰ > Recuperar "
+                    "uma pasta protegida' a encontra."
+                )
+        elif rec.state in (ABRINDO, RESTAURANDO):
+            if inside_now:
+                parts.append(
+                    f"Os arquivos de '{name}' continuam criptografados dentro da pasta; depois de "
+                    "tirar da lista, '☰ > Recuperar uma pasta protegida' a encontra."
+                )
+            else:
+                parts.append(
+                    f"A abertura de '{name}' parou no meio: os arquivos que ainda não voltaram "
+                    "para a pasta só existem na cópia criptografada."
+                )
+        elif rec.state == ABERTURA_INCOMPLETA:
+            parts.append(
+                f"Alguns arquivos de '{name}' não voltaram para a pasta e só existem na cópia "
+                "criptografada."
+            )
+        if present:
+            where = ", ".join(
+                sorted({winfs.strip_extended(winfs.parent_of(v.location)) for v in present})
+            )
+            parts.append(
+                f"{len(present)} cópia(s) criptografada(s) desta pasta fica(m) fora dela, em "
+                f"{where} (pasta oculta)."
+            )
+            if any(v.role == MANTIDO for v in present):
+                parts.append("Os arquivos da versão anterior mantida só existem lá.")
+            parts.append(
+                "Depois de tirar da lista, essa(s) cópia(s) NÃO aparece(m) em 'Recuperar uma "
+                "pasta protegida'; para abrir uma delas, use '☰ > Cópia criptografada de uma "
+                "pasta' > 'Abrir uma cópia', com a senha mestra."
+            )
+        if missing:
+            where = ", ".join(
+                sorted({winfs.strip_extended(winfs.parent_of(v.location)) for v in missing})
+            )
+            parts.append(
+                f"{len(missing)} cópia(s) criptografada(s) registrada(s) não foi(ram) "
+                f"encontrada(s) em {where}."
+            )
+            if rec.state == ABRINDO:
+                parts.append(
+                    "Se a cópia ainda estiver dentro da pasta, '☰ > Recuperar uma pasta "
+                    "protegida' a encontra."
+                )
+        if rec.state == APAGANDO:
+            parts.append(
+                "Se puder, use antes 'Desfazer' ou 'Continuar trancando' (ou 'Procurar a "
+                "pasta…', se ela mudou de lugar)."
+            )
+        elif rec.state in (ABRINDO, RESTAURANDO, ABERTURA_INCOMPLETA):
+            parts.append(
+                "Se puder, resolva antes a abertura (ou use 'Procurar a pasta…', se ela mudou "
+                "de lugar)."
+            )
+        return " ".join(parts)
 
     # ------------------------------------------------------------------ versões mantidas
     @staticmethod
@@ -555,9 +878,15 @@ class LockerManager:
     def _kept_reference(
         self, rec: FolderRecord
     ) -> tuple[dict[tuple[str, ...], bytes] | None, str | None]:
-        ref = rec.vault("atual") if rec.state == TRANCADA else self._latest_previous_or_none(rec)
-        newer = self._manifest_digests(ref.location) if ref is not None else None
-        return newer, (None if rec.state == TRANCADA else rec.path)
+        """Com o que a versão mantida é comparada (pelo conteúdo): o cofre 'atual' de uma pasta
+        trancada; nos outros estados, SÓ a própria pasta. Um 'anterior' nunca conta como
+        cobertura: ele pode ser mais velho que a versão mantida e o próximo trancamento o
+        apaga pela regra de caminho."""
+        if rec.state == TRANCADA:
+            current = rec.vault("atual")
+            newer = self._manifest_digests(current.location) if current is not None else None
+            return newer, None
+        return None, rec.path
 
     def kept_only_files(self, folder_id: str) -> list[str]:
         """Arquivos cuja versão só existe nas versões anteriores mantidas (não está — com o
@@ -915,11 +1244,23 @@ class LockerManager:
             with contextlib.suppress(OwlVaultError, OSError):
                 self._cleanup_staging(rec)  # só nomes nossos; nunca fica área órfã
             raise
+        old_vaults, old_attention, old_pending = list(rec.vaults), rec.attention, list(rec.pending)
         rec.state = TRANCANDO
         rec.vaults = [v for v in rec.vaults if v.role != "novo"] + [VaultRef("", "novo", novo)]
         rec.attention = ""
         rec.pending = []
-        self._save()
+        try:
+            self._save()
+        except BaseException:
+            # O disco continua em ABERTA e nada foi criado: a memória volta igual (como em
+            # unlock() com ABRINDO), para "Tente de novo" funcionar.
+            rec.state = ABERTA
+            rec.vaults = old_vaults
+            rec.attention = old_attention
+            rec.pending = old_pending
+            with contextlib.suppress(OwlVaultError, OSError):
+                self._cleanup_staging(rec)
+            raise
         keys = self.session.key_source()
         try:
             result: CreateResult = create_vault(
@@ -939,8 +1280,15 @@ class LockerManager:
                     + "; ".join(result.divergences[:5])
                 )
         except BaseException:
+            # 'apagando' ainda não foi gravado: este trancamento não apagou nada. Um arquivo que
+            # falta em P foi tirado pelo usuário — a pasta volta a ABERTA (§4.1.3). O 'novo' sai
+            # mesmo que o perfil não grave DESCARTANDO (must_record=False): sem isso a pasta
+            # ficaria em TRANCANDO e o 'Resolver' a julgaria pela heurística de "arquivo
+            # faltando" (APAGANDO, "começou a apagar"), o que seria falso. O cabeçalho sai
+            # primeiro; no início, um 'novo' sem cabeçalho e sem marcador é descartado, e um
+            # 'novo' que não existe some da lista.
             with contextlib.suppress(OwlVaultError, OSError):
-                self._discard_novo(rec)
+                self._discard_novo(rec, must_record=False, nothing_deleted=True)
             raise
         # --- cofre novo completo: agora (e só agora) os originais podem ser apagados
         vault_id = self._vault_id_of(novo)
@@ -962,10 +1310,11 @@ class LockerManager:
             rec.fingerprints = {}
             rec.zone_files = []
             with contextlib.suppress(OwlVaultError, OSError):
-                self._discard_novo(rec, must_record=False)
+                self._discard_novo(rec, must_record=False, nothing_deleted=True)
             raise
         self._ensure_marker(p, novo)
-        return self._finish_lock(rec, progress, cancel)
+        # marcador novo (id novo): nenhuma sobra de 'Desfazer' pode casar com ele
+        return self._finish_lock(rec, progress, cancel, undo_leftovers=False)
 
     def _ensure_marker(self, p: str, vault_dir: str) -> None:
         """Marcador de restauração em P: permite 'Desfazer' (restaurar por cima) com retomada."""
@@ -989,15 +1338,40 @@ class LockerManager:
         if rec.state != APAGANDO:
             raise StateError("Não há trancamento interrompido nesta pasta.")
         self._locate(rec)
+        # A lista da passada anterior deixa de valer ANTES de apagar qualquer coisa: uma queda
+        # no meio desta passada nunca deixa no disco uma lista antiga (e falsa).
+        rec.pending = []
+        rec.attention = _INTERRUPTED_LOCK
+        self._save()
         return self._finish_lock(rec, progress or NullProgress(), cancel or CancelToken())
 
     @staticmethod
-    def _content_fingerprint(
+    def _current_fingerprint(target: str) -> Fingerprint | None:
+        """Impressão digital atual de um arquivo comum, lida do handle sem bloquear ninguém
+        (None se não der para ler, se for pasta ou link)."""
+        try:
+            with winfs.Win32File.open(
+                target,
+                winfs.FILE_READ_ATTRIBUTES,
+                winfs.FILE_SHARE_READ | winfs.FILE_SHARE_WRITE | winfs.FILE_SHARE_DELETE,
+                winfs.OPEN_EXISTING,
+                winfs.FILE_FLAG_OPEN_REPARSE_POINT,
+            ) as f:
+                info = f.info()
+        except (OwlVaultError, OSError):
+            return None
+        if info.is_directory or info.attributes & winfs.FILE_ATTRIBUTE_REPARSE_POINT:
+            return None
+        return info.fingerprint()
+
+    @staticmethod
+    def _content_check(
         target: str, e: FileEntryRecord, cancel: CancelToken
-    ) -> Fingerprint | None:
-        """Impressão digital de um original SEM impressão gravada (trancamento retomado depois de
-        uma queda): só se o conteúdo for o guardado (tamanho + SHA-256 do manifesto) e o arquivo
-        não mudar durante a conferência. A exclusão confere de novo no próprio handle."""
+    ) -> tuple[Fingerprint | None, str, str]:
+        """Confere o CONTEÚDO de um original (tamanho + SHA-256 do manifesto, sem mudar durante a
+        conferência). Devolve (impressão digital, "", "") ou (None, motivo, tipo), com tipo
+        "mudou" (não é a versão guardada) ou "uso" (aberto/sem acesso). A exclusão confere de
+        novo no próprio handle."""
 
         def info() -> winfs.HandleInfo:
             with winfs.Win32File.open(
@@ -1009,27 +1383,186 @@ class LockerManager:
             ) as f:
                 return f.info()
 
+        def unreadable(exc: Exception) -> tuple[None, str, str]:
+            if isinstance(exc, OSError):
+                exc = winfs.classify_os_error(exc, "Não foi possível conferir o arquivo")
+            return None, f"{exc}; não foi apagado", "uso"
+
+        if not winfs.is_plain_file_at(target):
+            return None, "não é mais um arquivo comum (pasta ou link); não foi apagado", "mudou"
         try:
             before = info()
-            if (
-                before.attributes & winfs.FILE_ATTRIBUTE_REPARSE_POINT
-                or before.is_directory
-                or before.number_of_links > 1
-                or before.size != e.size
-            ):
-                return None
+        except (OwlVaultError, OSError) as exc:
+            return unreadable(exc)
+        if before.attributes & winfs.FILE_ATTRIBUTE_REPARSE_POINT or before.is_directory:
+            return None, "não é mais um arquivo comum (pasta ou link); não foi apagado", "mudou"
+        if before.number_of_links > 1:
+            return None, "o arquivo tem outro vínculo (hard link); não foi apagado", "uso"
+        if before.size != e.size:
+            return None, _CHANGED, "mudou"
+        try:
             digest = hash_file_unbuffered(target, cancel)
             after = info()
         except CancelledError:
             raise
+        except (OwlVaultError, OSError) as exc:
+            return unreadable(exc)
+        if digest != e.sha256:
+            return None, _CHANGED, "mudou"
+        if after.fingerprint() != before.fingerprint():
+            return None, "o arquivo mudou durante a conferência; não foi apagado", "uso"
+        return before.fingerprint(), "", ""
+
+    def _deletable(
+        self, rec: FolderRecord, target: str, e: FileEntryRecord, cancel: CancelToken
+    ) -> tuple[Fingerprint | None, str, str]:
+        """Com que impressão digital o original ``target`` pode ser apagado.
+
+        A impressão gravada na cifragem vale se o arquivo ainda é exatamente aquele. Sem ela —
+        ou se ela não bate mais (arquivo devolvido por um 'Desfazer', data regravada pela
+        restauração, o mesmo conteúdo posto de volta) — vale o CONTEÚDO conferido com o
+        manifesto do cofre novo: apagar um arquivo idêntico ao guardado nunca perde nada.
+        """
+        raw = rec.fingerprints.get(_rel_key(e.path))
+        if raw:
+            try:
+                recorded: Fingerprint | None = _fp_from_list(raw)
+            except (ValueError, TypeError):
+                recorded = None
+            if recorded is not None and self._current_fingerprint(target) == recorded:
+                return recorded, "", ""
+        return self._content_check(target, e, cancel)
+
+    @staticmethod
+    def _pending_attention(
+        in_use: list[str],
+        changed: list[str],
+        new_items: list[str],
+        leftovers: list[str] | None = None,
+    ) -> str:
+        """Texto de 'Precisa de atenção' de um trancamento parado em 'apagando', específico de
+        cada problema (em uso ≠ mudou ≠ item novo ≠ sobra de um 'Desfazer' interrompido)."""
+
+        def names(items: list[str]) -> str:
+            more = f" e mais {len(items) - 3}" if len(items) > 3 else ""
+            return ", ".join(items[:3]) + more
+
+        parts = ["O trancamento não terminou. O que já saiu da pasta está guardado."]
+        if leftovers:
+            parts.append(
+                f"{len(leftovers)} pedaço(s) de arquivo deixados por um 'Desfazer' interrompido "
+                f"não puderam ser apagados agora: {names(leftovers)}. Os arquivos estão "
+                "guardados; não mova esses pedaços: clique em 'Continuar trancando' de novo."
+            )
+        if in_use:
+            parts.append(
+                f"{len(in_use)} item(ns) não foram apagados porque estavam abertos em outro "
+                f"programa (ou o Windows não deixou): {names(in_use)}. Feche-os e clique em "
+                "'Continuar trancando'."
+            )
+        if changed:
+            parts.append(
+                f"{len(changed)} arquivo(s) mudaram depois de serem guardados: {names(changed)}. "
+                "A versão nova deles NÃO está guardada; para guardá-la, clique em 'Desfazer' e "
+                "tranque de novo."
+            )
+        if new_items:
+            parts.append(
+                f"{len(new_items)} item(ns) foram colocados na pasta durante o trancamento e NÃO "
+                f"estão guardados: {names(new_items)}. Mova-os para outro lugar e clique em "
+                "'Continuar trancando'."
+            )
+        parts.append("Para deixar a pasta aberta, clique em 'Desfazer'.")
+        return " ".join(parts)
+
+    @staticmethod
+    def _marker_restore_id(p: str, vault_id_hex: str, manifest_sha: str) -> str | None:
+        """``restore_id`` do marcador de restauração em P, se o marcador é DESTE cofre (mesmo
+        vault_id e mesmo manifesto); senão None."""
+        marker = winfs.join(p, MARKER_NAME)
+        if not winfs.is_plain_file_at(marker):
+            return None
+        try:
+            with open(marker, "rb") as fh:
+                obj = json.loads(fh.read(4096).decode("ascii"))
+        except (OSError, ValueError):
+            return None
+        if (
+            not isinstance(obj, dict)
+            or obj.get("vault_id") != vault_id_hex
+            or obj.get("manifest_sha256") != manifest_sha
+        ):
+            return None
+        rid = obj.get("restore_id")
+        return rid if isinstance(rid, str) and _RESTORE_ID_RE.fullmatch(rid) else None
+
+    def _clear_undo_parts(
+        self, p: str, vault_id_hex: str, manifest_sha: str, cancel: CancelToken
+    ) -> list[str]:
+        """Apaga os temporários ``.owl-<restore_id>-….part`` que um 'Desfazer' derrubado por uma
+        queda (energia, processo morto) deixou em P e nas subpastas.
+
+        São cópias parciais, já decifradas, de arquivos guardados no cofre 'novo': apagá-las não
+        perde nada, e quem as movesse para fora tiraria da pasta um pedaço legível de um arquivo
+        protegido. Só valem os nomes do marcador de restauração DESTE cofre em P (o mesmo padrão
+        e a mesma remoção de ``restore_vault`` na retomada), com a trava de restauração tomada
+        (nenhum 'Desfazer' rodando). Devolve os caminhos (relativos a P, para a tela) que não
+        puderam ser apagados agora.
+        """
+        restore_id = self._marker_restore_id(p, vault_id_hex, manifest_sha)
+        if restore_id is None:
+            return []
+        pattern = re.compile(re.escape(f".owl-{restore_id}-") + r"[0-9a-f]{32}\.part")
+
+        def scan() -> list[tuple[str, tuple[str, ...]]]:
+            found: list[tuple[str, tuple[str, ...]]] = []
+            stack: list[tuple[str, tuple[str, ...]]] = [(p, ())]
+            while stack:
+                cancel.check()
+                folder, rel = stack.pop()
+                try:
+                    with os.scandir(folder) as it:
+                        entries = list(it)
+                except OSError:
+                    continue  # pasta que não dá para listar: a exclusão acusa o problema
+                for entry in entries:
+                    try:
+                        st = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if getattr(st, "st_file_attributes", 0) & winfs.FILE_ATTRIBUTE_REPARSE_POINT:
+                        continue  # nunca segue links
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append((entry.path, (*rel, entry.name)))
+                    elif pattern.fullmatch(entry.name):
+                        found.append((entry.path, (*rel, entry.name)))
+            return found
+
+        lock = winfs.ExclusiveLock(winfs.join(p, RESTORE_LOCK_NAME), "A pasta")
+        try:
+            lock.acquire()
         except (OwlVaultError, OSError):
-            return None
-        if digest != e.sha256 or after.fingerprint() != before.fingerprint():
-            return None
-        return before.fingerprint()
+            # outro 'Desfazer' rodando (ou trava inválida): nada é apagado agora
+            return [display_path(rel) for _, rel in scan()]
+        try:
+            root = winfs.resolve(p)
+            failed: list[str] = []
+            for path, rel in scan():
+                try:
+                    safe_remove_own(path, root, pattern)
+                except (OwlVaultError, OSError):
+                    failed.append(display_path(rel))
+            return failed
+        finally:
+            lock.release()
 
     def _finish_lock(
-        self, rec: FolderRecord, progress: ProgressSink, cancel: CancelToken
+        self,
+        rec: FolderRecord,
+        progress: ProgressSink,
+        cancel: CancelToken,
+        *,
+        undo_leftovers: bool = True,
     ) -> LockOutcome:
         self._require_saved()  # nada é apagado sem o estado 'apagando' no disco
         p = rec.path
@@ -1039,59 +1572,86 @@ class LockerManager:
         if self._novo_moved_into_folder(rec, novo):
             # queda depois de mover o cofre para P e antes de gravar 'trancada'
             return self._conclude_lock(rec, novo)
+        self._require_vault(rec, novo)
         opened = open_vault(novo.location, self.keys_for_vault(novo.location), self.policy)
-        manifest = read_manifest(opened).manifest
+        mread = read_manifest(opened)
+        manifest = mread.manifest
         files = manifest.files
         progress.stage("Apagando as cópias legíveis", 0, len(files))
         pending: list[str] = []
+        in_use: list[str] = []
+        changed: list[str] = []
+        new_items: list[str] = []
+        # Sobras de um 'Desfazer' que caiu no meio: apagadas aqui, nunca "itens novos" (vd2-2).
+        leftovers = (
+            self._clear_undo_parts(
+                p, opened.vault_id.hex(), hashlib.sha256(mread.raw).hexdigest(), cancel
+            )
+            if undo_leftovers
+            else []
+        )
+        for shown in leftovers:
+            pending.append(f"{shown}: {_UNDO_LEFTOVER}")
         for e in files:
             cancel.check()
             target = winfs.join(p, *e.path)
             if not os.path.lexists(target):
                 progress.advance(0, 1)
                 continue
-            fp_raw = rec.fingerprints.get(_rel_key(e.path))
+            shown = display_path(e.path)
+            expected, why, kind = self._deletable(rec, target, e, cancel)
+            if expected is None:
+                pending.append(f"{shown}: {why}")
+                (changed if kind == "mudou" else in_use).append(shown)
+                progress.advance(0, 1)
+                continue
             try:
-                expected = (
-                    _fp_from_list(fp_raw)
-                    if fp_raw
-                    else self._content_fingerprint(target, e, cancel)
-                )
-                if expected is None:
-                    raise SourceChangedError(
-                        "não foi possível confirmar que é o mesmo conteúdo guardado; não foi apagado"
-                    )
                 winfs.delete_checked(target, expected)
             except CancelledError:
                 raise
             except OwlVaultError as exc:
-                pending.append(f"{display_path(e.path)}: {exc}")
+                if os.path.lexists(target):  # sumiu sozinho no meio: nada a fazer
+                    pending.append(f"{shown}: {exc}")
+                    (changed if isinstance(exc, SourceChangedError) else in_use).append(shown)
             progress.advance(0, 1)
         for d in sorted(manifest.dirs, key=lambda d: len(d.path), reverse=True):
             target = winfs.join(p, *d.path)
             if not os.path.lexists(target):
                 continue
+            shown = display_path(d.path)
+            if not winfs.is_plain_dir_at(target):
+                # outro item (arquivo, link) no lugar da pasta: não é guardado por este cofre
+                pending.append(f"{shown}: {_NEW_ITEM}")
+                new_items.append(shown)
+                continue
             try:
                 winfs.delete_checked(target, None, is_dir=True)
-            except OwlVaultError:
-                if not any(x.startswith(display_path(d.path) + "\\") for x in pending):
-                    pending.append(f"{display_path(d.path)}: a pasta não ficou vazia")
+            except OwlVaultError as exc:
+                if any(x.startswith(shown + "\\") for x in pending):
+                    continue  # consequência de um item já listado
+                try:
+                    inside = sorted(os.listdir(target))
+                except OSError:
+                    inside = []
+                if not inside:
+                    pending.append(f"{shown}: {exc}")
+                    in_use.append(shown)
+                for n in inside:  # nada do manifesto sobrou aqui: são itens colocados
+                    pending.append(f"{shown}\\{n}: {_NEW_ITEM}")
+                    new_items.append(f"{shown}\\{n}")
         lock_problem = self._clear_orphan_restore_lock(p)
         if lock_problem:
             pending.append(f"{RESTORE_LOCK_NAME}: {lock_problem}")
+            in_use.append(RESTORE_LOCK_NAME)
         known = {MARKER_NAME, RESTORE_LOCK_NAME}
-        extra = [n for n in os.listdir(p) if n not in known]
-        top_pending = {x.split("\\", 1)[0].split(":", 1)[0] for x in pending}
-        for n in extra:
-            if n not in top_pending:
-                pending.append(f"{n}: item novo colocado na pasta durante o trancamento")
+        top_pending = {fold_path((x.split("\\", 1)[0].split(":", 1)[0],)) for x in pending}
+        for n in sorted(os.listdir(p)):
+            if n not in known and fold_path((n,)) not in top_pending:
+                pending.append(f"{n}: {_NEW_ITEM}")
+                new_items.append(n)
         if pending:
             rec.pending = pending
-            rec.attention = (
-                f"Seus arquivos já estão guardados. {len(pending)} item(ns) ainda não foram "
-                "apagados da pasta porque estavam abertos ou foram alterados. Feche-os e clique "
-                "em 'Continuar trancando' (ou 'Desfazer' para deixar a pasta aberta)."
-            )
+            rec.attention = self._pending_attention(in_use, changed, new_items, leftovers)
             self._save()
             return LockOutcome(rec, complete=False, pending=pending)
         # tudo apagado: o cofre entra na pasta e o índice é gravado LOGO EM SEGUIDA
@@ -1212,6 +1772,9 @@ class LockerManager:
 
         Conflito num caminho que o Owl Vault apagou (outro conteúdo foi colocado no lugar) ⇒ o
         cofre vira versão MANTIDA (nunca apagada sem confirmação) e o relatório traz a lista.
+        "Nunca apagado" é decidido pelo PRÓPRIO arquivo (mesmo volume + FileId da impressão
+        gravada na cifragem), nunca pela lista de pendências: um arquivo apagado e recriado tem
+        outro FileId, e uma lista antiga (queda) não vale. Na dúvida, a versão é mantida.
         """
         rec = self._get(folder_id)
         if rec.state != APAGANDO:
@@ -1224,8 +1787,8 @@ class LockerManager:
             # o cofre já entrou na pasta: conclui o trancamento e abre normalmente
             self._conclude_lock(rec, novo)
             return self.unlock(folder_id, progress, cancel)
-        # pendências = originais que o Owl Vault NÃO apagou (a cópia da pasta é a mais nova)
-        never_deleted = {_key_of(x) for x in rec.pending}
+        self._require_vault(rec, novo)
+        fingerprints = {fold_path(tuple(k.split("\\"))): v for k, v in rec.fingerprints.items()}
         self._ensure_marker(p, novo.location)
         report = restore_vault(
             novo.location,
@@ -1243,8 +1806,9 @@ class LockerManager:
             )
             self._save()
             return UnlockOutcome(rec, complete=False, report=report, path=p)
-        lost = [c for c in report.conflicts if _key_of(c) not in never_deleted]
+        lost = [c for c in report.conflicts if not self._never_deleted(p, c, fingerprints)]
         remove_restore_marker(p)
+        before = (novo.role, rec.state, rec.pending, rec.fingerprints, rec.attention)
         novo.role = MANTIDO if lost else "anterior"
         rec.state = ABERTA
         rec.pending = []
@@ -1255,8 +1819,32 @@ class LockerManager:
             if lost
             else ""
         )
-        self._save()
+        try:
+            self._save()
+        except BaseException:
+            # a memória volta ao que está no disco (APAGANDO): "Desfazer" de novo, no mesmo
+            # processo, faz o mesmo que depois de reiniciar
+            novo.role, rec.state, rec.pending, rec.fingerprints, rec.attention = before
+            raise
         return UnlockOutcome(rec, complete=True, report=report, path=p)
+
+    def _never_deleted(
+        self, p: str, conflict: str, fingerprints: dict[tuple[str, ...], list[Any]]
+    ) -> bool:
+        """O item em conflito no 'Desfazer' é o MESMO arquivo que foi criptografado (mesmo
+        volume + FileId da impressão digital da cifragem)? Só então o Owl Vault nunca o apagou
+        e a cópia da pasta é a mais nova. Sem impressão, sem leitura ou com outro FileId ⇒ conta
+        como apagado (a versão guardada é mantida)."""
+        rel = conflict.split(":", 1)[0]
+        raw = fingerprints.get(_key_of(rel))
+        if not raw:
+            return False
+        try:
+            recorded = _fp_from_list(raw)
+        except (ValueError, TypeError):
+            return False
+        current = self._current_fingerprint(winfs.join(p, *rel.split("\\")))
+        return current is not None and current.identity == recorded.identity
 
     # ------------------------------------------------------------------ abrir
     def unlock(
@@ -1288,23 +1876,28 @@ class LockerManager:
             raise StateError(f"Não foi possível abrir '{rec.name}': {lock_problem}.")
         # espaço e destino conferidos com o cofre ainda na pasta (nada gravado até aqui)
         self._check_room_to_open(rec, vault_dir)
-        if rec.hidden:
-            self.show(folder_id)
         staging = self.staging_of(rec)
         self._prepare_staging(staging)
         target = winfs.join(staging, f"anterior-{secrets.token_hex(8)}")
-        # destino gravado ANTES de mover: a retomada sabe para onde o cofre vai
+        # destino gravado ANTES de mover: a retomada sabe para onde o cofre vai. A pasta deixa
+        # de ser "escondida" na MESMA gravação (os atributos saem com o espaço reservado, em
+        # _move_vault_out): uma falha antes daqui deixa a pasta trancada E escondida.
         old_vaults = list(rec.vaults)
+        was_hidden = rec.hidden
         rec.vaults.remove(current)
         rec.vaults.append(VaultRef(current.vault_id, "anterior", target))
         rec.state = ABRINDO
+        rec.hidden = False
         try:
             self._save()
         except BaseException:
             rec.vaults = old_vaults
             rec.state = TRANCADA
+            rec.hidden = was_hidden
             raise
         self._move_vault_out(rec, checked=True)
+        if was_hidden:
+            shell.notify_changed(winfs.parent_of(p))
         return self._finish_unlock(rec, progress, cancel)
 
     def _check_room_to_open(self, rec: FolderRecord, vault_dir: str) -> None:
@@ -1361,9 +1954,10 @@ class LockerManager:
             if n not in PLACEHOLDER and n != VAULT_DIR and not self._is_restore_lock(p, n)
         ]
         if extra:
-            raise StateError(
+            raise self._stuck(
+                rec,
                 f"Há item(ns) colocado(s) em '{rec.name}' enquanto estava trancada. Mova-os para "
-                "outro lugar e tente de novo."
+                "outro lugar e clique em 'Continuar abrindo'.",
             )
         lock_problem = self._clear_orphan_restore_lock(p)
         if lock_problem:
@@ -1373,6 +1967,15 @@ class LockerManager:
         self._prepare_staging(winfs.parent_of(prev.location))
         self._remove_placeholder(rec)
         winfs.rename_dir(vault_dir, prev.location)
+
+    def _stuck(self, rec: FolderRecord, text: str) -> StateError:
+        """Erro de uma abertura interrompida que só o usuário resolve: o texto também vira a
+        atenção da linha (o 'Resolver' mostra o problema de verdade, não uma frase fixa)."""
+        if rec.state in (ABRINDO, RESTAURANDO) and rec.attention != text:
+            rec.attention = text
+            with contextlib.suppress(OwlVaultError, OSError):
+                self._save()
+        return StateError(text)
 
     @staticmethod
     def _latest_previous(rec: FolderRecord) -> VaultRef:
@@ -1389,6 +1992,7 @@ class LockerManager:
     ) -> UnlockOutcome:
         p = rec.path
         prev = self._latest_previous(rec)
+        self._require_vault(rec, prev)
         try:
             shell.change_attributes(p, add=FILE_ATTRIBUTE_NOT_CONTENT_INDEXED)
         except OSError:
@@ -1404,9 +2008,10 @@ class LockerManager:
                 shown = ", ".join(names[:5]) + (
                     f" e mais {len(names) - 5}" if len(names) > 5 else ""
                 )
-                raise StateError(
+                raise self._stuck(
+                    rec,
                     f"Há item(ns) colocado(s) em '{rec.name}' enquanto ela abria: {shown}. "
-                    "Mova-os para outro lugar e clique em 'Continuar abrindo'."
+                    "Mova-os para outro lugar e clique em 'Continuar abrindo'.",
                 )
             # a restauração terminou (marcador já removido) antes de o estado ser gravado
             missing = [
@@ -1422,7 +2027,15 @@ class LockerManager:
         else:
             if rec.state == ABRINDO:
                 rec.state = RESTAURANDO  # fase gravada ANTES de restaurar
-                self._save()
+                try:
+                    self._save()
+                except BaseException:
+                    # nada foi restaurado: a memória volta a 'abrindo' (igual ao disco); a nova
+                    # tentativa grava a fase de novo antes de restaurar
+                    rec.state = ABRINDO
+                    raise
+            else:
+                self._require_saved()  # a fase em memória TEM de estar no disco
             try:
                 report = restore_vault(
                     prev.location,
@@ -1546,10 +2159,41 @@ class LockerManager:
             pass
 
     def forget(self, folder_id: str) -> None:
-        """'Tirar da lista' — não apaga nada (veja ``forget_warning``)."""
+        """'Tirar da lista' — vale em QUALQUER estado e não apaga nada (veja ``forget_warning``)."""
         rec = self._get(folder_id)
         self.folders.remove(rec)
         self._save()
+
+    def leave_open(self, folder_id: str) -> str:
+        """'Deixar a pasta aberta' — saída de um trancamento interrompido em TRANCANDO que a
+        conferência não decide (a cópia que estava sendo criada não pode ser lida).
+
+        Nada é apagado: nesse estado nenhum original foi tocado ('apagando' nunca foi gravado),
+        então a pasta volta a ABERTA e a cópia em dúvida vira versão MANTIDA (nunca apagada sem
+        a confirmação do usuário). Se a conferência decidir (cópia descartável, ou 'apagando'),
+        segue o caminho normal. Devolve o estado final.
+        """
+        rec = self._get(folder_id)
+        if rec.state != TRANCANDO:
+            raise StateError("Não há trancamento interrompido nesta pasta.")
+        self._locate(rec)
+        if self._discard_novo(rec) != "manter":
+            return rec.state
+        novo = rec.vault("novo")
+        if novo is not None:
+            if not novo.vault_id:
+                with contextlib.suppress(OSError):
+                    novo.vault_id = self._vault_id_of(novo.location)
+            novo.role = MANTIDO
+        rec.state = ABERTA
+        rec.pending = []
+        rec.fingerprints = {}
+        rec.attention = (
+            "A cópia criptografada do trancamento interrompido foi mantida como versão anterior; "
+            "nada foi apagado."
+        )
+        self._save()
+        return rec.state
 
     # ------------------------------------------------------------------ recuperar
     def find_recoverable(self, path: str) -> list[str]:
@@ -1616,30 +2260,24 @@ class LockerManager:
     def relocate(self, folder_id: str, new_path: str) -> None:
         """'Procurar a pasta…' — funciona em QUALQUER estado.
 
-        Aceita a mesma pasta (volume + FileId) ou uma pasta cujo ``.owlvault`` tem o vault_id de
-        um cofre registrado. Recalcula o lugar de cada cofre (dentro da pasta, na área temporária
-        antiga ou na nova ao lado dela, conferindo o vault_id) e recusa — sem mudar nada — se
-        algum não for achado.
+        Aceita a mesma pasta (volume + FileId) ou uma pasta cujo ``.owlvault`` tem o vault_id
+        que o estado espera DENTRO da pasta (``_expected_inside``): uma cópia trancada (backup)
+        nunca toma o lugar de uma pasta aberta. Se a pasta escolhida não for ela, procura entre
+        as pastas logo abaixo (o seletor do Windows não mostra uma pasta escondida: o usuário
+        escolhe a pasta onde ela fica). Recalcula o lugar de cada cofre (dentro da pasta, na área
+        temporária antiga ou na nova ao lado dela, conferindo o vault_id) e recusa — sem mudar
+        nada — se algum não for achado.
         """
         rec = self._get(folder_id)
         p_ext = winfs.to_extended(new_path)
         try:
-            res = winfs.resolve(p_ext)
-        except OwlVaultError as exc:
-            raise StateError(f"Não foi possível acessar a pasta escolhida: {exc}") from exc
-        if not res.exists or not res.is_directory or res.identity is None:
-            raise StateError("A pasta escolhida não existe.")
-        inner = winfs.join(p_ext, VAULT_DIR)
-        inner_id = ""
-        if winfs.is_plain_dir_at(inner):
-            with contextlib.suppress(OSError):
-                inner_id = self._vault_id_of(inner)
-        known = {v.vault_id for v in rec.vaults if v.vault_id}
-        same = res.identity.file_id.hex() == rec.file_id and res.volume == rec.volume
-        if inner_id and inner_id not in known:
-            raise StateError("Esta não é a mesma pasta protegida.")
-        if not same and not inner_id:
-            raise StateError("Esta pasta não contém os dados protegidos esperados.")
+            res, inner, inner_id = self._relocate_candidate(rec, p_ext)
+        except StateError:
+            child = self._relocate_child(rec, p_ext)
+            if child is None:
+                raise
+            p_ext, (res, inner, inner_id) = child
+        assert res.identity is not None
         for other in self.folders:
             if (
                 other is not rec
@@ -1678,6 +2316,96 @@ class LockerManager:
         if rec.state == TRANCADA and winfs.is_plain_dir_at(inner):
             with contextlib.suppress(OwlVaultError, OSError):
                 self._write_placeholder(rec)
+
+    def _expected_inside(self, rec: FolderRecord) -> set[str]:
+        """vault_id que pode estar em ``P\\.owlvault`` no estado atual: o 'atual' (trancada), o
+        cofre que está saindo (abrindo) ou o 'novo' que já entrou (apagando, queda no fim)."""
+        if rec.state == TRANCADA:
+            v = rec.vault("atual")
+        elif rec.state == ABRINDO:
+            v = self._latest_previous_or_none(rec)
+            if v is not None and os.path.lexists(v.location):
+                v = None  # o cofre já saiu para a área temporária: em P só haveria uma cópia
+        elif rec.state == APAGANDO:
+            v = rec.vault("novo")
+            if v is not None and os.path.lexists(v.location):
+                v = None  # o 'novo' ainda está na área temporária: não entrou em P
+        else:
+            v = None  # aberta, restaurando, abertura incompleta, trancando: nenhum cofre em P
+        return {v.vault_id} if v is not None and v.vault_id else set()
+
+    def _relocate_candidate(self, rec: FolderRecord, p_ext: str) -> tuple[winfs.Resolved, str, str]:
+        """Confere se ``p_ext`` é a pasta de ``rec`` (StateError explica por que não é).
+        Devolve (resolução, ``P\\.owlvault``, vault_id de dentro em que se pode confiar)."""
+        try:
+            res = winfs.resolve(p_ext)
+        except OwlVaultError as exc:
+            raise StateError(f"Não foi possível acessar a pasta escolhida: {exc}") from exc
+        if not res.exists or not res.is_directory or res.identity is None:
+            raise StateError("A pasta escolhida não existe.")
+        inner = winfs.join(p_ext, VAULT_DIR)
+        inner_id = ""
+        if winfs.is_plain_dir_at(inner):
+            with contextlib.suppress(OSError):
+                inner_id = self._vault_id_of(inner)
+        known = {v.vault_id for v in rec.vaults if v.vault_id}
+        same = res.identity.file_id.hex() == rec.file_id and res.volume == rec.volume
+        if inner_id and inner_id not in known:
+            raise StateError("Esta não é a mesma pasta protegida.")
+        expected = self._expected_inside(rec)
+        if not same:
+            if not inner_id:
+                raise StateError("Esta pasta não contém os dados protegidos esperados.")
+            if inner_id not in expected:
+                if rec.state in (ABERTA, ABERTURA_INCOMPLETA, RESTAURANDO):
+                    raise StateError(
+                        f"Esta é uma cópia trancada de '{rec.name}' (por exemplo, um backup), não "
+                        "a pasta que está aberta. Escolha a pasta com os arquivos legíveis."
+                    )
+                if rec.state == TRANCADA:
+                    raise StateError(
+                        f"Esta pasta tem uma cópia criptografada antiga de '{rec.name}', não a "
+                        "atual. Escolha a pasta que estava na lista."
+                    )
+                raise StateError(
+                    f"Esta é uma cópia trancada de '{rec.name}' (por exemplo, um backup), não a "
+                    "pasta que estava na lista. Escolha a pasta que estava na lista."
+                )
+        elif inner_id not in expected:
+            inner_id = ""  # a mesma pasta, mas um .owlvault que o estado não espera: não confiar
+        return res, inner, inner_id
+
+    def _relocate_child(
+        self, rec: FolderRecord, parent: str
+    ) -> tuple[str, tuple[winfs.Resolved, str, str]] | None:
+        """A pasta de ``rec`` logo abaixo de ``parent`` (só pastas com ``.owlvault``: é o caso
+        da pasta trancada e escondida). Uma só pela identidade, ou uma só pelo cofre; senão
+        None (na dúvida, nada é escolhido)."""
+        try:
+            names = sorted(os.listdir(parent))
+        except OSError:
+            return None
+        same: list[tuple[str, tuple[winfs.Resolved, str, str]]] = []
+        by_vault: list[tuple[str, tuple[winfs.Resolved, str, str]]] = []
+        for n in names:
+            sub = winfs.join(parent, n)
+            if not winfs.is_plain_dir_at(sub) or not winfs.is_plain_dir_at(
+                winfs.join(sub, VAULT_DIR)
+            ):
+                continue
+            try:
+                found = self._relocate_candidate(rec, sub)
+            except StateError:
+                continue
+            ident = found[0].identity
+            is_same = (
+                ident is not None
+                and ident.file_id.hex() == rec.file_id
+                and found[0].volume == rec.volume
+            )
+            (same if is_same else by_vault).append((sub, found))
+        hits = same or by_vault
+        return hits[0] if len(hits) == 1 else None
 
     def _relocated_vault(
         self, rec: FolderRecord, v: VaultRef, inner: str, inner_id: str, new_staging: str
@@ -1775,6 +2503,10 @@ class LockerManager:
             else:
                 self._restrict(lnk, directory=False)
         shell.make_system_folder(p)
+        if rec.hidden:
+            # PathMakeSystemFolderW tira o atributo SISTEMA: a pasta escondida voltaria a
+            # aparecer para quem mostra arquivos ocultos
+            shell.change_attributes(p, add=HIDE)
         shell.notify_changed(p)
         shell.notify_changed(winfs.parent_of(p))
         return notes
@@ -1902,18 +2634,34 @@ class LockerManager:
             return "manter", vault_id, manifest
         return "descartar", vault_id, manifest
 
-    def _discard_novo(self, rec: FolderRecord, *, must_record: bool = True) -> str:
+    def _discard_novo(
+        self, rec: FolderRecord, *, must_record: bool = True, nothing_deleted: bool = False
+    ) -> str:
         """Desfaz um trancamento que não apagou nada: descarta o 'novo' e volta a ABERTA.
 
         NUNCA apaga um 'novo' concluído se houver marcador em P ou se algum arquivo do manifesto
         faltar em P: aí a pasta vai para APAGANDO ('Desfazer'/'Continuar'), sem impressões
         digitais (a exclusão passa a conferir o conteúdo). Devolve "descartado", "apagando" ou
         "manter".
+
+        ``nothing_deleted``: chamado pelo próprio trancamento ANTES de gravar 'apagando' (falha,
+        cancelamento ou divergência em ``create_vault``). Este processo não apagou nada, então um
+        arquivo que falta em P foi tirado pelo usuário: o 'novo' é descartado e a pasta volta a
+        ABERTA (§4.1.3), como a mensagem "nada foi apagado. Tente de novo" promete. A heurística
+        de "arquivo faltando" vale só para o estado TRANCANDO lido do disco (início). Um
+        marcador em P (que não é deste trancamento: ele limpa o antigo ao começar) ainda faz
+        conferir.
         """
         p = rec.path
         novo = rec.vault("novo")
         if novo is not None and os.path.lexists(novo.location):
-            verdict, vault_id, manifest = self._judge_novo(p, novo)
+            verdict: str
+            vault_id = ""
+            manifest: Manifest | None = None
+            if nothing_deleted and not os.path.lexists(winfs.join(p, MARKER_NAME)):
+                verdict = "descartar"
+            else:
+                verdict, vault_id, manifest = self._judge_novo(p, novo)
             if verdict == "apagando" and manifest is not None:
                 novo.vault_id = vault_id
                 rec.state = APAGANDO
@@ -1932,9 +2680,14 @@ class LockerManager:
                 self._save()
                 return "apagando"
             if verdict != "descartar":
+                where = winfs.strip_extended(winfs.parent_of(novo.location))
                 rec.attention = (
-                    "O trancamento foi interrompido e o Owl Vault não conseguiu conferir o cofre "
-                    "novo; nada foi apagado. Tente de novo mais tarde."
+                    "O trancamento foi interrompido e o Owl Vault não conseguiu conferir a cópia "
+                    f"criptografada que estava sendo criada (em {where}, uma pasta oculta). Por "
+                    "segurança, ela foi mantida e nada mais foi feito; os arquivos que estão na "
+                    "pasta continuam lá. Para voltar a usar a pasta, clique em 'Deixar a pasta "
+                    "aberta': essa cópia fica guardada como versão anterior e nada é apagado. "
+                    "Outra saída é 'Tirar da lista' (nada é apagado)."
                 )
                 with contextlib.suppress(OwlVaultError, OSError):
                     self._save()
@@ -2042,7 +2795,9 @@ class LockerManager:
             try:
                 notes.extend(self._reconcile(rec))
             except (OwlVaultError, OSError) as exc:
-                notes.append(f"'{rec.name}': {exc}")
+                # str() de um OSError traz o caminho cru do Windows: só o motivo vai para a tela
+                why = str(exc) if isinstance(exc, OwlVaultError) else exc.strerror
+                notes.append(f"'{rec.name}': {why or 'erro do sistema'}")
         return notes
 
     def _reconcile(self, rec: FolderRecord) -> list[str]:
@@ -2074,8 +2829,9 @@ class LockerManager:
                 )
             else:
                 notes.append(
-                    f"O trancamento de '{rec.name}' foi interrompido e não pôde ser conferido; "
-                    "nada foi apagado."
+                    f"O trancamento de '{rec.name}' foi interrompido e a cópia criptografada que "
+                    "estava sendo criada não pôde ser conferida; ela foi mantida e nada mais foi "
+                    "feito."
                 )
         elif rec.state == APAGANDO:
             novo = rec.vault("novo")
@@ -2083,10 +2839,7 @@ class LockerManager:
                 self._conclude_lock(rec, novo)
                 notes.append(f"O trancamento de '{rec.name}' (interrompido no fim) foi concluído.")
             elif not rec.attention:
-                rec.attention = (
-                    "O trancamento foi interrompido. Seus arquivos já estão guardados; clique em "
-                    "'Continuar trancando' ou 'Desfazer'."
-                )
+                rec.attention = _INTERRUPTED_LOCK
                 self._save()
         elif rec.state in (ABRINDO, RESTAURANDO):
             rec.attention = "A abertura foi interrompida. Clique em 'Continuar abrindo'."

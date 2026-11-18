@@ -14,6 +14,11 @@ Segurança (revisão): os nomes de pipe do Windows são globais. Por isso:
 
 Mesmo vinda da mesma conta, uma mensagem nunca abre uma pasta sozinha: a janela sempre pede
 o PIN (e mostra o nome da pasta) antes de abrir.
+
+Entrega confirmada (revisão): a janela principal responde ``ok`` depois de ler o pedido. A 2ª
+execução espera essa resposta por até ``SEND_PATIENCE`` segundos (a janela pode estar ocupada) e,
+se o canal cair antes de o pedido ser lido, tenta de novo. Sem confirmação, avisa o usuário em
+vez de sair calada — um clique em "Abrir com Owl Vault" nunca se perde em silêncio.
 """
 
 from __future__ import annotations
@@ -23,15 +28,37 @@ import getpass
 import hashlib
 import os
 import sys
+import time
 from ctypes import wintypes
 
-from PySide6.QtCore import QByteArray, QObject, Signal
+from PySide6.QtCore import QByteArray, QCoreApplication, QObject, Signal
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
+from PySide6.QtWidgets import QApplication, QMessageBox
+
+from owl_vault import APP_NAME
 
 ERROR_ALREADY_EXISTS = 183
 ERROR_ACCESS_DENIED = 5
 ASFW_ANY = 0xFFFFFFFF
 MAX_MESSAGE = 512
+#: resposta da janela principal depois de ler um pedido
+ACK = b"ok"
+#: quanto tempo (s) a 2ª execução espera a janela principal confirmar o pedido
+SEND_PATIENCE = 10.0
+
+# resultado de uma tentativa de entrega
+_DELIVERED = "entregue"  # a janela principal confirmou (ou, versão anterior, leu e fechou)
+_NOT_READ = "nao_lido"  # o pedido não foi lido (sem conexão, ou o canal caiu antes): tenta de novo
+_NO_REPLY = "sem_resposta"  # o pedido foi lido, mas a janela não confirmou a tempo
+_REFUSED = "recusado"  # o canal é de outra conta do Windows: nada foi enviado
+
+_WARNINGS = {
+    _NOT_READ: "O Owl Vault já está aberto, mas não respondeu. Tente de novo em alguns segundos.",
+    _NO_REPLY: "O Owl Vault está ocupado e ainda não confirmou o pedido. Se a janela dele não "
+    "aparecer logo, tente de novo em alguns segundos.",
+    _REFUSED: "Não foi possível passar o pedido para o Owl Vault que já está aberto. Use a "
+    "janela dele.",
+}
 _PIPE_ACCESS_DUPLEX = 0x3
 _FILE_FLAG_FIRST_PIPE_INSTANCE = 0x00080000
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -132,6 +159,20 @@ def peer_is_same_user(sock: QLocalSocket, *, peer_is_server: bool) -> bool:
     return bool(mine) and mine == theirs
 
 
+def _ms_left(deadline: float, cap: int | None = None) -> int:
+    left = max(0, int((deadline - time.monotonic()) * 1000))
+    return left if cap is None else min(cap, left)
+
+
+def _warn_user(text: str) -> None:
+    """Caixa de aviso simples. Sem interface gráfica (testes, QCoreApplication) não mostra nada:
+    quem chamou fica só com o retorno False."""
+    if not isinstance(QCoreApplication.instance(), QApplication):
+        return
+    box = QMessageBox(QMessageBox.Icon.Warning, APP_NAME, text, QMessageBox.StandardButton.Ok)
+    box.exec()
+
+
 class SingleInstance(QObject):
     message = Signal(str)
 
@@ -156,24 +197,63 @@ class SingleInstance(QObject):
     def listening(self) -> bool:
         return self._server is not None
 
-    def send(self, text: str) -> bool:
-        """Repassa ``text`` à instância principal (e permite que ela venha para a frente)."""
+    def send(self, text: str, *, patience: float = SEND_PATIENCE, warn: bool = True) -> bool:
+        """Repassa ``text`` à instância principal (e permite que ela venha para a frente).
+
+        True só quando a principal confirma que leu o pedido. Ela pode estar ocupada: espera
+        até ``patience`` segundos e, se o pedido não chegou a ser lido (canal caiu, sem
+        conexão), tenta de novo. Sem confirmação devolve False e, com ``warn``, avisa o usuário
+        numa caixa de mensagem (só quando há interface gráfica)."""
+        payload = QByteArray(text.encode("utf-8")[: MAX_MESSAGE - 1] + b"\n")
+        deadline = time.monotonic() + max(0.0, patience)
+        while True:
+            outcome = self._send_once(payload, deadline)
+            # lido sem confirmação: NÃO reenviar (a janela abriria o pedido duas vezes)
+            if outcome in (_DELIVERED, _NO_REPLY, _REFUSED) or time.monotonic() >= deadline:
+                break
+            time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
+        if outcome == _DELIVERED:
+            return True
+        if warn:
+            _warn_user(_WARNINGS[outcome])
+        return False
+
+    def _send_once(self, payload: QByteArray, deadline: float) -> str:
         sock = QLocalSocket()
-        sock.connectToServer(self.name)
-        if not sock.waitForConnected(3000):
-            return False
-        if not peer_is_same_user(sock, peer_is_server=True):
+        try:
+            sock.connectToServer(self.name)
+            if not sock.waitForConnected(_ms_left(deadline, cap=3000)):
+                return _NOT_READ
+            if not peer_is_same_user(sock, peer_is_server=True):
+                return _REFUSED
+            if sys.platform == "win32":
+                try:
+                    ctypes.windll.user32.AllowSetForegroundWindow(ASFW_ANY)
+                except OSError:
+                    pass
+            written: list[int] = []
+            sock.bytesWritten.connect(written.append)
+            sock.write(payload)
+            # o canal do Qt no Windows só conclui a escrita quando a principal lê
+            while sum(written) < payload.size():
+                if sock.state() != QLocalSocket.LocalSocketState.ConnectedState:
+                    return _NOT_READ  # caiu antes de a principal ler
+                left = _ms_left(deadline)
+                if left <= 0:
+                    return _NOT_READ  # a principal não leu a tempo (ocupada)
+                sock.waitForBytesWritten(left)
+            while not sock.canReadLine():
+                if sock.state() != QLocalSocket.LocalSocketState.ConnectedState:
+                    # leu e fechou sem responder: versão anterior, que não confirma
+                    return _DELIVERED
+                left = _ms_left(deadline)
+                if left <= 0:
+                    return _NO_REPLY
+                sock.waitForReadyRead(left)
+            reply = bytes(sock.readLine(64).data()).strip()
+            return _DELIVERED if reply == ACK else _NO_REPLY
+        finally:
             sock.abort()
-            return False
-        if sys.platform == "win32":
-            try:
-                ctypes.windll.user32.AllowSetForegroundWindow(ASFW_ANY)
-            except OSError:
-                pass
-        sock.write(QByteArray(text.encode("utf-8")[: MAX_MESSAGE - 1] + b"\n"))
-        sock.waitForBytesWritten(3000)
-        sock.disconnectFromServer()
-        return True
 
     def _on_connection(self) -> None:
         assert self._server is not None
@@ -191,6 +271,9 @@ class SingleInstance(QObject):
                     sock.abort()
                 return
             line = bytes(sock.readLine(MAX_MESSAGE).data()).decode("utf-8", "replace").strip()
+            # confirma ANTES de tratar o pedido (que pode abrir um diálogo e demorar); o canal
+            # só fecha depois que a 2ª execução ler a confirmação
+            sock.write(QByteArray(ACK + b"\n"))
             sock.disconnectFromServer()
             if line:
                 self.message.emit(line[:MAX_MESSAGE])

@@ -228,6 +228,8 @@ QPlainTextEdit#log, QTextEdit#log {{
     font-size: 13px;
     padding: {space-4};
 }}
+/* foco de teclado visível (checklist de aceite); padding 1px menor: o texto não pula */
+QPlainTextEdit#log:focus, QTextEdit#log:focus {{ border: 2px solid {focus}; padding: 15px; }}
 
 /* ---------- caixas de seleção ---------- */
 /* O quadradinho é desenhado em Python (ui/theme.py, OwlStyle) com os mesmos tokens:
@@ -370,6 +372,10 @@ QListWidget {{
 }}
 QListWidget::item {{ min-height: 32px; border-radius: {radius-sm}; padding: 0 {space-2}; }}
 QListWidget::item:selected {{ background: {accent-soft}; color: {ink}; }}
+/* v2: a lista de "Detalhes" entra no Tab — o foco aparece como nos campos (borda de 2px,
+   padding 1px menor para o texto não pular) */
+QPlainTextEdit:focus {{ border: 2px solid {focus}; padding: 7px; }}
+QListWidget:focus {{ border: 2px solid {focus}; padding: 3px; }}
 
 /* abas (só se alguma tela ainda usar) */
 QTabWidget::pane {{ background: {panel}; border: 0; border-radius: {radius-xl}; padding: {space-4}; }}
@@ -390,7 +396,9 @@ QLabel#forcaTexto[nivel="fraca"] {{ color: {warn}; }}
 
 /* v2: textos dentro da dica e do aviso */
 QLabel#dicaTexto {{ font-size: 13px; color: {ink}; }}
-QLabel#avisoIcone {{ font-size: 16px; font-weight: 700; color: {notice-ink}; }}
+/* o ⚠ é desenhado em 18px (componentes._IconeAviso) com este "color"; "QFrame#aviso QLabel"
+   (13px) é mais específico que "QLabel#avisoIcone": por isso o prefixo */
+QFrame#aviso QLabel#avisoIcone {{ font-size: 16px; font-weight: 700; color: {notice-ink}; }}
 
 /* dialogos */
 /* "QFrame#cartao QWidget" (transparente) é mais específico que as regras de um só
@@ -443,3 +451,22 @@ QFrame#cartaoLateral QFrame#ligacao {{ background: {border}; }}
    dos cartões ('Trancar agora' na lista): devolve. As linhas da lista ficam dentro do cartão
    e já são cobertas pelas regras "QFrame#cartao QPushButton…" do bloco dialogos. */
 QFrame#aviso QPushButton:hover {{ background: {panel-alt}; }}
+
+/* tema */
+/* Linha da lista: "QFrame#cartao QWidget" (transparente) apagava o fundo panel-alt da linha.
+   Com a linha em panel-alt, o hover dos botões de DENTRO dela não pode ser panel-alt também
+   (sumiria): usa border. O primário e o discreto mantêm o hover deles. */
+QFrame#cartao QFrame#linhaPasta {{ background: {panel-alt}; }}
+QFrame#linhaPasta QToolButton#mais:hover, QFrame#linhaPasta QPushButton:hover {{ background: {border}; }}
+QFrame#linhaPasta QPushButton#primario:hover {{ background: {accent-hover}; }}
+QFrame#linhaPasta QPushButton#discreto:hover {{ background: transparent; }}
+
+/* Menus (⋯ da linha, botão direito em campos e textos selecionáveis) são janelas popup, mas
+   têm como pai um widget de dentro do cartão: as regras "QFrame#x QWidget" (transparentes)
+   também os pegavam e o menu saía sem fundo (preto no Windows; texto ilegível no claro).
+   Devolve o fundo. FICA NO FIM DO ARQUIVO: tem a mesma especificidade das regras
+   transparentes e precisa vir depois de todas elas (inclusive "QFrame#linhaPasta QWidget").
+   Toda regra nova "QFrame#x QWidget" transparente precisa do seu "QFrame#x QMenu" aqui —
+   tests/test_tema.py confere. */
+QFrame#cartao QMenu, QFrame#cartaoLateral QMenu, QFrame#dica QMenu, QFrame#aviso QMenu,
+QFrame#rodape QMenu, QFrame#linhaPasta QMenu {{ background: {panel}; }}

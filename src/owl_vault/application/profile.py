@@ -15,11 +15,16 @@ gravado em CADA cópia sem trocar o resto dela (o índice de uma cópia nunca é
 da outra antes de autenticar); o efetivo é o máximo das duas, e um PIN desativado em qualquer
 cópia está desativado. Uma sessão aberta relê o disco antes de gravar: nunca reativa um PIN
 desativado nem zera o contador (só ``set_pin`` e um desbloqueio bem-sucedido zeram).
+
+Trocar PIN/senha mestra é tudo ou nada para quem chama: exceção = o principal não foi trocado e a
+sessão volta ao que era; sem exceção = a mudança vale. Se só o .bak não puder ser trocado depois
+do principal, ele fica com a versão anterior até a próxima gravação (``NOTE_BACKUP_PENDING``).
 """
 
 from __future__ import annotations
 
 import contextlib
+import copy
 import datetime as _dt
 import itertools
 import json
@@ -61,6 +66,12 @@ NOTE_BACKUP_USED = (
 )
 NOTE_MASTER_REBUILT = (
     "A parte do perfil que abre com a senha mestra estava danificada e foi refeita."
+)
+#: aviso em ``session.notes`` quando a mudança valeu no arquivo principal, mas a cópia de
+#: segurança não pôde ser trocada (ela ainda tem a versão anterior até a próxima gravação)
+NOTE_BACKUP_PENDING = (
+    "A cópia de segurança do perfil não pôde ser atualizada agora; ela será refeita na "
+    "próxima gravação."
 )
 _WEAK_PIN = "Este PIN é fácil de adivinhar. Escolha outro."
 _DPAPI_GONE = (
@@ -490,12 +501,15 @@ class ProfileStore:
         self.policy = policy
         #: a última ``read_raw`` precisou da cópia de segurança (principal ausente/ilegível)
         self.last_read_used_backup = False
+        #: a última ``write_both`` trocou o principal, mas não o .bak (que ficou com a versão
+        #: anterior); a próxima gravação que passar o principal para o .bak desfaz isso
+        self.backup_pending = False
 
     def exists(self) -> bool:
         return self.path.exists() or self.bak.exists()
 
     # -- leitura
-    def _read_one(self, path: Path) -> dict[str, Any]:
+    def _read_bytes(self, path: Path) -> bytes:
         delay = 0.05
         for attempt in range(8):
             try:
@@ -508,7 +522,10 @@ class ProfileStore:
                     raise
                 time.sleep(delay)
                 delay = min(delay * 2, 1.0)
-        return _parse(data)
+        return data
+
+    def _read_one(self, path: Path) -> dict[str, Any]:
+        return _parse(self._read_bytes(path))
 
     def _read_or_none(self, path: Path) -> dict[str, Any] | None:
         try:
@@ -568,31 +585,49 @@ class ProfileStore:
 
     def write(self, obj: dict[str, Any]) -> None:
         """tmp + flush + os.replace; a versão anterior vira o .bak (só se for legível: um
-        principal danificado nunca toma o lugar de um .bak bom)."""
+        principal danificado nunca toma o lugar de um .bak bom).
+
+        Se levantar exceção, o principal NÃO foi trocado (continua a versão anterior)."""
+        self._write_primary(_dump(obj))
+
+    def _write_primary(self, data: bytes) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
-        tmp = self._tmp_write(self.path.name, _dump(obj))
+        tmp = self._tmp_write(self.path.name, data)
         try:
+            old: bytes | None
             try:
-                old: bytes | None = self.path.read_bytes()
-            except FileNotFoundError:
+                old = self._read_bytes(self.path)
+                _parse(old)
+            except _UNREADABLE:
                 old = None
             if old is not None:
-                try:
-                    _parse(old)
-                except _UNREADABLE:
-                    old = None
-            if old is not None:
                 self._install(self._tmp_write(self.bak.name, old), self.bak)
+                # o .bak agora tem o principal de antes desta gravação: se ele estava atrasado
+                # (``backup_pending``), deixou de estar
+                self.backup_pending = False
             self._install(tmp, self.path)
         finally:
             if tmp.exists():
                 tmp.unlink()
 
-    def write_both(self, obj: dict[str, Any]) -> None:
-        """Grava o mesmo conteúdo nas DUAS cópias (contador de PIN, desativação do PIN)."""
-        self.write(obj)
-        data = self.path.read_bytes()
-        self._install(self._tmp_write(self.bak.name, data), self.bak)
+    def write_both(self, obj: dict[str, Any]) -> bool:
+        """Grava o mesmo conteúdo nas DUAS cópias (contador e desativação do PIN, PIN novo,
+        senha mestra nova, desbloqueio).
+
+        O .bak recebe os MESMOS bytes já gravados no principal, sem reler o arquivo. Exceção
+        aqui = o principal NÃO foi trocado (nada mudou). Depois que o principal foi trocado, a
+        mudança valeu (é o principal que o desbloqueio usa) e nada vira erro para quem chamou:
+        se o .bak não puder ser trocado, devolve False e marca ``backup_pending`` — o .bak fica
+        com a versão anterior até a próxima gravação, que o refaz."""
+        data = _dump(obj)
+        self._write_primary(data)
+        try:
+            self._install(self._tmp_write(self.bak.name, data), self.bak)
+        except Exception:  # o principal já vale: falha aqui não pode virar "não mudou"
+            self.backup_pending = True
+            return False
+        self.backup_pending = False
+        return True
 
     def _store_counter(
         self,
@@ -913,6 +948,26 @@ class ProfileSession:
         else:
             self.store.write(self.obj)
         self._pin_seen = self.obj.get("pin")
+        if self.store.backup_pending:
+            self._note(NOTE_BACKUP_PENDING)
+        elif NOTE_BACKUP_PENDING in self.notes:
+            self.notes.remove(NOTE_BACKUP_PENDING)
+
+    def _snapshot(self) -> tuple[dict[str, Any], list[tuple[KekEntry, str]]]:
+        keks = self._index.keks if self._index is not None else []
+        return copy.deepcopy(self.obj), [(k, k.origin) for k in keks]
+
+    def _rollback(self, snap: tuple[dict[str, Any], list[tuple[KekEntry, str]]]) -> None:
+        """Volta a memória ao estado de antes de uma troca de PIN/senha mestra que NÃO foi
+        gravada: a sessão nunca pode gravar depois, por outro caminho (``save``), uma mudança
+        que a interface disse que falhou."""
+        obj, keks = snap
+        self.obj.clear()
+        self.obj.update(obj)
+        if self._index is not None:
+            for k, origin in keks:
+                k.origin = origin
+            self._index.keks[:] = [k for k, _ in keks]
 
     def save(self) -> None:
         """Re-sela o índice e grava (a versão anterior vira o .bak). Relê o disco antes: o
@@ -931,16 +986,26 @@ class ProfileSession:
         )
         box = _seal(kpin, pk, _aad(self.profile_id, "pin"))
         blob = dpapi.protect(json.dumps(box).encode("ascii"), self.profile_id.encode())
+        snap = self._snapshot()
         self.obj["pin"] = {"salt": salt.hex(), **_params_obj(params), "blob": blob.hex()}
         self.obj["pin_failures"] = 0
         if save:
             # PIN novo e contador zerado DE PROPÓSITO, nas duas cópias (o PIN antigo não pode
-            # continuar valendo no .bak)
-            self._commit(both=True, merge=False)
+            # continuar valendo no .bak). Exceção = nada foi gravado: a memória volta ao PIN
+            # antigo. Sem exceção = o PIN novo vale (mesmo que o .bak tenha ficado para depois:
+            # ``NOTE_BACKUP_PENDING``).
+            try:
+                self._commit(both=True, merge=False)
+            except BaseException:
+                self._rollback(snap)
+                raise
 
     def change_master(self, new_master: str) -> None:
         """Cria uma senha mestra nova (a antiga continua guardada no índice para abrir os
-        cofres ainda não re-trancados)."""
+        cofres ainda não re-trancados).
+
+        Exceção = nada foi gravado e a sessão continua com a senha mestra antiga (as próximas
+        trancagens não usam a nova). Sem exceção = a senha nova vale."""
         validate_master_password(new_master)
         pk = self._require_pk()
         mem = winfs.memory_status()
@@ -948,13 +1013,18 @@ class ProfileSession:
         params = calibrate(avail, mem.total_physical if mem else None)
         salt = os.urandom(SALT_SIZE)
         kek = derive_kek(new_master, salt, params, self.store.policy, avail)
-        for old in self.index.keks:
-            if old.origin == KEK_PERFIL:
-                old.origin = KEK_TROCADA
-        self.index.keks.insert(0, KekEntry(salt, params, kek, KEK_PERFIL))
-        self.obj["kdf"] = {"salt": salt.hex(), **_params_obj(params)}
-        self.obj["wrap_sm"] = _seal(kek, pk, _aad(self.profile_id, "sm"))
-        self._commit(both=True, merge=True)
+        snap = self._snapshot()
+        try:
+            for old in self.index.keks:
+                if old.origin == KEK_PERFIL:
+                    old.origin = KEK_TROCADA
+            self.index.keks.insert(0, KekEntry(salt, params, kek, KEK_PERFIL))
+            self.obj["kdf"] = {"salt": salt.hex(), **_params_obj(params)}
+            self.obj["wrap_sm"] = _seal(kek, pk, _aad(self.profile_id, "sm"))
+            self._commit(both=True, merge=True)
+        except BaseException:
+            self._rollback(snap)
+            raise
 
     def close(self) -> None:
         self._pk = None

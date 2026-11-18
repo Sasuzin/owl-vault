@@ -70,7 +70,7 @@ def main() -> int:
     launcher = ensure_installed()
     window = OwlWindow(launcher, open_request=request)
     single.message.connect(window.handle_message)
-    window.show()
+    window.show_initial()  # cabe na área útil da tela; numa tela pequena demais, maximizada
     return int(app.exec())
 
 

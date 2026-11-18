@@ -6,8 +6,13 @@ Na primeira execução, o `OwlVault.exe` se copia para `%LOCALAPPDATA%\Programs\
 e cria o atalho **Owl Vault** no Menu Iniciar — só para o seu usuário, sem administrador. Os
 atalhos "Abrir com Owl Vault" das pastas trancadas apontam para essa cópia; não a apague.
 Ao rodar uma versão **mais nova** do `OwlVault.exe`, a cópia instalada é atualizada (se estiver
-aberta, a atualização acontece na próxima vez). Uma versão igual ou mais antiga não substitui a
-instalada (a versão instalada fica em `versao.txt`, ao lado do executável). A versão e o build
+aberta, a atualização acontece na próxima vez). Uma versão mais antiga nunca substitui a
+instalada. Com o mesmo número de versão, a cópia instalada é trocada se o conteúdo for diferente
+(novo build ou executável trocado por fora), a não ser que ela confira com `versao.sha256` e
+seja um build mais novo. Ao lado do executável ficam `versao.txt` (a versão instalada) e
+`versao.sha256` (versão, tamanho, SHA-256 e data do build do executável instalado).
+Se o Owl Vault já estiver aberto e ocupado, o pedido de um atalho espera até 10 segundos pela
+janela principal; se ele não chegar, aparece um aviso em vez de nada acontecer. A versão e o build
 aparecem em ☰ → Sobre, no rodapé da janela e nas propriedades do arquivo (Detalhes →
 Versão do arquivo).
 

@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMenu,
     QScrollArea,
+    QSizePolicy,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
@@ -30,7 +31,9 @@ from owl_vault.application.lockers import (
     ABERTURA_INCOMPLETA,
     ABRINDO,
     APAGANDO,
+    RESTAURANDO,
     TRANCADA,
+    TRANCANDO,
     FolderView,
 )
 from owl_vault.application.profile import validate_master_password, validate_pin
@@ -63,8 +66,41 @@ from owl_vault.ui.componentes import (
 )
 from owl_vault.ui.icon import owl_image
 
-#: estados em que há cópias legíveis da pasta no disco (faixa da lista e aviso ao sair, T11)
-VISIVEIS = frozenset({ABERTA, ABERTURA_INCOMPLETA, ABRINDO, APAGANDO})
+#: estados em que a pasta pode ter cópias legíveis no disco (faixa da lista, aviso ao sair T11
+#: e a contagem guardada ao bloquear). RESTAURANDO: abertura cancelada ou interrompida no meio,
+#: com parte dos arquivos já legível; TRANCANDO: trancamento interrompido, com tudo legível.
+VISIVEIS = frozenset({ABERTA, ABERTURA_INCOMPLETA, ABRINDO, RESTAURANDO, APAGANDO, TRANCANDO})
+
+#: issues que a janela trata com um "Resolver…" próprio; qualquer outra cai no Resolver genérico
+ISSUES_CONHECIDAS = frozenset(
+    {
+        "",
+        APAGANDO,
+        ABERTURA_INCOMPLETA,
+        ABRINDO,
+        TRANCANDO,
+        "itens_extras",
+        "sem_dados",
+        "nao_encontrada",
+        "indisponivel",
+        "versao_anterior",
+        "versao_anterior_ilegivel",
+        "senha_antiga",
+    }
+)
+
+#: estados intermediários em que a pasta, no lugar, tem conteúdo para ver no Explorer
+_COM_CONTEUDO = frozenset({APAGANDO, TRANCANDO, RESTAURANDO, ABERTURA_INCOMPLETA})
+
+
+def pode_trancar(view: FolderView) -> bool:
+    """A pasta está aberta, no lugar, e "Trancar" funciona (botão ou ação base do menu ⋯)."""
+    return view.record.state == ABERTA and "trancar" in (view.action, view.base_action)
+
+
+def quebravel(texto: str) -> str:
+    """Deixa um caminho longo quebrar nas barras (sem isso ele empurra a linha para o lado)."""
+    return texto.replace("\\", "\\\u200b").replace("/", "/\u200b")
 
 
 def status_padrao() -> str:
@@ -116,7 +152,9 @@ def _rolavel(conteudo: QWidget) -> QScrollArea:
 
 
 def _palco(principal: QWidget, lateral: Sequence[QWidget]) -> QWidget:
-    """[principal (cresce)] + [lateral de 272 px], 20 px entre eles."""
+    """[principal (cresce)] + [lateral de 272 px], 20 px entre eles.
+
+    A lateral também rola: numa janela baixa, os textos dela nunca são espremidos."""
     w, lay = transparente(QHBoxLayout)
     lay.setSpacing(20)
     lay.addWidget(principal, 1)
@@ -126,9 +164,19 @@ def _palco(principal: QWidget, lateral: Sequence[QWidget]) -> QWidget:
         for x in lateral:
             cl.addWidget(x)
         cl.addStretch(1)
-        col.setFixedWidth(LARGURA_LATERAL)
-        lay.addWidget(col, 0)
+        area = _rolavel(col)
+        area.setFixedWidth(LARGURA_LATERAL)
+        lay.addWidget(area, 0)
     return w
+
+
+def _rolavel_centralizado(card: QWidget, largura: int) -> QScrollArea:
+    """Cartão centralizado (desbloqueio, perfil ilegível) que rola numa janela baixa."""
+    inner, lay = transparente()
+    lay.addStretch(1)
+    lay.addWidget(_centralizado(card, largura))
+    lay.addStretch(2)
+    return _rolavel(inner)
 
 
 def _centralizado(inner: QWidget, largura: int) -> QWidget:
@@ -462,22 +510,22 @@ class UnlockPage(Pagina):
         ll.addStretch(1)
         ll.addWidget(self.forgot)
         lay.addWidget(links)
-        self.extra, ex = transparente(QHBoxLayout)
+        # um embaixo do outro, na largura toda: lado a lado eles não cabem no cartão de 460 px
+        self.extra, ex = transparente(QVBoxLayout)
         ex.setSpacing(12)
         self.new_master = botao("Criar nova senha mestra")
         self.new_master.clicked.connect(self.new_master_requested.emit)
         self.once = botao("Usar o PIN desta vez")
         self.once.clicked.connect(self.use_pin_once.emit)
-        ex.addWidget(self.new_master)
-        ex.addWidget(self.once)
+        for b in (self.new_master, self.once):
+            b.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            ex.addWidget(b)
         self.extra.hide()
         lay.addWidget(self.extra)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        root.addStretch(1)
-        root.addWidget(_centralizado(card, 460))
-        root.addStretch(2)
+        root.addWidget(_rolavel_centralizado(card, 460), 1)
         self.go = self.rodape.primario
         self.go.clicked.connect(self._submit)
         self.enter_aciona_primario(self.edit)
@@ -599,9 +647,7 @@ class ProfileProblemPage(Pagina):
             lay.addWidget(w)
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        root.addStretch(1)
-        root.addWidget(_centralizado(card, 520))
-        root.addStretch(2)
+        root.addWidget(_rolavel_centralizado(card, 520), 1)
         self.rodape.primario.clicked.connect(self._go)
         self.configure(corrupt=True)
 
@@ -658,8 +704,34 @@ def estado_da_linha(view: FolderView) -> str:
     return "trancada"
 
 
+class RotuloNome(RotuloCortado):
+    """Nome da pasta numa linha: corta o FIM com "…" (o começo do nome é o que se reconhece);
+    o nome inteiro fica na dica e no nome acessível. Nunca alarga a linha."""
+
+    def __init__(self, text: str, name: str = "linhaNome") -> None:
+        super().__init__(text, name)
+        self.setAccessibleName(text)
+
+    def _elide(self) -> None:
+        metrics = self.fontMetrics()
+        self.setText(metrics.elidedText(self._full, Qt.TextElideMode.ElideRight, self.width()))
+
+
+def _detalhe(view: FolderView) -> str:
+    """Texto pequeno embaixo do estado (o problema atual, dito pelo gerente)."""
+    if view.issue == "indisponivel":
+        dica = "Se a unidade voltou com outra letra, use ⋯ > Procurar a pasta…"
+        return dica if "Procurar" not in view.label + view.attention else view.attention
+    if view.attention and view.action == "resolver":
+        return view.attention
+    return ""
+
+
 class FolderRow(QFrame):
-    """Uma linha da lista: nome, local (cortado no meio), estado, UM botão e o menu ⋯."""
+    """Uma linha da lista: nome, local (cortado no meio), estado, UM botão e o menu ⋯.
+
+    Nome longo, estado longo ou detalhe com caminho nunca empurram o botão e o ⋯ para fora:
+    o nome corta com "…", o estado e o detalhe quebram linha."""
 
     def __init__(
         self,
@@ -675,22 +747,26 @@ class FolderRow(QFrame):
         lay.setSpacing(12)
         textos, tl = transparente()
         tl.setSpacing(2)
-        name = QLabel(rec.name)
-        name.setObjectName("linhaNome")
-        name.setTextFormat(Qt.TextFormat.PlainText)
+        textos.setMinimumWidth(80)
+        textos.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        name = RotuloNome(rec.name)
         self.where = RotuloCortado(winfs.strip_extended(winfs.parent_of(rec.path)), "linhaLocal")
         state = QLabel(view.label)
         state.setObjectName("linhaEstado")
+        state.setTextFormat(Qt.TextFormat.PlainText)
+        state.setWordWrap(True)
         state.setProperty("estado", estado_da_linha(view))
         repintar(state)
         tl.addWidget(name)
         tl.addWidget(self.where)
         tl.addWidget(state)
-        if view.attention and view.action == "resolver":
-            att = QLabel(view.attention)
+        detalhe = _detalhe(view)
+        if detalhe:
+            att = QLabel(quebravel(detalhe))
             att.setObjectName("linhaDetalhe")
             att.setTextFormat(Qt.TextFormat.PlainText)
             att.setWordWrap(True)
+            att.setAccessibleName(detalhe)
             tl.addWidget(att)
         lay.addWidget(textos, 1)
         self.button = None
@@ -717,12 +793,19 @@ class FolderRow(QFrame):
             lay.addWidget(self.more, 0, Qt.AlignmentFlag.AlignVCenter)
 
 
+PROCURAR = ("Procurar a pasta…", "relocate")
+TIRAR = ("Tirar da lista", "forget")
+
+
 def row_menu(view: FolderView) -> list[tuple[str, str]]:
-    """Menu ⋯ por estado (T4)."""
+    """Menu ⋯ por estado (T4). Toda linha tem saída: "Tirar da lista" em qualquer estado e
+    "Procurar a pasta…" quando a pasta sumiu, a unidade não responde, o estado é
+    intermediário ou o problema é desconhecido."""
     rec = view.record
+    issue = view.issue
+    if issue in ("nao_encontrada", "indisponivel"):
+        return [PROCURAR, TIRAR]
     items: list[tuple[str, str]] = []
-    if view.issue == "indisponivel":
-        return [("Tirar da lista", "forget")]
     if view.action == "resolver" and view.base_action:
         items.append(("Abrir" if view.base_action == "abrir" else "Trancar", view.base_action))
     state = rec.state
@@ -737,8 +820,13 @@ def row_menu(view: FolderView) -> list[tuple[str, str]]:
         items.append(("Abrir a pasta no Explorer", "explore"))
         items.append(("Trancar e esconder", "lock_hide"))
         items.append(("Remover proteção…", "remove"))
-    if view.issue == "nao_encontrada":
-        items = [("Procurar a pasta…", "relocate"), ("Tirar da lista", "forget")]
+    else:  # trancando, apagando, abrindo, restaurando, abertura incompleta (ou um estado novo)
+        if state in _COM_CONTEUDO:
+            items.append(("Abrir a pasta no Explorer", "explore"))
+        items.append(PROCURAR)
+    if issue not in ISSUES_CONHECIDAS and PROCURAR not in items:
+        items.append(PROCURAR)
+    items.append(TIRAR)
     return items
 
 
@@ -784,12 +872,17 @@ class HomePage(Pagina):
         self.notice.hide()
         lay.addWidget(self.notice)
         self.list_area = _rolavel(QWidget())
+        # a lista fica com o espaço que sobrar (no mínimo 3 linhas) e rola por dentro; numa
+        # janela baixa, quem rola é a coluna inteira — nada de título espremido
+        self.list_area.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Ignored)
+        self.list_area.setMinimumHeight(180)
         lay.addWidget(self.list_area, 1)
 
         coluna, cl = transparente()
         cl.setSpacing(20)
         cl.addWidget(self.banner)
         cl.addWidget(card, 1)
+        self.coluna = _rolavel(coluna)
 
         # resumo: chave à esquerda, número grande à direita (contagens, sem nomes)
         self.resumo = CartaoLateral("Resumo")
@@ -810,7 +903,7 @@ class HomePage(Pagina):
         self.dica = Dica()
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        root.addWidget(_palco(coluna, [self.resumo, self.dica]), 1)
+        root.addWidget(_palco(self.coluna, [self.resumo, self.dica]), 1)
         self.counts: dict[str, int] = {}
         self.set_rows([], lambda _i, _a: None)
 
@@ -887,8 +980,10 @@ class HomePage(Pagina):
             )
 
     def _faixa(self, views: list[FolderView]) -> None:
+        """Faixa "N pastas abertas e visíveis": conta toda pasta que pode ter cópias legíveis
+        (``VISIVEIS``); "Trancar agora" só aparece se alguma delas pode ser trancada já."""
         visiveis = [v for v in views if v.record.state in VISIVEIS]
-        abertas = [v for v in visiveis if v.record.state == ABERTA]
+        trancaveis = [v for v in visiveis if pode_trancar(v)]
         if not visiveis:
             self.banner.definir("")
             return
@@ -898,9 +993,9 @@ class HomePage(Pagina):
             "1 pasta está aberta e visível neste computador.",
             "{n} pastas estão abertas e visíveis neste computador.",
         )
-        if len(abertas) < n:
-            text += " Use 'Resolver…' nas que precisam de atenção."
-        self.lock_all.setVisible(bool(abertas))
+        if len(trancaveis) < n:
+            text += " Use 'Resolver…' (ou o menu ⋯) nas que precisam de atenção."
+        self.lock_all.setVisible(bool(trancaveis))
         self.banner.definir(text)
 
     def clear(self) -> None:

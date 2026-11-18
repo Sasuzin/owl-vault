@@ -7,11 +7,15 @@ outro lugar. Nunca trabalhe na única cópia.
 
 | Situação | O que fazer |
 |----------|-------------|
-| "Trancamento interrompido" | Seus arquivos já estão guardados. Feche os arquivos listados e clique **Continuar trancando**, ou **Desfazer** para devolver tudo e deixar a pasta aberta. |
+| "Trancamento interrompido" | Leia o texto: ele diz se os arquivos listados estão em uso (feche-os), se mudaram depois de criptografados (a versão nova NÃO está guardada) ou se são itens novos colocados durante o trancamento (NÃO estão guardados: mova-os para outro lugar). Depois clique **Continuar trancando**, ou **Desfazer** para devolver tudo e deixar a pasta aberta. |
+| "Trancamento interrompido" sem Continuar/Desfazer (a cópia que estava sendo criada não pôde ser conferida) | **Deixar a pasta aberta**: a pasta volta a ficar aberta, essa cópia fica guardada como "Versão anterior" e nada é apagado. |
+| "A cópia criptografada … não foi encontrada / não pode ser lida" (pasta oculta `.owlvault-<código>` ao lado da pasta) | Se você moveu ou apagou essa pasta oculta, coloque-a de volta e clique **Resolver…** de novo. Se não for possível, **Tirar da lista** (nada é apagado). |
+| "Os dados criptografados que estão na pasta não são os registrados" | Alguém pôs outra cópia (talvez mais antiga) no lugar de `.owlvault`. O Owl Vault não abre nem verifica essa cópia como se fosse a sua. Devolva a cópia certa ou use **Tirar da lista** e depois ☰ → **Recuperar uma pasta protegida**, que abre a cópia que está na pasta. |
+| "O Windows não deixa o Owl Vault ler a pasta" | Confira as permissões da pasta (veio de outro computador? tome posse dela). As outras pastas continuam funcionando. |
 | "Não abriu por completo" | **Tentar de novo**. Se insistir, **Continuar sem eles**: a versão guardada desses arquivos é mantida e aparece em "Versão anterior". |
 | "Versão anterior mantida" | **Recuperar esses arquivos em outra pasta…** cria uma pasta nova com eles. Só use **Apagar a versão anterior…** depois de conferir a lista. |
 | "Há itens novos na pasta trancada" | Mova para fora da pasta o que foi colocado nela depois de trancar e clique **Tentar de novo**. Nada é apagado. |
-| "A pasta não foi encontrada" | Ela foi movida ou renomeada: **Procurar a pasta…** e escolha-a no novo lugar (o Owl Vault confere que é a mesma). **Tirar da lista** não apaga nada. |
+| "A pasta não foi encontrada" | Ela foi movida ou renomeada: **Procurar a pasta…** e escolha-a no novo lugar (o Owl Vault confere que é a mesma). Pasta escondida: escolha a pasta onde ela fica. **Tirar da lista** não apaga nada; antes de confirmar, leia onde ficam os arquivos e as cópias fora da pasta — "Recuperar uma pasta protegida" não acha as cópias da pasta oculta `.owlvault-<código>` (para abri-las: ☰ → Cópia criptografada → Abrir uma cópia, com a senha mestra). |
 | Esqueci o PIN | Na tela do PIN, **Esqueci o PIN** → senha mestra; depois ☰ → Alterar PIN. |
 | Windows reinstalado / senha do Windows redefinida | O PIN deixa de funcionar (DPAPI). Entre com a senha mestra e crie um PIN novo. |
 | Computador novo ou Owl Vault reinstalado | Instale, crie o acesso com a **mesma senha mestra** e use ☰ → **Recuperar uma pasta protegida** escolhendo a pasta com o ícone da coruja (ou a pasta onde ela ficava, se estava escondida). |

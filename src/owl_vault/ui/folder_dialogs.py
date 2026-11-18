@@ -13,27 +13,38 @@ import html
 import itertools
 from collections.abc import Sequence
 
-from PySide6.QtCore import QEvent, QSize, Qt
+from PySide6.QtCore import QEvent, Qt, QTimer
 from PySide6.QtGui import QShowEvent
 from PySide6.QtWidgets import (
-    QBoxLayout,
     QCheckBox,
     QDialog,
-    QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLayout,
     QListWidget,
     QListWidgetItem,
     QPlainTextEdit,
     QPushButton,
-    QScrollArea,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
 
 from owl_vault.domain.limits import MIN_PASSWORD_LENGTH
-from owl_vault.ui.common import fit_to_content, fmt_duration, fmt_int, fmt_size, show_error
+from owl_vault.ui.common import (
+    CORPO_MINIMO,
+    FOLGA_LARGURA,
+    FOLGA_MOLDURA,
+    Rolagem,
+    area_util,
+    assinatura_do_tema,
+    fit_to_content,
+    fmt_duration,
+    fmt_int,
+    fmt_size,
+    show_error,
+)
 from owl_vault.ui.componentes import (
     Aviso,
     CampoSenha,
@@ -48,6 +59,7 @@ from owl_vault.ui.componentes import (
     lista_detalhes,
     nota,
     rotulo,
+    sombra,
     subtitulo,
     titulo,
     transparente,
@@ -58,6 +70,9 @@ LARGURA = 520
 MARGEM = 24
 #: até esta largura os botões ficam lado a lado; acima, um embaixo do outro
 LARGURA_MAXIMA_BOTOES = 680
+#: vão entre os botões (lado a lado, empilhados ou em duas colunas) e espaço antes deles
+VAO_BOTOES = 12
+ESPACO_ANTES_DOS_BOTOES = 8
 
 LIMITS_TEXT = [
     "Uma pasta aberta pode ser lida por qualquer pessoa que use este computador.",
@@ -119,29 +134,41 @@ def tab_order(widgets: Sequence[QWidget]) -> None:
 
 
 class _DialogoCofre(QDialog):
-    """Fundo ``app-bg`` + ``QFrame#cartao``; ``self.corpo`` é o layout do cartão."""
+    """Fundo ``app-bg`` + ``QFrame#cartao``; ``self.corpo`` é o layout do conteúdo do cartão.
 
-    #: só a janela dos limites (com rolagem) encolhe para caber numa tela baixa
-    _clamp_to_screen = False
+    O conteúdo fica numa ``Rolagem`` e a linha de botões, fora dela, embaixo: numa tela baixa
+    (1366x768 a 125%/150%) o diálogo nunca passa da área útil, o conteúdo rola e os botões
+    continuam à vista.
+    """
 
     def __init__(self, parent: QWidget | None, width: int = LARGURA) -> None:
         super().__init__(parent)
         self.setWindowTitle("Owl Vault")
         self.setMinimumWidth(width)
         self._largura = width
+        self._tema = assinatura_do_tema()
+        self._erro_visto = ""
         externo = QVBoxLayout(self)
         externo.setContentsMargins(MARGEM, MARGEM, MARGEM, MARGEM)
-        self.card, self.corpo = cartao()
+        self.card, self._cartao = cartao()
         externo.addWidget(self.card)
+        conteudo, corpo = transparente()
+        corpo.setSpacing(self._cartao.spacing())
+        assert isinstance(corpo, QVBoxLayout)
+        self.corpo: QVBoxLayout = corpo
+        self.rolagem = Rolagem(conteudo)
+        self._cartao.addWidget(self.rolagem, 1)
         self.title_label = _puro(titulo(""))
         self.text_label = _puro(subtitulo(""))
         self.corpo.addWidget(self.title_label)
         self.corpo.addWidget(self.text_label)
-        self.button_box: QBoxLayout | None = None
+        #: linha (QHBoxLayout), coluna (QVBoxLayout) ou duas colunas (QGridLayout)
+        self.button_box: QLayout | None = None
 
     def fit(self) -> None:
-        """Tamanho fixo pelo conteúdo (largura mínima e a altura que os textos pedem)."""
-        fit_to_content(self, self._largura, clamp_to_screen=self._clamp_to_screen)
+        """Tamanho fixo pelo conteúdo (largura mínima e a altura que os textos pedem), nunca
+        maior que a área útil da tela."""
+        fit_to_content(self, self._largura)
 
     def showEvent(self, event: QShowEvent) -> None:
         self.fit()  # antes de o QDialog centralizar sobre a janela-mãe
@@ -151,7 +178,29 @@ class _DialogoCofre(QDialog):
         handled = super().event(event)
         if event.type() == QEvent.Type.LayoutRequest and self.isVisible():
             self.fit()  # apareceu um erro ou os detalhes: a altura acompanha
+            self._rolar_ate_erro()
         return handled
+
+    def _rolar_ate_erro(self) -> None:
+        """Numa tela baixa o corpo rola: um erro NOVO é trazido para a vista (uma vez só,
+        para não brigar com quem está rolando)."""
+        conteudo = self.rolagem.widget()
+        erros = [] if conteudo is None else conteudo.findChildren(QLabel, "erro")
+        visiveis = [e for e in erros if e.isVisibleTo(self) and e.text()]
+        texto = visiveis[0].text() if visiveis else ""
+        if texto and texto != getattr(self, "_erro_visto", ""):
+            alvo = visiveis[0]
+            QTimer.singleShot(0, self, lambda: self.rolagem.ensureWidgetVisible(alvo, 0, 8))
+        self._erro_visto = texto
+
+    def changeEvent(self, event: QEvent) -> None:
+        super().changeEvent(event)
+        if event.type() in (QEvent.Type.PaletteChange, QEvent.Type.StyleChange):
+            tema = assinatura_do_tema()
+            # a sombra é um efeito (fora do QSS): refaz com o token (se o cartão já existe)
+            if tema != getattr(self, "_tema", tema):
+                self._tema = tema
+                sombra(self.card)
 
     def _cabecalho(self, title: str, text: str) -> None:
         self.title_label.setText(title)
@@ -167,24 +216,76 @@ class _DialogoCofre(QDialog):
         return lbl
 
     def _botoes(self, botoes: Sequence[QPushButton]) -> None:
-        """Linha de botões à direita; se não cabem, um embaixo do outro, na largura toda."""
-        self.corpo.addSpacing(8)
+        """Linha de botões à direita (fora da rolagem: sempre à vista); se não cabem, um
+        embaixo do outro, na largura toda. Numa tela baixa em que a coluna não cabe junto com
+        o corpo mínimo, ficam em duas colunas (os botões nunca saem da tela)."""
+        # a sobra de altura do corpo vai para baixo, nunca para dentro do título e do texto
+        self.corpo.addStretch(1)
+        self._cartao.addSpacing(ESPACO_ANTES_DOS_BOTOES)
         cabe = max(self.minimumWidth(), LARGURA_MAXIMA_BOTOES) - 2 * MARGEM - 2 * 24
-        total = sum(b.sizeHint().width() for b in botoes) + 12 * max(0, len(botoes) - 1)
-        box: QBoxLayout
+        total = sum(b.sizeHint().width() for b in botoes) + VAO_BOTOES * max(0, len(botoes) - 1)
+        box: QLayout
         if total <= cabe or len(botoes) < 2:
-            box = QHBoxLayout()
-            box.addStretch(1)
+            linha = QHBoxLayout()
+            linha.addStretch(1)
             for b in botoes:
-                box.addWidget(b)
-        else:
-            box = QVBoxLayout()
+                linha.addWidget(b)
+            linha.setSpacing(VAO_BOTOES)
+            box = linha
+        elif self._coluna_cabe(botoes) or not self._grade_cabe(botoes):
+            coluna = QVBoxLayout()
             for b in botoes:
                 b.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-                box.addWidget(b)
-        box.setSpacing(12)
-        self.corpo.addLayout(box)
+                coluna.addWidget(b)
+            coluna.setSpacing(VAO_BOTOES)
+            box = coluna
+        else:
+            grade = QGridLayout()
+            grade.setHorizontalSpacing(VAO_BOTOES)
+            grade.setVerticalSpacing(VAO_BOTOES)
+            for i, b in enumerate(botoes):
+                b.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+                if i == len(botoes) - 1 and i % 2 == 0:
+                    grade.addWidget(b, i // 2, 0, 1, 2)  # o último, sozinho, na largura toda
+                else:
+                    grade.addWidget(b, i // 2, i % 2)
+            largura = max(b.sizeHint().width() for b in botoes)
+            for coluna_i in (0, 1):  # as duas colunas com a mesma largura
+                grade.setColumnStretch(coluna_i, 1)
+                grade.setColumnMinimumWidth(coluna_i, largura)
+            box = grade
+        self._cartao.addLayout(box)
         self.button_box = box
+
+    def _cromo_vertical(self) -> int:
+        """Altura de tudo que não é corpo nem botão: margens, moldura do cartão e vãos."""
+        m = self._cartao.contentsMargins()
+        f = self.card.contentsMargins()
+        return (
+            2 * MARGEM
+            + m.top()
+            + m.bottom()
+            + f.top()
+            + f.bottom()
+            + self._cartao.spacing()
+            + ESPACO_ANTES_DOS_BOTOES
+        )
+
+    def _coluna_cabe(self, botoes: Sequence[QPushButton]) -> bool:
+        """A coluna de botões e ``CORPO_MINIMO`` de corpo cabem na área útil da tela?"""
+        area = area_util(self.parentWidget() or self)
+        if area is None:
+            return True
+        coluna = sum(b.sizeHint().height() for b in botoes) + VAO_BOTOES * (len(botoes) - 1)
+        return self._cromo_vertical() + CORPO_MINIMO + coluna <= area.height() - FOLGA_MOLDURA
+
+    def _grade_cabe(self, botoes: Sequence[QPushButton]) -> bool:
+        """Duas colunas de botões cabem na largura da tela?"""
+        area = area_util(self.parentWidget() or self)
+        if area is None:
+            return False
+        largura = 2 * max(b.sizeHint().width() for b in botoes) + VAO_BOTOES
+        return largura + 2 * MARGEM + 2 * 24 <= area.width() - FOLGA_LARGURA
 
 
 # --- escolha (T5c, T7, T8, T9, T11...) --------------------------------------------------
@@ -631,44 +732,19 @@ class PickDialog(_DialogoCofre):
 # --- T15: limites --------------------------------------------------------------------------
 
 
-class _Rolagem(QScrollArea):
-    """Rolagem que pede a altura do conteúdo na largura dada; numa tela baixa, encolhe."""
-
-    def __init__(self, content: QWidget) -> None:
-        super().__init__()
-        self.setObjectName("transparente")
-        self.setWidgetResizable(True)
-        self.setFrameShape(QFrame.Shape.NoFrame)
-        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setWidget(content)
-
-    def hasHeightForWidth(self) -> bool:
-        return True
-
-    def heightForWidth(self, width: int) -> int:
-        content = self.widget()
-        if content is None:
-            return super().heightForWidth(width)
-        frame = 2 * self.frameWidth()
-        # mede já descontando a barra de rolagem: assim ela não aparece "por um fio"
-        barra = self.verticalScrollBar().sizeHint().width()
-        return content.heightForWidth(width - frame - barra) + frame
-
-    def minimumSizeHint(self) -> QSize:
-        return QSize(super().minimumSizeHint().width(), 120)
+#: nome antigo (a rolagem agora é a mesma de todos os diálogos: ``common.Rolagem``)
+_Rolagem = Rolagem
 
 
 class LimitsDialog(_DialogoCofre):
     """T15 — os limites da proteção, um por linha (ícone de alerta + título + nota)."""
-
-    _clamp_to_screen = True
 
     def __init__(self, parent: QWidget | None) -> None:
         super().__init__(parent, 600)
         self._cabecalho(
             "Limites da proteção", "O que o Owl Vault não consegue fazer por você. Leia uma vez."
         )
-        conteudo, lay = transparente()
+        linhas, lay = transparente()
         lay.setSpacing(8)
         self.rows: list[LinhaChecagem] = []
         for t, d in zip(LIMITS_TITLES, LIMITS_TEXT, strict=True):
@@ -676,8 +752,9 @@ class LimitsDialog(_DialogoCofre):
             row.icone.setAccessibleName(f"Limite: {t}")
             lay.addWidget(row)
             self.rows.append(row)
-        self.scroll_area = _Rolagem(conteudo)
-        self.corpo.addWidget(self.scroll_area, 1)
+        self.corpo.addWidget(linhas)
+        #: a rolagem do diálogo (numa tela baixa o texto rola e "Entendi" fica à vista)
+        self.scroll_area = self.rolagem
         self.ok = botao_primario("Entendi")
         self.ok.clicked.connect(self.accept)
         self._botoes([self.ok])

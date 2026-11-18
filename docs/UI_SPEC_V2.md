@@ -39,12 +39,13 @@ Variante atalho: título "Abrir '<Nome>'", campo [PIN], botão [Abrir]. Aparece 
 Variante perfil danificado (as duas cópias do perfil ilegíveis ou o índice não autentica): "O perfil deste computador está danificado" — nunca "Senha mestra incorreta" nem o assistente de criação. Botão [Recuperar minhas pastas com a senha mestra]: renomeia perfil.owlp e .bak para *.danificado-<data> (nada é apagado) e abre o assistente no modo recuperar (→ T1 → T12). Perfil que não pôde ser lido agora (erro de disco): "Não foi possível ler o perfil agora" [Tentar de novo]. Se o app usou a cópia .bak, a lista mostra um aviso.
 
 ## Travamento automático: o app volta para T3 depois de 5 min sem uso, ao bloquear o Windows (Win+L) e ao suspender. Também existe ☰ > "Bloquear agora".
+Todo bloqueio fecha a janela da Cópia criptografada (T14) sem perguntar: as senhas e os caminhos digitados somem; se ela estiver trabalhando, o trabalho para num ponto seguro e a janela se fecha sozinha quando ele parar. Um trabalho da Cópia conta como uso (os 5 min não a interrompem). Os diálogos já fechados, que guardam nomes de pastas e arquivos, são destruídos. Se o bloqueio acontecer no meio de "Trancar agora", nenhum resumo com nomes aparece na tela travada. Seletor de pastas do Windows que estava aberto: continua aberto, mas o caminho escolhido depois do bloqueio é descartado (em "Proteger uma pasta" e em "Recuperar esses arquivos em outra pasta…"). Bloqueio pedido durante um trabalho (Win+L, suspensão): acontece quando o trabalho termina, ANTES de mostrar o resultado — o aviso com nomes não aparece, o Explorer não abre, a sessão nova de um desbloqueio é descartada (no Alterar PIN, só "PIN alterado / Para entrar, use o PIN novo.") e o erro, que pode citar arquivos, não vai para a tela travada; o estado da pasta aparece na lista depois de desbloquear. Nenhum trabalho terminado guarda a senha, o PIN ou a função que os usou.
 
 
 ## T4 TELA PRINCIPAL — "Pastas protegidas"
 
 ## Topo: botão principal [+ Proteger uma pasta…] e o menu ☰.
-Faixa (enquanto houver pasta aberta): "1 pasta está aberta e visível neste computador. [Trancar agora]".
+Faixa (enquanto houver pasta aberta): "1 pasta está aberta e visível neste computador. [Trancar agora]". Contam como "abertas e visíveis" (podem ter cópias legíveis) as pastas em: aberta, abertura incompleta, abrindo, restaurando, apagando e trancando — na faixa, no T11 e na contagem guardada ao bloquear. [Trancar agora] tranca em fila: uma falha não para as outras e, no fim, um resumo diz quais ficaram abertas e por quê ("Não deu para trancar '<Nome>'").
 Estado vazio: "Nenhuma pasta protegida ainda. Clique em 'Proteger uma pasta…' e escolha a pasta que você quer trancar."
 Cada linha mostra ícone, Nome (negrito), Local (cinza), Estado por extenso e UM botão:
 - Trancada → [Abrir]
@@ -57,7 +58,13 @@ Menu "⋯" da linha:
 - Trancada: "Esconder do Explorer" · "Verificar arquivos" · "Remover proteção…"
 - Escondida: "Mostrar no Explorer" · "Verificar arquivos" · "Remover proteção…"
 - Aberta: "Abrir a pasta no Explorer" · "Trancar e esconder" · "Remover proteção…"
-Menu ☰: "Recuperar uma pasta protegida…" · "Cópia criptografada de uma pasta…" · "Alterar PIN…" · "Bloquear agora" · "Limites da proteção" · "Tema".
+- Trancando, apagando, abrindo, restaurando, abertura incompleta (ou um estado novo): "Abrir a pasta no Explorer" (quando há conteúdo) · "Procurar a pasta…"
+- Não encontrada / Indisponível: "Procurar a pasta…" (a linha de uma pasta indisponível diz: "Se a unidade voltou com outra letra, use ⋯ > Procurar a pasta…")
+- Problema desconhecido: a ação base (Abrir/Trancar) quando ela vale, mais "Procurar a pasta…".
+- Todo menu termina com "Tirar da lista". Toda linha tem saída.
+O nome longo é cortado com "…" (inteiro na dica do mouse); o estado e o detalhe quebram linha, e o botão e o ⋯ nunca somem.
+Menu ☰: "Recuperar uma pasta protegida…" · "Cópia criptografada de uma pasta…" · "Alterar PIN…" · "Bloquear agora" · "Limites da proteção" · "Tema" (Escuro/Claro, com a marca no tema em uso).
+Tamanho: a janela abre dentro da área útil da tela (descontada a moldura) e maximiza se nem o tamanho mínimo couber; as colunas e cartões rolam e o rodapé fica sempre à vista (testado em 1366×768 a 125% e 150%). Diálogos: o conteúdo rola e a linha de botões fica sempre à vista; um erro novo é trazido para a vista. Num diálogo limitado à tela, a altura que falta sai só do texto (os botões nunca se sobrepõem); se a coluna de botões não couber com o corpo mínimo, eles ficam em duas colunas, na ordem de leitura. Avisos curtos têm a altura natural, e a barra de rolagem só aparece quando o texto não cabe.
 
 
 ## T5 PROTEGER UMA PASTA (nenhum campo para preencher)
@@ -96,18 +103,23 @@ Fim: "'<Nome>' está trancada." Em unidade removível NTFS, acrescenta: "Use 'Re
 
 
 ## T7 TRANCAR UMA PASTA ABERTA: vai direto para T6, sem confirmação, EXCETO se faltarem arquivos que estavam no cofre anterior:
-"Desde que você abriu '<Nome>', 3 arquivos foram apagados ou movidos: a.docx, b.jpg, c.pdf. Eles não ficarão na pasta trancada." [Trancar mesmo assim] [Cancelar]
+"Desde que você abriu '<Nome>', 3 arquivos foram apagados ou movidos: a.docx, b.jpg, c.pdf. Se você trancar, eles não ficarão na pasta trancada e a cópia protegida deles será apagada para sempre." [Trancar mesmo assim] (vermelho) [Cancelar] (padrão: Enter nunca escolhe trancar e apagar)
 
 
-## T8 RESOLVER… (Precisa de atenção): uma explicação e no máximo 2 botões.
-- Trancamento interrompido: "Seus arquivos já estão guardados. N arquivos ainda não foram apagados da pasta porque estavam abertos ou foram alterados: Relatório.docx, … Feche-os e clique em Continuar trancando." [Continuar trancando] [Desfazer (deixar a pasta aberta)]. Depois de Desfazer: se algum arquivo não voltou porque já havia outro item com o mesmo nome num caminho que o Owl Vault apagou, o app lista esses nomes ("'<Nome>' continua aberta") e a versão guardada vira "Versão anterior mantida"; se algo falhou, "Nem todos os arquivos voltaram para '<Nome>'" com a lista.
-- Trancamento interrompido sem confirmação (estado "trancando"): o Owl Vault confere a pasta e mostra o resultado na faixa da lista.
-- Abertura incompleta: "N arquivos não puderam ser abertos: … A cópia protegida deles continua guardada." [Tentar de novo] [Continuar sem eles] (o cofre anterior nunca é apagado automaticamente)
+## T8 RESOLVER… (Precisa de atenção): uma explicação e as saídas. A explicação é o texto do gerente (`attention`), específico do problema atual — nunca uma frase fixa que pode ser falsa. Todo Resolver tem [Tirar da lista].
+- Trancamento interrompido (etapa 4, "apagando"): o texto separa os casos — arquivo em uso ("Feche-os e clique em Continuar trancando"), arquivo que mudou depois de criptografado (a versão nova NÃO está guardada) e item novo colocado durante o trancamento (NÃO está guardado: "Mova-os para outro lugar"); a lista vai nos detalhes. [Continuar trancando] [Desfazer (deixar a pasta aberta)] [Mostrar no Explorer] (se há pendências) [Tirar da lista] [Fechar]. Depois de Desfazer: se algum arquivo não voltou porque já havia outro item com o mesmo nome num caminho que o Owl Vault apagou, o app lista esses nomes ("'<Nome>' continua aberta") e a versão guardada vira "Versão anterior mantida"; se algo falhou, "Nem todos os arquivos voltaram para '<Nome>'" com a lista.
+- Trancamento interrompido sem confirmação (estado "trancando"): o Owl Vault confere a pasta e mostra o resultado na faixa da lista. Se ela continuar presa (a cópia que estava sendo criada não pode ser conferida): o texto do gerente e [Deixar a pasta aberta] (a pasta volta a ficar aberta e essa cópia fica guardada como versão anterior; nada é apagado) [Procurar a pasta…] [Tirar da lista] [Fechar] (padrão).
+- Abertura interrompida: o texto do gerente (inclusive um item colocado na pasta durante a abertura) e [Continuar abrindo] [Tirar da lista] [Fechar].
+- Abertura incompleta: "N arquivos não puderam ser abertos: … A cópia protegida deles continua guardada." [Tentar de novo] [Continuar sem eles] [Tirar da lista] (o cofre anterior nunca é apagado automaticamente)
+- Indisponível (pelo atalho ou pelo menu): "Conecte a unidade. Se ela voltou com outra letra, clique em 'Procurar a pasta…'" [Procurar a pasta…] [Tirar da lista] [Fechar] (padrão).
+- Problema que a janela não conhece (ex.: o cofre da área temporária sumiu ou não abre, o cofre na pasta não é o registrado, sem permissão para ler a pasta, erro de disco): o texto do gerente e [Abrir]/[Trancar] (só quando a ação vale) [Procurar a pasta…] [Tirar da lista] [Cancelar] (padrão). "Verificar arquivos" recusa um cofre que não é o registrado ("Nada foi verificado nem alterado.").
 - Item colocado na pasta trancada: "Há 1 item que foi colocado em '<Nome>' depois de trancar: Nova planilha.xlsx. Mova-o para outro lugar e clique em Tentar de novo." [Mostrar no Explorer] [Tentar de novo]
-- Pasta não encontrada: "A pasta '<Nome>' não está mais em D:\Fotos." [Procurar a pasta…] [Tirar da lista] ("Nada será apagado."). Vale em qualquer estado: numa pasta aberta renomeada, explica que precisa ser a mesma pasta, na mesma unidade. "Tirar da lista" explica onde fica a cópia criptografada que sobra fora da pasta (".owlvault-<id>" na pasta-mãe) e avisa que ela não aparece em "Recuperar uma pasta protegida".
-- Versão anterior mantida: "Foi mantida uma versão anterior de '<Nome>' com N arquivos que não estão na pasta." [Recuperar esses arquivos em outra pasta…] [Apagar a versão anterior…] (botão vermelho; a confirmação lista os N nomes)
-- Versão anterior ilegível: "A versão anterior de '<Nome>' que foi mantida não pôde ser lida. … Nada foi apagado." [Tentar recuperar em outra pasta…] (ou o salvamento de emergência, docs/RECOVERY.md); se a pasta oculta dela sumiu: [Esquecer a versão que sumiu] (nada é apagado). Nunca é contada como "0 arquivos" nem apagada.
-- Senha mestra antiga: "Tranque de novo para atualizar a senha mestra." [Abrir] (só aparece depois de 'Criar nova senha mestra')
+- Pasta não encontrada: "A pasta '<Nome>' não está mais em D:\Fotos." [Procurar a pasta…] [Tirar da lista] ("Nada será apagado."). Vale em qualquer estado: numa pasta aberta renomeada, explica que precisa ser a mesma pasta, na mesma unidade; para uma pasta escondida, dá para escolher a pasta onde ela fica.
+- Tirar da lista (confirmação, padrão [Cancelar]): "Nada será apagado." + o aviso do gerente para o estado atual — onde ficam os arquivos legíveis (só diz que continuam na pasta quando é verdade), onde fica cada cópia criptografada fora da pasta (".owlvault-<id>" na pasta-mãe, versão mantida) e que ela NÃO aparece em "Recuperar uma pasta protegida" (para abri-la: Cópia criptografada → "Abrir uma cópia"). "Use ☰ > Recuperar uma pasta protegida" só numa pasta trancada com tudo dentro dela.
+- Versão anterior mantida: "Foi mantida uma versão anterior de '<Nome>' com N arquivos que não estão na pasta." [Recuperar esses arquivos em outra pasta…] [Apagar a versão anterior…] (botão vermelho; a confirmação lista os N nomes) [Tirar da lista] [Fechar]
+- Versão anterior ilegível: "A versão anterior de '<Nome>' que foi mantida não pôde ser lida. … Nada foi apagado." [Tentar recuperar em outra pasta…] (ou o salvamento de emergência, docs/RECOVERY.md); se a pasta oculta dela sumiu: [Esquecer a versão que sumiu] (nada é apagado) [Tirar da lista] [Fechar]. Nunca é contada como "0 arquivos" nem apagada.
+- Senha mestra antiga: "Tranque de novo para atualizar a senha mestra." [Abrir] [Tirar da lista] [Fechar] (só aparece depois de 'Criar nova senha mestra')
+- Pedaços de um "Desfazer" interrompido (arquivos ".owl-…part" deixados por uma queda): "Continuar trancando" apaga os que são desse Desfazer; um pedaço preso aparece com texto próprio ("não mova esses pedaços: clique em Continuar trancando de novo") e nunca como "item novo".
 
 
 ## T9 ESCONDER DO EXPLORER: "Esconder '<Nome>'? A pasta some do Explorer e só volta pelo Owl Vault. Quem souber mostrar arquivos protegidos do sistema ainda pode ver que ela existe, mas não o conteúdo." [Esconder] [Cancelar]. Só vale para pasta trancada; numa pasta aberta, a opção é "Trancar e esconder". "Mostrar no Explorer" age na hora, sem confirmação.
@@ -116,21 +128,22 @@ Fim: "'<Nome>' está trancada." Em unidade removível NTFS, acrescenta: "Use 'Re
 ## T10 REMOVER PROTEÇÃO: "Remover a proteção de '<Nome>'? A pasta volta a ser comum e qualquer pessoa que use este computador poderá ver os arquivos." Campo: [PIN]. Botões: [Remover proteção] [Cancelar]. Se a pasta estiver trancada, ela é aberta antes (T6). Se faltar algo, o app mostra a lista e pede confirmação antes de apagar o cofre.
 
 
-## T11 SAIR COM PASTAS ABERTAS: "Sair do Owl Vault? Estas pastas estão abertas e visíveis: • Fotos (trancar leva cerca de 35 min)" [Trancar e sair] (padrão) [Sair sem trancar] [Cancelar]. Em caso de erro: "Não deu para trancar 'Fotos': feche 'IMG_0042.jpg' e clique em Tentar de novo." [Tentar de novo] [Sair sem trancar].
+## T11 SAIR COM PASTAS ABERTAS: "Sair do Owl Vault? Estas pastas estão abertas e visíveis: • Fotos (trancar leva cerca de 35 min)" [Trancar e sair] (padrão) [Sair sem trancar] [Cancelar]. Entram na lista as pastas em aberta, abertura incompleta, abrindo, restaurando, apagando e trancando; as que não dá para trancar automaticamente aparecem como "precisa de atenção" (quando TODAS precisam de atenção, só [Sair sem trancar] [Cancelar]). Com pastas trancáveis e pastas de atenção juntas, [Trancar e sair] tranca as trancáveis e, no fim, mostra o resumo com as de atenção ("Não deu para trancar '<Nome>'… Volte ao Owl Vault e use 'Resolver…' nesta pasta.") [Voltar ao Owl Vault] (padrão) [Sair sem trancar]. Com essa pergunta na tela, os 5 min sem uso bloqueiam o app (que então não sai). A lista é refeita depois da resposta: se surgiu outra pasta aberta (pelo atalho, com a pergunta na tela), a pergunta volta; durante "Trancar e sair", o atalho pede "Aguarde". As pastas são trancadas em fila; uma falha não para as outras e o app só sai sem trancar se o usuário escolher [Sair sem trancar]. Em caso de erro: "Não deu para trancar 'Fotos': feche 'IMG_0042.jpg' e clique em Tentar de novo." [Tentar de novo] [Sair sem trancar]. Se o trancamento parou na etapa 4: "Os arquivos já estão guardados, mas parte das cópias legíveis ainda está na pasta… use Resolver…" [Voltar ao Owl Vault] [Sair sem trancar] (sem "Tentar de novo", que não trancaria).
 
 
 ## T12 RECUPERAR UMA PASTA PROTEGIDA: "Escolha a pasta com o ícone do Owl Vault. Se ela estava escondida, escolha a pasta onde ela ficava." → seletor do Windows → (se houver mais de uma, uma lista para marcar) → campo [Senha mestra] → botão [Recuperar].
 
 
-## T13 ALTERAR PIN: campos [PIN atual] [Novo PIN] [Repita o novo PIN], botão [Salvar]. Link "Esqueci o PIN" (pede a senha mestra).
+## T13 ALTERAR PIN: campos [PIN atual] [Novo PIN] [Repita o novo PIN], botão [Salvar]. Link "Esqueci o PIN" (pede a senha mestra). Se o PIN novo (ou a senha mestra nova) valeu mas a cópia de segurança do perfil não pôde ser trocada junto, o aviso da lista diz isso ("…ela será refeita na próxima gravação"); se nada foi gravado, a mudança não vale.
 
 
 ## T14 CÓPIA CRIPTOGRAFADA DE UMA PASTA (modo v1, uso raro)
 Assistente de 4 passos do design (visual/ESTILO5-COFRE.md): Pastas → Senha → Conferência → Criar, com lateral "Escolhas do passo 1" e dica por passo; no topo, discretos "Abrir uma cópia", "Conferir uma cópia" e "Limites da proteção".
 Passo 1: [Origem] [Local do cofre] [Teste de restauração] (com [Escolher]) e o nome do cofre (sugeridos automaticamente); discreto "Retomar criação interrompida".
 Passo 2: a cópia usa uma SENHA PRÓPRIA (não a senha mestra das pastas): [Senha] (mínimo 12, com medidor) [Confirmação] e o aviso da cópia: "O cofre é uma cópia criptografada. A pasta original continua legível até você removê-la — e, mesmo removida, podem restar cópias dela na Lixeira, em Versões anteriores, no OneDrive, em backups e no índice do Windows."
-Passo 3: conferência numa linha por item (espaço, arquivos em uso, tamanho e contagem, destino gravável) e os aceites obrigatórios como caixas (limites, backup, perda da senha; FAT/exFAT só quando o destino é FAT/exFAT).
-Passo 4: barra, etapa e registro. Fim: "Cópia criptografada criada e verificada (cópia da pasta como estava em <data> <hora>). Mantenha a origem e um backup externo até verificar o cofre, de preferência em outro computador." [Abrir a pasta do cofre] e o discreto "Criar outro cofre".
+Passo 3: conferência numa linha por item (espaço, arquivos em uso, tamanho e contagem, destino gravável) e os aceites obrigatórios como caixas (limites, backup, perda da senha; FAT/exFAT só quando o destino é FAT/exFAT). "Destino gravável" fica neutro (•): a gravação só é testada no início da criação, nunca com ✓ antes disso. Os aceites são desmarcados a cada conferência (inclusive na retomada) e o rodapé acompanha: "marque os avisos" até todos estarem marcados. Nome do cofre inválido (ex.: "Fotos?", "CON", "nome.") é recusado no passo 1.
+Passo 4: barra, etapa e registro. Uma falha sem cofre incompleto não manda "Retomar"; cada operação (criar, conferir, abrir) tem a sua mensagem de cancelamento e de erro.
+A janela da Cópia cabe na área útil da tela (mínimo 860×480; cartão e lateral rolam, rodapé sempre à vista). "Abrir uma cópia" sugere um nome de pasta que ainda não existe e valida o nome antes de olhar o disco. Fechar ou esconder a janela apaga as senhas digitadas. Fim: "Cópia criptografada criada e verificada (cópia da pasta como estava em <data> <hora>). Mantenha a origem e um backup externo até verificar o cofre, de preferência em outro computador." [Abrir a pasta do cofre] e o discreto "Criar outro cofre".
 
 
 ## T15 LIMITES DA PROTEÇÃO (só texto)

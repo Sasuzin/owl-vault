@@ -66,18 +66,25 @@ class _Worker(QObject):
 
     def __init__(self, job: Job, progress: QtProgress, cancel: CancelToken) -> None:
         super().__init__()
-        self._job = job
+        self._job: Job | None = job
         self._progress = progress
         self._cancel = cancel
 
     @Slot()
     def run(self) -> None:
+        # O objeto solta o trabalho antes de rodá-lo: a closure (que pode guardar senha, PIN ou
+        # caminhos) não fica presa a ele depois que o trabalho termina.
+        job, self._job = self._job, None
+        if job is None:
+            return
         try:
-            result = self._job(self._progress, self._cancel)
+            result = job(self._progress, self._cancel)
         except BaseException as exc:  # entregue à UI; nada é registrado em disco
+            del job
             self._progress.close()
             self.failed.emit(exc)
             return
+        del job
         self._progress.close()
         self.finished.emit(result)
 
@@ -109,6 +116,9 @@ class JobRunner(QObject):
         worker = _Worker(job, progress, self.cancel_token)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
+        # O worker vive na thread do trabalho: só ela pode destruí-lo. Depois de "finished" a
+        # thread ainda atende os pedidos de destruição, então nenhum worker sobra por trabalho.
+        thread.finished.connect(worker.deleteLater)
         worker.finished.connect(self._on_finished)
         worker.failed.connect(self._on_failed)
         self._thread, self._worker = thread, worker
@@ -122,10 +132,8 @@ class JobRunner(QObject):
     def _cleanup(self) -> None:
         if self._thread is not None:
             self._thread.quit()
-            self._thread.wait()
+            self._thread.wait()  # ao voltar, o worker já foi destruído pela própria thread
             self._thread.deleteLater()
-        if self._worker is not None:
-            self._worker.deleteLater()
         self._thread = None
         self._worker = None
 

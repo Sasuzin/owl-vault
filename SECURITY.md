@@ -63,7 +63,10 @@ arquivos do cofre, tamanho aproximado do manifesto, parâmetros do Argon2id. Det
 * **Instância única**: o canal local só aceita mensagens de processos da mesma conta do
   Windows, e um pedido "abrir" vindo por ele nunca abre uma pasta sem o PIN e sem mostrar o nome
   da pasta.
-* **Instalação**: um `OwlVault.exe` mais antigo (ou igual) não substitui o instalado.
+* **Instalação**: um `OwlVault.exe` de versão mais antiga nunca substitui o instalado. Com o
+  mesmo número de versão e conteúdo diferente (executável trocado por fora ou novo build com o
+  mesmo número), o instalado é substituído — exceto quando ele confere com `versao.sha256` e é
+  um build de data mais nova.
 
 ## Garantias operacionais
 

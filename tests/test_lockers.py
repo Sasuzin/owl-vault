@@ -847,7 +847,7 @@ def test_queda_em_trancando_descarta_cofre_novo(env: Env, monkeypatch: pytest.Mo
     check = env.mgr.check_protect(str(p))
     with monkeypatch.context() as m:
         # o processo "morre" durante create_vault: ninguém limpa o cofre novo
-        m.setattr(LockerManager, "_discard_novo", lambda self, rec: None)
+        m.setattr(LockerManager, "_discard_novo", lambda self, rec, **_kw: None)
         with pytest.raises(Crash):
             env.mgr.protect(check, progress=OnStage("Teste de restauração", _raise_crash))
 
