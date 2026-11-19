@@ -430,6 +430,14 @@ def test_validate_pin_recusa_duas_datas_dia_mes(pin: str, datas: str) -> None:
     assert f"parece as datas {datas}." in str(ei.value)
 
 
+@pytest.mark.parametrize(("pin", "data"), [("12121212", "12/12"), ("25032503", "25/03")])
+def test_validate_pin_mesma_data_dia_mes_duas_vezes(pin: str, data: str) -> None:
+    """Não diz "as datas 12/12 e 12/12": diz que é a mesma data repetida."""
+    with pytest.raises(OwlVaultError, match="datas") as ei:
+        validate_pin(pin)
+    assert f"parece a data {data} repetida." in str(ei.value)
+
+
 @pytest.mark.parametrize("pin", ["25321208", "25031318", "00031208"])
 def test_validate_pin_aceita_quase_duas_datas(pin: str) -> None:
     validate_pin(pin)
@@ -457,6 +465,12 @@ def test_validate_pin_aceita_quase_duas_datas(pin: str) -> None:
         "0102030405",
         "001002003",
         "000102030405",
+        # com passo "redondo" (como 204060 e 100200300 sem os zeros) e largura 4
+        "00204060",
+        "000100200",
+        "000100200300",
+        "000100020003",
+        "001000200030",
     ],
 )
 def test_validate_pin_recusa_dois_pedacos_faceis(pin: str) -> None:

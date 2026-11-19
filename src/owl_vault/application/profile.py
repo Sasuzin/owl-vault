@@ -240,6 +240,8 @@ def _date_in(pin: str) -> str:
         return f"a data {when.strftime(shown)}"
     if len(pin) == 8:
         first, second = _day_month(pin[:4]), _day_month(pin[4:])
+        if first and first == second:
+            return f"a data {first} repetida"  # 12121212, 25032503
         if first and second:
             return f"as datas {first} e {second}"
     return ""
@@ -327,14 +329,18 @@ def _counting(pin: str) -> bool:
 
 def _padded_counting(pin: str) -> bool:
     """Contagem com números de largura fixa e zero à esquerda, que ``_counting`` não lê:
-    01020304 (01 02 03 04), 000102, 04030201, 001002003. 3 termos ou mais, passo de 1 a 10."""
+    01020304 (01 02 03 04), 000102, 04030201, 001002003, 00204060, 000100020003. 3 termos ou
+    mais; o passo segue a regra de ``_counting`` (1 a 10, ou "redondo" como 20 e 100)."""
     n = len(pin)
-    for w in (2, 3):
+    for w in (2, 3, 4):
         if n % w or n // w < 3 or not any(pin[i] == "0" for i in range(0, n, w)):
             continue
         terms = [int(pin[i : i + w]) for i in range(0, n, w)]
         diffs = {b - a for a, b in itertools.pairwise(terms)}
-        if len(diffs) == 1 and 0 < abs(next(iter(diffs))) <= 10:
+        if len(diffs) != 1:
+            continue
+        d = next(iter(diffs))
+        if d != 0 and (abs(d) <= 10 or (d % 10 == 0 and terms[0] % d == 0)):
             return True
     return False
 
