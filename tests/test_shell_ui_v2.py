@@ -760,6 +760,66 @@ def test_id_de_aplicativo_proprio_so_no_desenvolvimento(monkeypatch: pytest.Monk
     assert ui_app.explicit_app_user_model_id() is None
 
 
+def test_coruja_no_icone_da_classe_antes_de_mostrar(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """0.4.0: aberta do arquivo baixado (sem atalho), a barra de tarefas mostrava o ícone da
+    classe do Qt — o genérico do Windows. A janela principal troca o ícone da classe antes de
+    aparecer (a troca em si, numa janela nativa de verdade, está no teste seguinte)."""
+    chamadas: list[tuple[int, int, int]] = []
+    monkeypatch.setattr(
+        shell, "set_window_class_icons", lambda h, big, small: chamadas.append((h, big, small))
+    )
+    janela = QWidget()
+    try:
+        assert ui_app.use_owl_class_icon(janela)
+        assert not janela.isVisible()  # antes de aparecer
+        [(hwnd, grande, pequeno)] = chamadas
+        assert hwnd == int(janela.winId())
+        assert grande and pequeno and grande != pequeno  # HICONs de verdade, dois tamanhos
+    finally:
+        janela.deleteLater()
+    # qualquer falha é engolida: o ícone nunca impede o Owl Vault de abrir
+    monkeypatch.setattr(shell, "class_icon_sizes", lambda: 1 / 0)
+    assert ui_app.use_owl_class_icon(QWidget()) is False
+
+
+def test_icone_da_classe_trocado_numa_janela_nativa_escondida() -> None:
+    """Janela STATIC nunca mostrada (nada aparece na tela); a classe volta ao que era."""
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.CreateWindowExW.argtypes = [
+        wintypes.DWORD,
+        wintypes.LPCWSTR,
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        wintypes.HWND,
+        wintypes.HMENU,
+        wintypes.HINSTANCE,
+        wintypes.LPVOID,
+    ]
+    user32.CreateWindowExW.restype = wintypes.HWND
+    user32.DestroyWindow.argtypes = [wintypes.HWND]
+    user32.LoadIconW.argtypes = [wintypes.HINSTANCE, ctypes.c_void_p]
+    user32.LoadIconW.restype = ctypes.c_void_p
+    hwnd = user32.CreateWindowExW(0, "STATIC", "teste", 0, 0, 0, 10, 10, None, None, None, None)
+    assert hwnd
+    antes = shell.window_class_icons(hwnd)
+    info = int(user32.LoadIconW(None, ctypes.c_void_p(32516)))  # IDI_INFORMATION
+    aviso = int(user32.LoadIconW(None, ctypes.c_void_p(32515)))  # IDI_WARNING
+    try:
+        shell.set_window_class_icons(hwnd, info, aviso)
+        assert shell.window_class_icons(hwnd) == (info, aviso)
+    finally:
+        shell.set_window_class_icons(hwnd, *antes)
+        user32.DestroyWindow(hwnd)
+    grande, pequeno = shell.class_icon_sizes()
+    assert grande > pequeno >= 16
+
+
 # =========================================================================== common
 
 

@@ -11,10 +11,10 @@ import ctypes
 import sys
 
 from PySide6.QtCore import QLibraryInfo, QLocale, QTranslator
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QWidget
 
 from owl_vault import APP_NAME, __version__
-from owl_vault.ui.icon import owl_icon
+from owl_vault.ui.icon import owl_icon, owl_image
 from owl_vault.ui.theme import apply_theme, saved_theme
 
 
@@ -52,6 +52,26 @@ def explicit_app_user_model_id() -> str | None:
     if sys.platform != "win32" or getattr(sys, "frozen", False):
         return None
     return DEV_APP_USER_MODEL_ID
+
+
+def use_owl_class_icon(window: QWidget) -> bool:
+    """Coruja também no ícone da CLASSE de janela, antes de a janela aparecer.
+
+    Sem atalho que leve a barra de tarefas ao exe (a 1ª execução, do arquivo baixado), ela pede
+    o ícone à janela; se o Owl Vault ainda está ocupado abrindo, o pedido expira e ela usa o
+    ícone da classe — que o Qt registra como o genérico do Windows (visto no 0.4.0: a cópia
+    baixada sempre com o ícone genérico, a instalada sempre com a coruja). Devolve se trocou."""
+    if sys.platform != "win32":
+        return False
+    try:
+        from owl_vault.storage import shell  # noqa: PLC0415 - só no Windows
+
+        big, small = shell.class_icon_sizes()
+        hwnd = int(window.winId())  # cria a janela nativa (ainda escondida)
+        shell.set_window_class_icons(hwnd, owl_image(big).toHICON(), owl_image(small).toHICON())
+    except Exception:  # apenas cosmético (ícone na barra de tarefas): nunca impede de abrir
+        return False
+    return True
 
 
 def configure_app(app: QApplication) -> None:
@@ -97,6 +117,7 @@ def main() -> int:
 
     launcher = ensure_installed()
     window = OwlWindow(launcher, open_request=request)
+    use_owl_class_icon(window)
     single.message.connect(window.handle_message)
     window.show_initial()  # cabe na área útil da tela; numa tela pequena demais, maximizada
     return int(app.exec())

@@ -106,6 +106,45 @@ def known_folders() -> dict[str, str]:
     return result
 
 
+# --- ícone da classe de janela (barra de tarefas) ------------------------------------------
+
+_user32 = ctypes.WinDLL("user32", use_last_error=True)
+_SetClassLongPtrW = getattr(_user32, "SetClassLongPtrW", None) or _user32.SetClassLongW
+_SetClassLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+_SetClassLongPtrW.restype = ctypes.c_void_p
+_GetClassLongPtrW = getattr(_user32, "GetClassLongPtrW", None) or _user32.GetClassLongW
+_GetClassLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+_GetClassLongPtrW.restype = ctypes.c_void_p
+_GetSystemMetrics = _user32.GetSystemMetrics
+_GetSystemMetrics.argtypes = [ctypes.c_int]
+_GetSystemMetrics.restype = ctypes.c_int
+GCLP_HICON = -14
+GCLP_HICONSM = -34
+_SM_CXICON = 11
+_SM_CXSMICON = 49
+
+
+def class_icon_sizes() -> tuple[int, int]:
+    """(grande, pequeno) em pixels, como o Windows usa para ícones de janela."""
+    return _GetSystemMetrics(_SM_CXICON) or 32, _GetSystemMetrics(_SM_CXSMICON) or 16
+
+
+def set_window_class_icons(hwnd: int, big: int, small: int) -> None:
+    """Troca os ícones da CLASSE da janela ``hwnd`` (valem para todas as janelas dela).
+
+    A barra de tarefas cai no ícone da classe quando a janela não responde a tempo ao pedido
+    do ícone; o Qt registra a classe com o ícone genérico do Windows (só usaria o do exe se
+    ele tivesse um recurso chamado ``IDI_ICON1``, e o PyInstaller não grava esse nome)."""
+    _SetClassLongPtrW(hwnd, GCLP_HICON, big)
+    _SetClassLongPtrW(hwnd, GCLP_HICONSM, small)
+
+
+def window_class_icons(hwnd: int) -> tuple[int, int]:
+    return int(_GetClassLongPtrW(hwnd, GCLP_HICON) or 0), int(
+        _GetClassLongPtrW(hwnd, GCLP_HICONSM) or 0
+    )
+
+
 def get_attributes(path: str) -> int:
     value = _GetFileAttributesW(path)
     if value == INVALID_FILE_ATTRIBUTES:

@@ -8,10 +8,15 @@ atalhos "Abrir com Owl Vault" das pastas trancadas apontam para essa cópia; nã
 Também cria, uma única vez, o atalho **Owl Vault** na Área de Trabalho (a marca
 `area-de-trabalho.txt`, ao lado do executável, registra isso): se você apagar esse atalho, ele
 não volta; se ele apontar para outra cópia do `OwlVault.exe`, é corrigido para a instalada.
-Na barra de tarefas aparece o ícone embutido no executável: o `OwlVault.exe` não define um ID
-de aplicativo próprio (AppUserModelID) — com ele, o Windows 11 às vezes mostrava o ícone
-genérico. Só rodando do código-fonte (`pythonw -m owl_vault`) o ID `OwlVault.App` é usado,
-para a barra não mostrar o ícone do Python.
+Na barra de tarefas aparece sempre a coruja. Aberto por um atalho (ou sendo a cópia instalada,
+que tem o atalho do Menu Iniciar), o Windows usa o ícone do atalho. Aberto direto de outra
+pasta (a 1ª execução, do arquivo baixado), ele pede o ícone à janela e, se o programa ainda
+está ocupado abrindo, usa o ícone da *classe* da janela — que o Qt registra como o genérico do
+Windows. Por isso o Owl Vault troca o ícone da classe pela coruja antes de mostrar a janela
+principal. O `OwlVault.exe` também não define um ID de aplicativo próprio (AppUserModelID):
+com ele, nenhum atalho correspondia e a barra dependia sempre desse pedido à janela. Só
+rodando do código-fonte (`pythonw -m owl_vault`) o ID `OwlVault.App` é usado, para a barra não
+mostrar o ícone do Python.
 Ao rodar uma versão **mais nova** do `OwlVault.exe`, a cópia instalada é atualizada (se estiver
 aberta, a atualização acontece na próxima vez). Uma versão mais antiga nunca substitui a
 instalada. Com o mesmo número de versão, a cópia instalada é trocada se o conteúdo for diferente
