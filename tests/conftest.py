@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+from owl_vault.application import install
 from owl_vault.application.create import CreateResult, create_vault
 from owl_vault.application.progress import CancelToken, RecordingProgress
 from owl_vault.application.protection import ProtectedPaths
@@ -28,6 +29,13 @@ def _reset_faults() -> Iterator[None]:
     faults.reset()
     yield
     faults.reset()
+
+
+@pytest.fixture(autouse=True)
+def _sem_area_de_trabalho_real(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Nenhum teste cria atalho na Área de Trabalho real: quem precisa dela usa uma pasta
+    temporária (``install.desktop_dir`` trocado no próprio teste)."""
+    monkeypatch.setattr(install, "desktop_dir", lambda: None)
 
 
 @dataclass

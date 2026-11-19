@@ -5,6 +5,11 @@ Na execução do ``OwlVault.exe`` empacotado, o programa se copia para
 "Abrir com Owl Vault" das pastas trancadas apontam para esse caminho fixo — assim continuam
 funcionando mesmo que o arquivo baixado seja movido ou apagado.
 
+Atalho na Área de Trabalho: criado UMA vez por instalação (a marca ``area-de-trabalho.txt``
+fica ao lado do exe instalado). Se a pessoa apagar o atalho, ele não volta; se ele existir e
+apontar para outro ``OwlVault.exe`` (cópia baixada, instalação antiga), é corrigido. Um atalho
+com o mesmo nome para outro programa fica como está.
+
 Versão: ao lado do exe instalado ficam
 
 * ``versao.txt`` ("0.3.0.15"): só a versão, no formato que as versões anteriores também leem;
@@ -47,8 +52,16 @@ from owl_vault.storage import shell
 
 EXE_NAME = "OwlVault.exe"
 START_MENU_NAME = "Owl Vault.lnk"
+DESKTOP_NAME = "Owl Vault.lnk"
+SHORTCUT_DESCRIPTION = "Owl Vault — pastas protegidas"
 VERSION_FILE = "versao.txt"
 STAMP_FILE = "versao.sha256"
+#: ao lado do exe instalado: o atalho da Área de Trabalho já foi criado uma vez
+DESKTOP_MARK = "area-de-trabalho.txt"
+_DESKTOP_MARK_TEXT = (
+    "O Owl Vault já criou o atalho da Área de Trabalho nesta instalação. "
+    "Se ele foi apagado, não é recriado.\n"
+).encode()
 
 Version = tuple[int, int, int, int]
 
@@ -79,6 +92,12 @@ def install_dir() -> Path | None:
 def start_menu_dir() -> Path | None:
     base = os.environ.get("APPDATA")
     return Path(base) / "Microsoft" / "Windows" / "Start Menu" / "Programs" if base else None
+
+
+def desktop_dir() -> Path | None:
+    """Área de Trabalho do usuário (segue o redirecionamento, por exemplo o do OneDrive)."""
+    path = shell.known_folder(shell.KNOWN_FOLDERS["Área de Trabalho"])
+    return Path(path) if path else None
 
 
 def current_version() -> Version:
@@ -278,7 +297,14 @@ def ensure_installed() -> tuple[str, str]:
         pass
     exe = target if target.exists() else current
     _ensure_start_menu(exe)
+    _ensure_desktop(exe, target_dir)
     return str(exe), ""
+
+
+def _make_shortcut(lnk: Path, exe: Path) -> None:
+    if lnk.exists():
+        lnk.unlink()
+    shell.create_shortcut(str(lnk), str(exe), "", str(exe), SHORTCUT_DESCRIPTION, str(exe.parent))
 
 
 def _ensure_start_menu(exe: Path) -> None:
@@ -289,11 +315,36 @@ def _ensure_start_menu(exe: Path) -> None:
     lnk = folder / START_MENU_NAME
     if lnk.exists() and shell.shortcut_matches(str(lnk), str(exe), ""):
         return
+    with contextlib.suppress(OSError, OwlVaultError):
+        _make_shortcut(lnk, exe)
+
+
+def _points_to_owl_vault(lnk: Path) -> bool:
+    """O atalho abre um ``OwlVault.exe`` (qualquer cópia)? Ilegível conta como "não"."""
+    try:
+        target, _args = shell.read_shortcut(str(lnk))
+    except (OSError, OwlVaultError):
+        return False
+    return os.path.normcase(os.path.basename(target)) == os.path.normcase(EXE_NAME)
+
+
+def _ensure_desktop(exe: Path, target_dir: Path) -> None:
+    """Atalho na Área de Trabalho: criado uma vez (marca ao lado do exe instalado), corrigido
+    se apontar para outro ``OwlVault.exe``, nunca recriado depois de apagado."""
+    folder = desktop_dir()
+    if folder is None or not folder.is_dir():
+        return
+    lnk = folder / DESKTOP_NAME
+    mark = target_dir / DESKTOP_MARK
     try:
         if lnk.exists():
-            lnk.unlink()
-        shell.create_shortcut(
-            str(lnk), str(exe), "", str(exe), "Owl Vault — pastas protegidas", str(exe.parent)
-        )
+            if _points_to_owl_vault(lnk) and not shell.shortcut_matches(str(lnk), str(exe), ""):
+                _make_shortcut(lnk, exe)
+        elif mark.exists():
+            return  # já foi criado uma vez e a pessoa apagou
+        else:
+            _make_shortcut(lnk, exe)
+        if target_dir.is_dir() and not mark.exists():
+            _write_atomic(mark, _DESKTOP_MARK_TEXT)
     except (OSError, OwlVaultError):
         pass

@@ -231,7 +231,7 @@ usando a SM; as KEKs trazidas assim ficam marcadas `recuperada` e não disparam 
   `PathUnmakeSystemFolderW(P)` ao abrir; avisos `SHChangeNotify`.
 * Atalho `Abrir com Owl Vault.lnk` criado no processo (IShellLinkW + IPersistFile), apontando
   para o executável instalado em `%LOCALAPPDATA%\Programs\Owl Vault\OwlVault.exe` (o app se
-  copia para lá na 1ª execução e cria atalho no Menu Iniciar). O ícone do atalho é o próprio
+  copia para lá na 1ª execução e cria atalhos no Menu Iniciar e na Área de Trabalho). O ícone do atalho é o próprio
   executável e o `.lnk` não leva LinkInfo/rastreio: não guarda o caminho de P nem das
   pastas-mãe. O espaço reservado é idempotente e só mexe nos nossos nomes; o atalho é conferido
   (`shortcut_matches`) a cada início e antes de atender um pedido vindo dele, e refeito com

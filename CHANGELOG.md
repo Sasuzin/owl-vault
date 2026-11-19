@@ -10,6 +10,16 @@ O executável também mostra o **build** (número de commits do projeto, sobe so
 ajuste) e o commit, em ☰ → Sobre, no rodapé e nas propriedades do `OwlVault.exe`
 (Versão do arquivo `<versão>.<build>`, por exemplo `0.3.1.8`).
 
+## 0.4.0 — 2026-11-19
+
+* Atalho **Owl Vault** na Área de Trabalho: criado na primeira instalação em cada computador
+  (e na primeira vez que esta versão abre num computador que já tinha o Owl Vault). Se você
+  apagar o atalho, ele não volta; se ele apontar para outra cópia do `OwlVault.exe` (a
+  baixada, por exemplo), é corrigido para a cópia instalada.
+* Ícone da coruja sempre na barra de tarefas: às vezes aparecia o ícone genérico do Windows
+  (o programa usava um ID de aplicativo próprio, e a barra caía no ícone padrão quando a
+  janela demorava a responder ao abrir). Agora a barra usa o ícone embutido no exe.
+
 ## 0.3.3 — 2026-11-19
 
 * Título das janelas sem o nome repetido: era "Owl Vault v0.3.2 · build 10 · 843d2dd - Owl

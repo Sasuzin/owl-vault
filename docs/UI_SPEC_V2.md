@@ -12,7 +12,7 @@ uma pasta" (T5: Pasta → Conferência → Trancar) usam a trilha de passos dent
 PRINCÍPIO: o usuário só digita PIN ou senha mestra. Todo o resto é escolher pasta no seletor do Windows ou clicar em botão. Não existe campo de cofre nem de pasta de teste. Estados de uma pasta: Trancada · Aberta — visível neste computador · Escondida · Precisa de atenção · Indisponível — conecte a unidade · Trancando…/Abrindo… N%.
 
 
-## T0 INSTALAÇÃO (sem tela): na 1ª execução, o app se copia para %LOCALAPPDATA%\Programs\Owl Vault\OwlVault.exe e cria um atalho no Menu Iniciar.
+## T0 INSTALAÇÃO (sem tela): na 1ª execução, o app se copia para %LOCALAPPDATA%\Programs\Owl Vault\OwlVault.exe e cria um atalho no Menu Iniciar e outro na Área de Trabalho (este só uma vez: apagado, não volta).
 
 
 ## T1 ASSISTENTE 1/2 — "Crie sua senha mestra"

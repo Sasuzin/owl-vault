@@ -16,6 +16,7 @@ import os
 import re
 import secrets
 import shutil
+import struct
 import subprocess
 import sys
 import threading
@@ -471,13 +472,22 @@ class InstalacaoFalsa:
     menu_iniciar: Path
     alvo: Path
     atalho: Path
+    area_de_trabalho: Path
     escritas: list[str]
     pe: bytes = field(repr=False)
+
+    @property
+    def atalho_area(self) -> Path:
+        return self.area_de_trabalho / install.DESKTOP_NAME
+
+    @property
+    def marca_area(self) -> Path:
+        return self.alvo.parent / install.DESKTOP_MARK
 
 
 @pytest.fixture
 def instalacao(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> InstalacaoFalsa:
-    """``OwlVault.exe`` falso e LOCALAPPDATA/APPDATA dentro de tmp_path.
+    """``OwlVault.exe`` falso e LOCALAPPDATA/APPDATA/Área de Trabalho dentro de tmp_path.
 
     O executável falso é o lançador do Python do venv com bytes aleatórios no fim: o Explorer
     só grava atalho para um PE válido (com bytes quaisquer, IPersistFile::Save dá E_FAIL).
@@ -491,10 +501,13 @@ def instalacao(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> InstalacaoFal
     roaming = tmp_path / "AppData Roaming"
     menu = roaming / "Microsoft" / "Windows" / "Start Menu" / "Programs"
     menu.mkdir(parents=True)
+    area = tmp_path / "Área de Trabalho sintética"
+    area.mkdir()
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(sys, "executable", str(baixado))
     monkeypatch.setenv("LOCALAPPDATA", str(local))
     monkeypatch.setenv("APPDATA", str(roaming))
+    monkeypatch.setattr(install, "desktop_dir", lambda: area)
     escritas: list[str] = []
 
     def abre(file: Any, mode: str = "r", *a: Any, **k: Any) -> Any:
@@ -509,6 +522,7 @@ def instalacao(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> InstalacaoFal
         menu,
         local / "Programs" / "Owl Vault" / "OwlVault.exe",
         menu / "Owl Vault.lnk",
+        area,
         escritas,
         pe,
     )
@@ -520,26 +534,35 @@ def test_ensure_installed_congelado_copia_e_cria_atalho(instalacao: InstalacaoFa
     assert args == ""
     assert _mesmo(exe, instalacao.alvo)
     assert instalacao.alvo.read_bytes() == instalacao.baixado.read_bytes()
-    # sem .tmp; ao lado ficam a versão instalada (impede trocar por uma versão mais antiga) e a
-    # marca que liga essa versão ao conteúdo do exe (install.STAMP_FILE, revisão "perfil")
+    # sem .tmp; ao lado ficam a versão instalada (impede trocar por uma versão mais antiga), a
+    # marca que liga essa versão ao conteúdo do exe (install.STAMP_FILE, revisão "perfil") e a
+    # marca de que o atalho da Área de Trabalho já foi criado
     assert sorted(p.name for p in instalacao.alvo.parent.iterdir()) == [
         "OwlVault.exe",
+        "area-de-trabalho.txt",
         "versao.sha256",
         "versao.txt",
     ]
     assert len(instalacao.escritas) == 1
-    assert instalacao.atalho.is_file()
-    lido = _ler_atalho(instalacao.atalho)
-    assert _mesmo(lido["alvo"], instalacao.alvo)  # aponta para a cópia instalada (fixa)
-    assert lido["argumentos"] == ""
-    assert _mesmo(lido["pasta"], instalacao.alvo.parent)
-    assert lido["descricao"] == "Owl Vault — pastas protegidas"
+    for atalho in (instalacao.atalho, instalacao.atalho_area):  # Menu Iniciar e Área de Trabalho
+        assert atalho.is_file()
+        lido = _ler_atalho(atalho)
+        assert _mesmo(lido["alvo"], instalacao.alvo)  # aponta para a cópia instalada (fixa)
+        assert lido["argumentos"] == ""
+        assert _mesmo(lido["pasta"], instalacao.alvo.parent)
+        assert lido["descricao"] == "Owl Vault — pastas protegidas"
+    # o atalho da Área de Trabalho também sai sem LinkInfo nem rastros da máquina
+    dados = instalacao.atalho_area.read_bytes()
+    assert not struct.unpack_from("<I", dados, 0x14)[0] & 0x2  # HasLinkInfo
+    assert b"\x03\x00\x00\xa0" not in dados  # TrackerDataBlock
 
 
 def test_ensure_installed_segunda_chamada_nao_recopia(instalacao: InstalacaoFalsa) -> None:
     install.ensure_installed()
     st_exe = instalacao.alvo.stat()
     st_lnk = instalacao.atalho.stat()
+    st_area = instalacao.atalho_area.stat()
+    st_marca = instalacao.marca_area.stat()
     instalacao.escritas.clear()
     exe, _args = install.ensure_installed()
     assert _mesmo(exe, instalacao.alvo)
@@ -547,6 +570,68 @@ def test_ensure_installed_segunda_chamada_nao_recopia(instalacao: InstalacaoFals
     st2 = instalacao.alvo.stat()
     assert (st2.st_ino, st2.st_mtime_ns) == (st_exe.st_ino, st_exe.st_mtime_ns)
     assert instalacao.atalho.stat().st_mtime_ns == st_lnk.st_mtime_ns  # atalho não refeito
+    assert instalacao.atalho_area.stat().st_mtime_ns == st_area.st_mtime_ns
+    assert instalacao.marca_area.stat().st_mtime_ns == st_marca.st_mtime_ns
+
+
+def test_atalho_da_area_de_trabalho_apagado_nao_volta(instalacao: InstalacaoFalsa) -> None:
+    install.ensure_installed()
+    instalacao.atalho_area.unlink()  # a pessoa apagou o atalho
+    install.ensure_installed()
+    assert not instalacao.atalho_area.exists()
+    # nem numa atualização
+    instalacao.baixado.write_bytes(instalacao.pe + os.urandom(4096))
+    install.ensure_installed()
+    assert not instalacao.atalho_area.exists()
+    assert instalacao.atalho.is_file()  # o do Menu Iniciar continua sendo garantido
+
+
+def test_instalacao_anterior_sem_marca_ganha_o_atalho_da_area_de_trabalho(
+    instalacao: InstalacaoFalsa,
+) -> None:
+    """Instalação feita por uma versão de antes do atalho da Área de Trabalho (0.3.x)."""
+    install.ensure_installed()
+    instalacao.atalho_area.unlink()
+    instalacao.marca_area.unlink()
+    install.ensure_installed()
+    assert _mesmo(_ler_atalho(instalacao.atalho_area)["alvo"], instalacao.alvo)
+    assert instalacao.marca_area.read_text(encoding="utf-8").startswith("O Owl Vault já criou")
+
+
+def test_atalho_da_area_de_trabalho_de_outro_programa_fica_como_esta(
+    instalacao: InstalacaoFalsa, tmp_path: Path
+) -> None:
+    outro = tmp_path / "Outro programa" / "Outro.exe"
+    outro.parent.mkdir()
+    outro.write_bytes(instalacao.pe)
+    shell.create_shortcut(
+        str(instalacao.atalho_area), str(outro), "--x", str(outro), "outro", str(outro.parent)
+    )
+    antes = instalacao.atalho_area.read_bytes()
+    install.ensure_installed()
+    assert instalacao.atalho_area.read_bytes() == antes
+    assert instalacao.marca_area.is_file()  # já existe um "Owl Vault.lnk": nada a criar depois
+    instalacao.atalho_area.unlink()
+    install.ensure_installed()
+    assert not instalacao.atalho_area.exists()
+
+
+def test_sem_area_de_trabalho_nao_falha(
+    instalacao: InstalacaoFalsa, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(install, "desktop_dir", lambda: None)
+    exe, _args = install.ensure_installed()
+    assert _mesmo(exe, instalacao.alvo)
+    assert not instalacao.marca_area.exists()  # sem pasta, nada foi criado: tenta de novo depois
+    monkeypatch.setattr(install, "desktop_dir", lambda: instalacao.area_de_trabalho)
+    install.ensure_installed()
+    assert instalacao.atalho_area.is_file()
+
+
+def test_area_de_trabalho_e_a_pasta_conhecida_do_windows() -> None:
+    """``desktop_dir`` real (o conftest troca ``install.desktop_dir`` só no módulo)."""
+    real = shell.known_folder(shell.KNOWN_FOLDERS["Área de Trabalho"])
+    assert real and os.path.isdir(real)
 
 
 def test_ensure_installed_atualiza_so_com_versao_mais_nova(
@@ -559,10 +644,16 @@ def test_ensure_installed_atualiza_so_com_versao_mais_nova(
     instalacao.baixado.write_bytes(novo)
     instalacao.escritas.clear()
     major, minor, patch, build = install.current_version()
-    # versão mais antiga: NUNCA substitui o instalado (revisão de segurança)
-    monkeypatch.setattr(
-        install, "current_version", lambda: (major, minor, patch - 1 if patch else 0, 0)
-    )
+    # versão mais antiga: NUNCA substitui o instalado (revisão de segurança). Anterior de
+    # verdade também numa 0.X.0 (antes: "patch - 1 if patch else 0" dava a própria versão)
+    if build:
+        anterior = (major, minor, patch, build - 1)
+    elif patch:
+        anterior = (major, minor, patch - 1, 0)
+    else:
+        anterior = (major, minor - 1, 99, 0) if minor else (major - 1, 99, 99, 0)
+    assert anterior < (major, minor, patch, build)
+    monkeypatch.setattr(install, "current_version", lambda: anterior)
     install.ensure_installed()
     assert instalacao.alvo.read_bytes() == antigo
     assert instalacao.escritas == []
@@ -608,10 +699,13 @@ def test_atalho_do_menu_iniciar_passa_para_a_copia_instalada(
     instalacao.alvo.parent.write_bytes(b"")  # 1ª execução: a cópia não pôde ser feita
     install.ensure_installed()
     assert _mesmo(_ler_atalho(instalacao.atalho)["alvo"], instalacao.baixado)
+    assert _mesmo(_ler_atalho(instalacao.atalho_area)["alvo"], instalacao.baixado)
     instalacao.alvo.parent.unlink()  # 2ª execução: agora a cópia funciona
     exe, _args = install.ensure_installed()
     assert _mesmo(exe, instalacao.alvo)
     assert _mesmo(_ler_atalho(instalacao.atalho)["alvo"], instalacao.alvo)
+    assert _mesmo(_ler_atalho(instalacao.atalho_area)["alvo"], instalacao.alvo)
+    assert instalacao.marca_area.is_file()
 
 
 def test_ensure_installed_sem_menu_iniciar_nao_falha(instalacao: InstalacaoFalsa) -> None:
@@ -655,6 +749,15 @@ def test_ensure_installed_sem_localappdata_roda_de_onde_esta(
 )
 def test_open_request_aceita_so_32_hex(argv: list[str], esperado: str | None) -> None:
     assert ui_app._open_request(argv) == esperado
+
+
+def test_id_de_aplicativo_proprio_so_no_desenvolvimento(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No exe, ID próprio fazia a barra de tarefas mostrar às vezes o ícone genérico do Windows
+    (0.3.3): sem ele, a barra usa o ícone embutido no exe."""
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    assert ui_app.explicit_app_user_model_id() == "OwlVault.App"  # pythonw: senão, ícone do Python
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    assert ui_app.explicit_app_user_model_id() is None
 
 
 # =========================================================================== common

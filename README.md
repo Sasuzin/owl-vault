@@ -12,7 +12,8 @@ criptografados: só abrem pelo Owl Vault, com o seu **PIN** (ou a **senha mestra
 ## Como usar
 
 1. Rode `OwlVault.exe`. Na primeira vez ele se instala só para o seu usuário
-   (`%LOCALAPPDATA%\Programs\Owl Vault`, com atalho no Menu Iniciar; não pede administrador).
+   (`%LOCALAPPDATA%\Programs\Owl Vault`, com atalhos no Menu Iniciar e na Área de Trabalho; não
+   pede administrador).
 2. **Crie a senha mestra** (mínimo 8 caracteres; mais longa é mais segura — anote num lugar seguro) e o **PIN** (6 a 12
    números, só para este computador).
 3. **+ Proteger uma pasta…** → escolha a pasta → confira o resumo → **Proteger**. O Owl Vault

@@ -36,6 +36,24 @@ def _open_request(argv: list[str]) -> str | None:
     return None
 
 
+DEV_APP_USER_MODEL_ID = "OwlVault.App"
+
+
+def explicit_app_user_model_id() -> str | None:
+    """ID de aplicativo próprio (AppUserModelID) para a barra de tarefas — só no
+    desenvolvimento.
+
+    Rodando pelo ``pythonw``, sem ID próprio a barra de tarefas mostra o ícone do Python. No
+    ``OwlVault.exe``, NÃO: com ID próprio e sem atalho que o declare, a barra pede o ícone à
+    janela assim que ela aparece e, se o programa ainda está ocupado abrindo, cai no ícone da
+    classe de janela do Qt — o genérico do Windows (visto no Windows 11 25H2: às vezes coruja,
+    às vezes genérico, com o mesmo exe). Sem ID próprio, a barra usa o ícone embutido no exe
+    (a coruja) e o atalho do Menu Iniciar, sem depender de tempo."""
+    if sys.platform != "win32" or getattr(sys, "frozen", False):
+        return None
+    return DEV_APP_USER_MODEL_ID
+
+
 def configure_app(app: QApplication) -> None:
     """Nome, versão e ícone do app.
 
@@ -54,9 +72,10 @@ def main() -> int:
         from owl_vault.selftest import run  # noqa: PLC0415 - só no modo de autoteste
 
         return run()
-    if sys.platform == "win32":
+    app_id = explicit_app_user_model_id()
+    if app_id is not None:
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("OwlVault.App")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
         except Exception:  # noqa: S110 - apenas cosmético (ícone na barra de tarefas)
             pass
     app = QApplication(sys.argv)
