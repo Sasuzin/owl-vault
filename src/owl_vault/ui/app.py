@@ -36,6 +36,18 @@ def _open_request(argv: list[str]) -> str | None:
     return None
 
 
+def configure_app(app: QApplication) -> None:
+    """Nome, versão e ícone do app.
+
+    Sem ``setApplicationDisplayName``: com ele, o Qt acrescenta " - Owl Vault" ao título de
+    toda janela que não termina com o nome, e os títulos do app já começam com "Owl Vault"
+    (ficava "Owl Vault v0.3.2 · build 10 · 843d2dd - Owl Vault" e "Owl Vault — Cópia
+    criptografada - Owl Vault")."""
+    app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(__version__)
+    app.setWindowIcon(owl_icon())
+
+
 def main() -> int:
     argv = sys.argv[1:]
     if "--selftest" in argv:
@@ -48,10 +60,7 @@ def main() -> int:
         except Exception:  # noqa: S110 - apenas cosmético (ícone na barra de tarefas)
             pass
     app = QApplication(sys.argv)
-    app.setApplicationName(APP_NAME)
-    app.setApplicationDisplayName(APP_NAME)
-    app.setApplicationVersion(__version__)
-    app.setWindowIcon(owl_icon())
+    configure_app(app)
 
     from owl_vault.ui.single_instance import SingleInstance  # noqa: PLC0415
 

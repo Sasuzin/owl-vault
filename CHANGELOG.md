@@ -10,6 +10,12 @@ O executável também mostra o **build** (número de commits do projeto, sobe so
 ajuste) e o commit, em ☰ → Sobre, no rodapé e nas propriedades do `OwlVault.exe`
 (Versão do arquivo `<versão>.<build>`, por exemplo `0.3.1.8`).
 
+## 0.3.3 — 2026-11-19
+
+* Título das janelas sem o nome repetido: era "Owl Vault v0.3.2 · build 10 · 843d2dd - Owl
+  Vault" na janela principal e "Owl Vault — Cópia criptografada - Owl Vault" na Cópia
+  criptografada (o Qt acrescentava " - Owl Vault" no fim).
+
 ## 0.3.2 — 2026-11-19
 
 * A senha mestra e a senha da Cópia criptografada passam a ter no mínimo 8 caracteres (eram
