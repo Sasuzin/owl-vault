@@ -252,7 +252,7 @@ Abas **Criar cofre**, **Verificar cofre**, **Restaurar**.
   administrador durante o uso; Python não apaga segredos da memória de forma garantida; sem
   exclusão segura) e aviso de backup ("mantenha a origem e um backup externo até verificar o
   cofre em outro computador") — ambos exigem aceite; caixa "Entendo que sem a senha não há
-  recuperação"; senha ≥ 12 caracteres + confirmação + indicador de força.
+  recuperação"; senha ≥ 8 caracteres (12 até a 0.3.1) + confirmação + indicador de força.
 * Progresso por etapa, cancelar, relatório final. O conselho de backup se repete na mensagem
   de sucesso. Teste automatizado garante que textos sobre a pasta de origem não usem
   "protegid*", "segur*", "bloquead*", "criptografad*".

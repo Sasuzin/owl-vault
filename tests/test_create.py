@@ -718,7 +718,7 @@ def test_restore_test_dir_holds_only_anonymous_files_and_is_removed(area: Area) 
 
 @pytest.mark.parametrize(
     "password",
-    ["", "curta", "12345678901", "ççççççççççç", " espaco no inicio", "espaco no fim "],
+    ["", "curta", "1234567", "ççççççç", " espaco no inicio", "espaco no fim "],
 )
 def test_weak_password_rejected_before_anything_is_written(area: Area, password: str) -> None:
     _sample(area)
@@ -727,14 +727,14 @@ def test_weak_password_rejected_before_anything_is_written(area: Area, password:
     assert not isinstance(ei.value, PreflightError)
     assert not area.vault().exists()
     assert list(area.testarea.iterdir()) == []
-    if len(password) < 12:
-        assert "12" in str(ei.value)
+    if len(password) < 8:
+        assert "8 caracteres" in str(ei.value)
 
 
-def test_twelve_character_password_is_accepted(area: Area) -> None:
+def test_eight_character_password_is_accepted(area: Area) -> None:
     _sample(area)
-    pw = "abcdefghijkl"
-    assert len(pw) == 12
+    pw = "abcdefgh"
+    assert len(pw) == 8
     assert make_vault(area, password=pw).status == "success"
     assert do_verify(area, password=pw).fully_ok
 

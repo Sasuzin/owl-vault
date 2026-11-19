@@ -328,7 +328,7 @@ def test_cli_create_rejects_short_password(cli_area: Area) -> None:
         password="curta",
     )
     assert code == 1, (out, err)
-    assert "12 caracteres" in err
+    assert "8 caracteres" in err
     assert not a.vault().exists()
     assert list(a.testarea.iterdir()) == []
 

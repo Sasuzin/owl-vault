@@ -18,7 +18,7 @@ PRINCÍPIO: o usuário só digita PIN ou senha mestra. Todo o resto é escolher 
 ## T1 ASSISTENTE 1/2 — "Crie sua senha mestra"
 
 ## Texto: "A senha mestra abre suas pastas em qualquer computador. Se você esquecê-la, ninguém consegue recuperar os arquivos — nem o Owl Vault."
-Campos: [Senha mestra] [Repita a senha mestra] (mínimo de 12 caracteres, com indicador de força).
+Campos: [Senha mestra] [Repita a senha mestra] (mínimo de 8 caracteres, com indicador de força).
 Caixa obrigatória: "Anotei minha senha mestra em um lugar seguro."
 Botão: [Continuar]. Link: "Já usei o Owl Vault — recuperar minhas pastas" (→ T12).
 

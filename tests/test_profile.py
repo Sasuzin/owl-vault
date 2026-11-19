@@ -514,7 +514,7 @@ def test_validate_master_password_aceita(sm: str) -> None:
     [
         ("", "pelo menos"),
         ("a" * (MIN_PASSWORD_LENGTH - 1), "pelo menos"),
-        ("ção" * 3, "pelo menos"),
+        ("ção" * 2 + "x", "pelo menos"),  # 7 caracteres
         (" " + MASTER, "espaço"),
         (MASTER + " ", "espaço"),
         ("\t" + MASTER, "espaço"),

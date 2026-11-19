@@ -387,7 +387,7 @@ def test_senha_valida_e_ir_e_voltar_nao_perde_o_que_foi_digitado(
     win.c_senha.setText("curta")
     win.rodape.primario.click()
     assert win.passo == 1
-    assert win.erro_senha.text() == "A senha deve ter pelo menos 12 caracteres."
+    assert win.erro_senha.text() == "A senha deve ter pelo menos 8 caracteres."
     win.c_senha.setText(SENHA)
     win.c_conf.setText(SENHA + "x")
     win.rodape.primario.click()

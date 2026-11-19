@@ -129,7 +129,7 @@ Não aprende nomes, estrutura, conteúdo, hashes nem datas originais.
 |--------|-----------|
 | Leitura do cofre (A1) | AES-256-GCM com chave por arquivo; manifesto e diário cifrados; nomes de blob aleatórios; ordem embaralhada |
 | Adulteração (A2) | GCM em cada chunk; cabeçalho do blob no AAD; nonce = índice+final; tamanho exato; `file_id`/`vault_id` vinculados; SHA-256 no manifesto |
-| Força bruta (A3) | Argon2id calibrado (64–512 MiB, t ≥ 3, ~0,5 s na criação); senha mínima de 12 caracteres; indicador de força |
+| Força bruta (A3) | Argon2id calibrado (64–512 MiB, t ≥ 3, ~0,5 s na criação); senha mínima de 8 caracteres (12 até a 0.3.1; baixado a pedido do usuário — uma senha curta escolhida por pessoa é bem mais fácil de quebrar offline, e o indicador de força mostra "fraca" até ela crescer); indicador de força |
 | Manifesto hostil (A4) | componentes validados; sem `..`, separadores, `:` (ADS), nomes reservados; fold de caixa; limites de tamanho/datas; `CREATE_NEW`/rename sem sobrescrita; caminho final de cada handle conferido; Mark-of-the-Web |
 | Cabeçalho hostil (A5) | limites de m/t/p e tamanhos checados antes de qualquer alocação; memória disponível conferida |
 | Falhas (A6) | tmp+flush+rename sem substituição no mesmo volume; diário em segmentos write-once; máquina de estados autenticada + `complete.owl`; trava de escritor único; cancelamento em fronteiras; verificação com E/S sem cache + teste de restauração + rescan da origem antes de "sucesso"; cópias duplas de cabeçalho e manifesto com leitura normativa |

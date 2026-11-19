@@ -10,6 +10,15 @@ O executável também mostra o **build** (número de commits do projeto, sobe so
 ajuste) e o commit, em ☰ → Sobre, no rodapé e nas propriedades do `OwlVault.exe`
 (Versão do arquivo `<versão>.<build>`, por exemplo `0.3.1.8`).
 
+## 0.3.2 — 2026-11-19
+
+* A senha mestra e a senha da Cópia criptografada passam a ter no mínimo 8 caracteres (eram
+  12). Senhas mais longas continuam mais seguras: o indicador de força mostra "fraca" para
+  uma senha de 8 caracteres e sobe conforme ela cresce e mistura letras, números e símbolos.
+  Perfis e cofres com senha de 8 a 11 caracteres também abrem nas versões anteriores, mas
+  elas recusam essa senha na hora de criar um perfil ou uma cópia: em outro computador, use a
+  0.3.2 ou mais nova.
+
 ## 0.3.1 — 2026-11-19
 
 * PIN: ano-mês-dia com 2 dígitos de ano (como 401216, que seria 16/12/2040) não é mais
