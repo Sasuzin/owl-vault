@@ -6,7 +6,7 @@ commits do repositório, que cresce sozinho a cada ajuste — e o commit, e gera
 
 * ``src/owl_vault/_build.py`` — lido pela interface ("Sobre", rodapé, título);
 * ``packaging/version_info.txt`` — propriedades do ``OwlVault.exe`` no Explorer
-  (Versão do arquivo = 0.3.0.<build>).
+  (Versão do arquivo = <versão>.<build>, por exemplo 0.3.1.8).
 
 Os dois arquivos são gerados (não versionados).
 """

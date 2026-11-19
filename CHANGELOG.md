@@ -8,7 +8,19 @@ O Owl Vault está em desenvolvimento contínuo. Cada ajuste sobe a versão
 
 O executável também mostra o **build** (número de commits do projeto, sobe sozinho a cada
 ajuste) e o commit, em ☰ → Sobre, no rodapé e nas propriedades do `OwlVault.exe`
-(Versão do arquivo `0.3.0.<build>`).
+(Versão do arquivo `<versão>.<build>`, por exemplo `0.3.1.8`).
+
+## 0.3.1 — 2026-11-19
+
+* PIN: ano-mês-dia com 2 dígitos de ano (como 401216, que seria 16/12/2040) não é mais
+  tratado como data. Continuam recusadas as datas no jeito brasileiro (dia-mês-ano, como
+  250390 ou 25031990) e ano-mês-dia com o ano inteiro (19900325), só com anos de 1900 a 2099.
+* A mensagem de PIN recusado por data agora diz qual data ele parece ("Este PIN parece a data
+  25/03/90").
+* PINs feitos de dois pedaços fáceis (dígito repetido ou sequência, como 000123, 222345 ou
+  567876) e contagens com zero à esquerda (01020304, 000102) são recusados como fáceis de
+  adivinhar. Com 8 dígitos, duas datas dia-mês juntas (25031208, "as datas 25/03 e 12/08")
+  continuam recusadas.
 
 ## 0.3.0 — 2026-11-17
 

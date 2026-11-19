@@ -227,6 +227,18 @@ def wrong_pin(store: ProfileStore) -> int:
         "31021990",  # 31/02/1990
         "29021990",  # 29/02/1990 (1990 não é bissexto)
         "19902231",  # mês 22
+        # ano-mês-dia com 2 dígitos de ano não é tratado como data (ninguém escreve assim)
+        "401216",  # seria 16/12/2040: o PIN do relato do usuário
+        "900325",
+        "991231",
+        # ano por extenso fora de 1900–2099
+        "15081850",  # 15/08/1850
+        "21500704",  # 2150-07-04
+        # 901/109 não são sequência (0 e 1 não são vizinhos na fileira): sem "dois pedaços"
+        "109456",
+        "901456",
+        "345901",
+        "555901",
     ],
 )
 def test_validate_pin_aceita(pin: str) -> None:
@@ -290,8 +302,6 @@ def test_validate_pin_recusa_repetidos_e_sequencias(pin: str) -> None:
         "250390",  # ddmmaa
         "010100",  # ddmmaa (01/01/2000)
         "311299",  # ddmmaa
-        "900325",  # aammdd
-        "991231",  # aammdd
         "25031990",  # ddmmaaaa
         "29022024",  # ddmmaaaa (bissexto)
         "19900325",  # aaaammdd
@@ -380,11 +390,87 @@ def test_validate_pin_recusa_padroes_faceis(pin: str) -> None:
         validate_pin(pin)
 
 
-@pytest.mark.parametrize("pin", ["121212", "111222", "000123", "890123", "10111213"])
+@pytest.mark.parametrize("pin", ["121212", "111222", "010203"])
 def test_validate_pin_padrao_que_tambem_e_data_continua_recusado(pin: str) -> None:
     """Datas válidas continuam com a mensagem de data, mesmo quando também são padrões."""
     with pytest.raises(OwlVaultError, match="datas"):
         validate_pin(pin)
+
+
+@pytest.mark.parametrize(
+    ("pin", "data"),
+    [
+        ("250390", "25/03/90"),
+        ("010100", "01/01/00"),
+        ("25031990", "25/03/1990"),
+        ("19991231", "31/12/1999"),
+        ("20240229", "29/02/2024"),
+    ],
+)
+def test_validate_pin_de_data_diz_qual_data_parece(pin: str, data: str) -> None:
+    """A mensagem mostra a data que o PIN parece: sem isso, quem digitou não entende o porquê."""
+    with pytest.raises(OwlVaultError, match="datas") as ei:
+        validate_pin(pin)
+    assert f"parece a data {data}." in str(ei.value)
+
+
+@pytest.mark.parametrize(
+    ("pin", "datas"),
+    [
+        ("25031208", "25/03 e 12/08"),  # dois aniversários sem o ano
+        ("29020101", "29/02 e 01/01"),
+        ("31120101", "31/12 e 01/01"),
+    ],
+)
+def test_validate_pin_recusa_duas_datas_dia_mes(pin: str, datas: str) -> None:
+    """Com 8 dígitos, duas datas dia-mês (ddmmddmm). Antes eram recusadas só por acaso (a
+    regra lia qualquer ano de 0001 a 9999: 25/03/1208)."""
+    with pytest.raises(OwlVaultError, match="datas") as ei:
+        validate_pin(pin)
+    assert f"parece as datas {datas}." in str(ei.value)
+
+
+@pytest.mark.parametrize("pin", ["25321208", "25031318", "00031208"])
+def test_validate_pin_aceita_quase_duas_datas(pin: str) -> None:
+    validate_pin(pin)
+
+
+@pytest.mark.parametrize(
+    "pin",
+    [
+        # antes recusados só por parecerem aammdd/aaaa fora do intervalo; continuam recusados
+        "000123",
+        "890123",
+        "10111213",
+        # dois pedaços fáceis: dígito repetido + sequência (ou o contrário)
+        "123000",
+        "222345",
+        "987000",
+        "000987",
+        "00123456",
+        "789000",
+        "5556789",
+        "345666",
+        # contagem com zero à esquerda (antes recusada só por acaso, como "data" 01/02/0304)
+        "00010203",
+        "000102",
+        "0102030405",
+        "001002003",
+        "000102030405",
+    ],
+)
+def test_validate_pin_recusa_dois_pedacos_faceis(pin: str) -> None:
+    with pytest.raises(OwlVaultError, match="fácil de adivinhar"):
+        validate_pin(pin)
+
+
+@pytest.mark.parametrize("pin", ["01020304", "04030201", "02040608", "03060912"])
+def test_validate_pin_contagem_com_zero_a_esquerda_em_8_digitos(pin: str) -> None:
+    """Recusados (são também duas datas dia-mês, e essa mensagem vem antes); a contagem com
+    zero à esquerda os pega mesmo sem a regra de datas."""
+    with pytest.raises(OwlVaultError):
+        validate_pin(pin)
+    assert profile_mod._padded_counting(pin)
 
 
 @pytest.mark.parametrize("pin", ["947361", "583920", "961473"])

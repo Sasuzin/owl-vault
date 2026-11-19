@@ -54,8 +54,14 @@ originais" e "sem integração com o Explorer". O formato do cofre (FORMAT.md) n
   máximo 2 dígitos distintos, passo constante módulo 10 (inclui a fileira do teclado
   1234567890/0987654321 e 135791), bloco repetido (mesmo com a última repetição pela metade),
   `aabbcc`, palíndromos, linhas/colunas/diagonais do teclado numérico emendadas (ex.: 2580),
-  contagens (102030, 246810, 9101112) e uma lista de PINs comuns; datas são recusadas antes,
-  com a mensagem de data.
+  contagens (102030, 246810, 9101112, e com zero à esquerda: 01020304, 000102), dois pedaços
+  fáceis emendados (dígito repetido ou sequência de 3+ de 0–9 ou da fileira 1234567890, nos
+  dois sentidos — 890 conta, 901 não: 000123, 222345, 567876) e uma lista de PINs comuns.
+  Datas são recusadas antes, com uma mensagem que mostra a data ("Este PIN parece a data
+  25/03/90"): dia-mês-ano com 6 dígitos (`ddmmaa`) ou 8 (`ddmmaaaa`), ano-mês-dia com o ano
+  por extenso (`aaaammdd`), anos 1900–2099 nos de 8 dígitos, e duas datas dia-mês com 8
+  dígitos (`ddmmddmm`, "parece as datas 25/03 e 12/08"). Ano-mês-dia com 2 dígitos de ano
+  (`aammdd`) não conta: quase ninguém escreve datas assim e barrava PINs como 401216 (0.3.1).
 * Contador de erros: gravado em CADA cópia legível antes de derivar, mudando só
   `pin_failures`/`pin` (o índice e o cabeçalho de cada cópia são preservados; uma cópia
   ilegível só é regravada depois de um desbloqueio bem-sucedido). Efetivo = máximo; contador

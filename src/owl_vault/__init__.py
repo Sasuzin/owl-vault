@@ -8,7 +8,7 @@ O executável também carrega o número do build e o commit (``_build.py``, gera
 __all__ = ["APP_NAME", "__version__", "build_label", "version_label"]
 
 APP_NAME = "Owl Vault"
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 
 def _build_info() -> tuple[int | None, str, bool, str]:

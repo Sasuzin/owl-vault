@@ -26,7 +26,7 @@ Botão: [Continuar]. Link: "Já usei o Owl Vault — recuperar minhas pastas" (�
 ## T2 ASSISTENTE 2/2 — "Crie seu PIN"
 
 ## Texto: "Use o PIN no dia a dia, só neste computador. Ele é mais fraco que a senha mestra: não use datas nem sequências como 123456."
-Campos: [PIN (6 a 12 números)] [Repita o PIN]. Erro: "Este PIN é fácil de adivinhar. Escolha outro." (sequências, fileira do teclado, blocos repetidos, palíndromos, caminhos do teclado numérico, contagens e PINs comuns — lista completa em PASTAS_PROTEGIDAS.md §2; datas têm mensagem própria).
+Campos: [PIN (6 a 12 números)] [Repita o PIN]. Erro: "Este PIN é fácil de adivinhar. Escolha outro." (sequências, fileira do teclado, blocos repetidos, palíndromos, dois pedaços fáceis emendados, caminhos do teclado numérico, contagens e PINs comuns — lista completa em PASTAS_PROTEGIDAS.md §2). Datas têm mensagem própria, que mostra a data: "Este PIN parece a data 25/03/90. Não use datas como PIN: escolha outro."
 Botão: [Concluir] (→ T4).
 
 

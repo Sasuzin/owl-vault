@@ -180,13 +180,17 @@ _KEYPAD_SEGMENTS = frozenset(s for line in _KEYPAD_LINES for s in (line, line[::
 
 
 def validate_pin(pin: str) -> None:
-    """6 a 12 dígitos; recusa PINs fáceis de adivinhar e datas óbvias.
+    """6 a 12 dígitos; recusa datas e PINs fáceis de adivinhar.
+
+    Datas (com a mensagem que mostra a data, ``_date_in``): ddmmaa; ddmmaaaa e aaaammdd de
+    1900 a 2099; e, com 8 dígitos, duas datas dia-mês (ddmmddmm).
 
     Fáceis: todos iguais; sequências (também com a volta 9→0 da fileira do teclado e com
     passo constante, como 135791); blocos repetidos (abab, abcabc, 12341234, aabbcc);
-    palíndromos; no máximo 2 dígitos distintos; linhas/colunas/diagonais do teclado numérico
-    emendadas (147258, 159357, 789456123); contagens (102030, 246810); e uma lista curta de
-    PINs comuns.
+    palíndromos; no máximo 2 dígitos distintos; dois pedaços fáceis emendados (000123,
+    222345, 567876); linhas/colunas/diagonais do teclado numérico emendadas (147258, 159357,
+    789456123); contagens (102030, 246810, e com zero à esquerda: 01020304, 000102); e uma
+    lista curta de PINs comuns.
     """
     if not re.fullmatch(r"[0-9]{6,12}", pin or ""):
         raise OwlVaultError("O PIN deve ter de 6 a 12 números.")
@@ -194,25 +198,51 @@ def validate_pin(pin: str) -> None:
     steps = {b - a for a, b in itertools.pairwise(digits)}
     if len(set(pin)) == 1 or steps in ({1}, {-1}):
         raise OwlVaultError(_WEAK_PIN)
-    if _looks_like_date(pin):
-        raise OwlVaultError("Não use datas como PIN. Escolha outro.")
+    date = _date_in(pin)
+    if date:
+        raise OwlVaultError(f"Este PIN parece {date}. Não use datas como PIN: escolha outro.")
     if _is_guessable(pin):
         raise OwlVaultError(_WEAK_PIN)
 
 
-def _looks_like_date(pin: str) -> bool:
-    candidates = []
+#: anos que um PIN de 8 dígitos com o ano por extenso (ddmmaaaa, aaaammdd) pode ser
+_DATE_YEARS = range(1900, 2100)
+
+
+def _day_month(text: str) -> str:
+    """'2503' → '25/03' se for um dia-mês válido (29/02 vale); senão ''."""
+    try:
+        return _dt.datetime.strptime(text + "2000", "%d%m%Y").strftime("%d/%m")
+    except ValueError:
+        return ""
+
+
+def _date_in(pin: str) -> str:
+    """As datas que o PIN parece, como as pessoas as escrevem no Brasil ("a data 25/03/90",
+    "as datas 25/03 e 12/08"; "" se nenhuma): dia-mês-ano com 6 dígitos (ddmmaa, qualquer
+    ano) ou 8 (ddmmaaaa), ano-mês-dia só com o ano por extenso (aaaammdd), que se reconhece
+    pelo ano no começo, e, com 8 dígitos, duas datas dia-mês (o aniversário de duas pessoas).
+    Ano-mês-dia com 2 dígitos (aammdd) não conta: quase ninguém escreve datas assim, e
+    recusar barrava PINs que ninguém vê como data (401216 seria 16/12/2040)."""
     if len(pin) == 6:
-        candidates = [("%d%m%y", pin), ("%y%m%d", pin)]
+        candidates = [("%d%m%y", "%d/%m/%y")]
     elif len(pin) == 8:
-        candidates = [("%d%m%Y", pin), ("%Y%m%d", pin)]
-    for fmt, text in candidates:
+        candidates = [("%d%m%Y", "%d/%m/%Y"), ("%Y%m%d", "%d/%m/%Y")]
+    else:
+        return ""
+    for fmt, shown in candidates:
         try:
-            _dt.datetime.strptime(text, fmt)
-            return True
+            when = _dt.datetime.strptime(pin, fmt)
         except ValueError:
             continue
-    return False
+        if len(pin) == 8 and when.year not in _DATE_YEARS:
+            continue
+        return f"a data {when.strftime(shown)}"
+    if len(pin) == 8:
+        first, second = _day_month(pin[:4]), _day_month(pin[4:])
+        if first and second:
+            return f"as datas {first} e {second}"
+    return ""
 
 
 def _is_guessable(pin: str) -> bool:
@@ -230,7 +260,25 @@ def _is_guessable(pin: str) -> bool:
     # cada dígito repetido em seguida (aabbcc, 11223344, 998877)
     if min(len(list(g)) for _, g in itertools.groupby(pin)) >= 2:
         return True
-    return _keypad_path(pin) or _counting(pin)
+    return _two_easy_pieces(pin) or _keypad_path(pin) or _counting(pin) or _padded_counting(pin)
+
+
+#: sequências que alguém digita em linha: 0 a 9 e a fileira do teclado (1234567890), nos
+#: dois sentidos. 890 e 098 contam; 901 e 109 não (0 e 1 não são vizinhos em nenhuma delas)
+_RUNS = ("0123456789", "1234567890", "9876543210", "0987654321")
+
+
+def _easy_piece(piece: str) -> bool:
+    """Um dígito repetido (2 ou mais) ou uma sequência de 3 ou mais de ``_RUNS``."""
+    if len(piece) >= 2 and len(set(piece)) == 1:
+        return True
+    return len(piece) >= 3 and any(piece in run for run in _RUNS)
+
+
+def _two_easy_pieces(pin: str) -> bool:
+    """Dois pedaços fáceis emendados: zeros ou um dígito repetido antes ou depois de uma
+    sequência (000123, 123000, 222345, 987000, 00123456), ou duas sequências (567876)."""
+    return any(_easy_piece(pin[:i]) and _easy_piece(pin[i:]) for i in range(2, len(pin) - 1))
 
 
 def _keypad_path(pin: str) -> bool:
@@ -274,6 +322,20 @@ def _counting(pin: str) -> bool:
                 terms += 1
             if terms >= 3 and out == pin:
                 return True
+    return False
+
+
+def _padded_counting(pin: str) -> bool:
+    """Contagem com números de largura fixa e zero à esquerda, que ``_counting`` não lê:
+    01020304 (01 02 03 04), 000102, 04030201, 001002003. 3 termos ou mais, passo de 1 a 10."""
+    n = len(pin)
+    for w in (2, 3):
+        if n % w or n // w < 3 or not any(pin[i] == "0" for i in range(0, n, w)):
+            continue
+        terms = [int(pin[i : i + w]) for i in range(0, n, w)]
+        diffs = {b - a for a, b in itertools.pairwise(terms)}
+        if len(diffs) == 1 and 0 < abs(next(iter(diffs))) <= 10:
+            return True
     return False
 
 
