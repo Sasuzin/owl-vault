@@ -11,9 +11,11 @@ criptografados: só abrem pelo Owl Vault, com o seu **PIN** (ou a **senha mestra
 
 ## Como usar
 
-1. Rode `OwlVault.exe`. Na primeira vez ele se instala só para o seu usuário
-   (`%LOCALAPPDATA%\Programs\Owl Vault`, com atalhos no Menu Iniciar e na Área de Trabalho; não
-   pede administrador).
+1. Rode `OwlVault-Setup.exe` (instalador: aparece em "Aplicativos instalados", com
+   Desinstalar) ou simplesmente `OwlVault.exe`, que na primeira vez se instala sozinho. Os dois
+   instalam só para o seu usuário (`%LOCALAPPDATA%\Programs\Owl Vault`, com atalhos no Menu
+   Iniciar e na Área de Trabalho; não pedem administrador) e já trazem tudo o que o programa
+   precisa — não há nada mais para instalar.
 2. **Crie a senha mestra** (mínimo 8 caracteres; mais longa é mais segura — anote num lugar seguro) e o **PIN** (6 a 12
    números, só para este computador).
 3. **+ Proteger uma pasta…** → escolha a pasta → confira o resumo → **Proteger**. O Owl Vault
@@ -55,8 +57,8 @@ ameaças e limites: [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) · segurança: 
 recuperação: [docs/RECOVERY.md](docs/RECOVERY.md) · Windows: [docs/WINDOWS.md](docs/WINDOWS.md) ·
 testes: [docs/TEST_PLAN.md](docs/TEST_PLAN.md).
 
-O Windows SmartScreen pode avisar porque o executável não é assinado — confira o SHA-256 em
-`OwlVault.exe.sha256`.
+O Windows SmartScreen pode avisar porque o executável e o instalador não são assinados —
+confira o SHA-256 em `OwlVault-Setup.exe.sha256` / `OwlVault.exe.sha256`.
 
 ## Desenvolvimento
 

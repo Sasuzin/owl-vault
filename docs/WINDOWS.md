@@ -28,9 +28,39 @@ janela principal; se ele não chegar, aparece um aviso em vez de nada acontecer.
 aparecem em ☰ → Sobre, no rodapé da janela e nas propriedades do arquivo (Detalhes →
 Versão do arquivo).
 
-O Windows SmartScreen pode mostrar "O Windows protegeu o computador" porque o executável não
-é assinado. Confira o SHA-256 (`Get-FileHash .\OwlVault.exe -Algorithm SHA256`) antes de clicar
-em "Executar assim mesmo". Não rode como administrador — não é necessário.
+### Instalador (`OwlVault-Setup.exe`)
+
+Desde a 0.5.0, cada build também gera `OwlVault-Setup.exe` (Inno Setup 6,
+`packaging/owl_vault.iss`). Ele instala o mesmo `OwlVault.exe`, no mesmo lugar
+(`%LOCALAPPDATA%\Programs\Owl Vault`, sem escolher a pasta: os atalhos das pastas protegidas
+apontam para lá), por usuário e sem administrador. Diferenças para o exe sozinho:
+
+* telas de instalação em português, com a opção "Criar atalho na Área de Trabalho" (marcada)
+  e "Abrir o Owl Vault" no fim;
+* o Owl Vault aparece em **Configurações → Aplicativos instalados**, com **Desinstalar**;
+* grava junto `versao.txt`, `versao.sha256` e `area-de-trabalho.txt`, que descrevem exatamente
+  o exe instalado: um `OwlVault.exe` mais antigo aberto depois não o substitui, e o programa
+  não recria o atalho da Área de Trabalho se a opção foi desmarcada;
+* não instala por cima de uma versão mais nova (lê o `versao.txt` instalado).
+
+A desinstalação apaga só o que está em `%LOCALAPPDATA%\Programs\Owl Vault` e os atalhos do
+Menu Iniciar e da Área de Trabalho. **Nunca** apaga o perfil (`%LOCALAPPDATA%\Owl Vault`) nem
+as pastas protegidas. Se houver perfil, ela pergunta antes ("Não" é o padrão): sem o programa,
+as pastas protegidas não abrem — para deixar de usar o Owl Vault de vez, use "Remover proteção…"
+em cada pasta antes; instalando de novo, tudo volta a abrir. Desinstalação silenciosa
+(`unins000.exe /VERYSILENT /SUPPRESSMSGBOXES`) segue em frente sem perguntar.
+
+O exe sozinho e o instalador podem ser usados um depois do outro (atualizar com qualquer um
+dos dois funciona). O instalador fecha o Owl Vault aberto antes de trocar o exe (pergunta
+antes). Sem o Inno Setup 6 instalado na máquina do build, o `build.ps1` avisa e gera só o exe.
+
+### SmartScreen
+
+O Windows SmartScreen pode mostrar "O Windows protegeu o computador" porque o executável e o
+instalador não são assinados (só um certificado de assinatura de código resolve isso). Confira
+o SHA-256 (`Get-FileHash .\OwlVault-Setup.exe -Algorithm SHA256`, igual ao do arquivo
+`.sha256` publicado) antes de clicar em "Mais informações" → "Executar assim mesmo". Não rode
+como administrador — não é necessário.
 
 O executável é *onefile*: a cada abertura ele se descompacta numa pasta temporária, o que leva
 alguns segundos. Alguns antivírus podem desconfiar de executáveis PyInstaller (falso positivo).

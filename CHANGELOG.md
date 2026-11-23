@@ -10,6 +10,20 @@ O executável também mostra o **build** (número de commits do projeto, sobe so
 ajuste) e o commit, em ☰ → Sobre, no rodapé e nas propriedades do `OwlVault.exe`
 (Versão do arquivo `<versão>.<build>`, por exemplo `0.3.1.8`).
 
+## 0.5.0 — 2026-11-23
+
+* **Instalador** `OwlVault-Setup.exe`, ao lado do `OwlVault.exe` de sempre: telas de
+  instalação em português, por usuário e sem administrador, com a opção "Criar atalho na Área
+  de Trabalho" (marcada) e "Abrir o Owl Vault" no fim. O Owl Vault passa a aparecer em
+  Configurações → Aplicativos instalados, com **Desinstalar**.
+* A desinstalação **não apaga** o perfil nem as pastas protegidas. Se houver um perfil neste
+  computador, ela avisa antes: pastas protegidas só abrem com o Owl Vault, então, se você não
+  for instalá-lo de novo, use "Remover proteção…" em cada pasta antes.
+* O instalador não substitui uma versão mais nova já instalada, e grava junto as marcas de
+  versão do exe: um `OwlVault.exe` mais antigo aberto depois também não o substitui.
+* O `OwlVault.exe` sozinho continua funcionando como antes (ele mesmo se instala na primeira
+  vez). Os dois instalam no mesmo lugar e podem ser usados um depois do outro.
+
 ## 0.4.3 — 2026-11-23
 
 * O `OwlVault.exe` não leva mais uma cópia do OpenSSL tirada da máquina onde foi gerado

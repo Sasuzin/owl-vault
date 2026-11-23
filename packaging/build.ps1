@@ -1,4 +1,4 @@
-# Gera dist\OwlVault.exe e dist\OwlVault.exe.sha256
+# Gera dist\OwlVault.exe, dist\OwlVault-Setup.exe (instalador, se houver Inno Setup 6) e os .sha256
 # Uso (na raiz do projeto):  powershell -ExecutionPolicy Bypass -File packaging\build.ps1
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
@@ -27,5 +27,34 @@ $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
 "$hash  OwlVault.exe" | Out-File -Encoding ascii (Join-Path $root "dist\OwlVault.exe.sha256")
 $label = & $py -c "import sys; sys.path.insert(0, 'src'); import owl_vault; print(owl_vault.version_label())"
 "$label" | Out-File -Encoding utf8 (Join-Path $root "dist\VERSAO.txt")
+
+Write-Host "== Instalador"
+$setup = Join-Path $root "dist\OwlVault-Setup.exe"
+Remove-Item $setup, "$setup.sha256" -ErrorAction SilentlyContinue  # nunca sobra um instalador velho
+$appVersion = (& $py packaging\installer_files.py | Select-Object -Last 1)
+if ($LASTEXITCODE -ne 0 -or -not $appVersion) { throw "Falha ao gravar as marcas do instalador." }
+$iscc = @(
+    (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe"),
+    (Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"),
+    (Join-Path $env:ProgramFiles "Inno Setup 6\ISCC.exe")
+) | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $iscc) {
+    $cmd = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+    if ($cmd) { $iscc = $cmd.Source }
+}
+$setupHash = ""
+if (-not $iscc) {
+    Write-Warning "Inno Setup 6 não encontrado (ISCC.exe): o instalador não foi gerado. Baixe em https://jrsoftware.org/isdl.php"
+} else {
+    & $iscc /Q "/DAppVersion=$($appVersion.Trim())" "/DAppLabel=$label" packaging\owl_vault.iss
+    if ($LASTEXITCODE -ne 0) { throw "Inno Setup falhou." }
+    $setupHash = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLower()
+    "$setupHash  OwlVault-Setup.exe" | Out-File -Encoding ascii "$setup.sha256"
+}
+
 Write-Host "== Pronto: $exe ($label)"
 Write-Host "   SHA-256: $hash"
+if ($setupHash) {
+    Write-Host "   Instalador: $setup"
+    Write-Host "   SHA-256: $setupHash"
+}

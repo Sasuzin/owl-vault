@@ -60,4 +60,10 @@ durante a gravação; queda de energia; `subst`; ponto de montagem (admin); exec
 máquina limpa; tela real de 1366×768 com escala de 125% e 150% (janela principal, Cópia
 criptografada e diálogos); Win+L com o seletor de pastas do Windows aberto na Cópia
 criptografada (o seletor continua aberto; o caminho escolhido depois deve ser descartado);
-atalho de uma pasta com o Owl Vault ocupado num trabalho longo.
+atalho de uma pasta com o Owl Vault ocupado num trabalho longo; instalador
+(`OwlVault-Setup.exe`) em máquina limpa — instalar com e sem o atalho da Área de Trabalho,
+atualizar com o Owl Vault aberto, tentar instalar uma versão mais antiga por cima, desinstalar
+com e sem perfil (o perfil e as pastas protegidas continuam; reinstalando, abrem de novo) e
+desinstalar por Configurações → Aplicativos instalados. A consistência do script do
+instalador com o programa (pasta, marcas, atalhos, caminho do perfil, nada apagado fora da
+pasta do programa) está em `test_instalador.py`.

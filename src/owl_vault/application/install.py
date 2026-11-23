@@ -241,9 +241,28 @@ def _restore_marks(target_dir: Path, before: dict[str, bytes | None]) -> None:
                 _write_atomic(target_dir / name, data)
 
 
+def _marks(stamp: InstallStamp) -> dict[str, bytes]:
+    return {
+        STAMP_FILE: stamp.text().encode("ascii"),
+        VERSION_FILE: f"{_version_text(stamp.version)}\n".encode("ascii"),
+    }
+
+
 def _write_marks(target_dir: Path, stamp: InstallStamp) -> None:
-    _write_atomic(target_dir / STAMP_FILE, stamp.text().encode("ascii"))
-    _write_atomic(target_dir / VERSION_FILE, f"{_version_text(stamp.version)}\n".encode("ascii"))
+    for name, data in _marks(stamp).items():  # versao.sha256 antes de versao.txt
+        _write_atomic(target_dir / name, data)
+
+
+def installer_files(exe: Path) -> dict[str, bytes]:
+    """Arquivos que o instalador (``packaging/owl_vault.iss``) grava ao lado de ``exe``: as
+    marcas que o descrevem exatamente — iguais às que este programa gravaria ao se instalar —
+    e a marca da Área de Trabalho (o atalho de lá é uma opção do instalador; o programa não o
+    cria sozinho depois)."""
+    data = exe.read_bytes()
+    stamp = InstallStamp(
+        current_version(), len(data), hashlib.sha256(data).hexdigest(), current_build_date()
+    )
+    return {**_marks(stamp), DESKTOP_MARK: _DESKTOP_MARK_TEXT}
 
 
 def _copy(current: Path, target: Path, target_dir: Path) -> None:

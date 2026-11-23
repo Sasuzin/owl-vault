@@ -20,7 +20,8 @@ FORMAT, ARCHITECTURE, UI_SPEC_V2, WINDOWS, RECOVERY).
   dona do repositório (Sasuzin/owl-vault), nunca com conta de empresa. Nunca versione `.venv`,
   `build/`, `dist/` (o exe) nem segredos.
 * **Releases:** quando o usuário pedir, publique no GitHub como *pré-lançamento* (os testes
-  manuais ainda não foram feitos), com `dist/OwlVault.exe` e `dist/OwlVault.exe.sha256`, tag
+  manuais ainda não foram feitos), com `dist/OwlVault-Setup.exe`, `dist/OwlVault.exe` e os dois
+  `.sha256`, tag
   `vX.Y.Z-buildN` no commit do build (use o SHA completo em `--target`) e notas em pt-BR.
 
 ## Regras de segurança (do usuário, valem sempre)
@@ -50,7 +51,8 @@ $env:QT_QPA_PLATFORM='offscreen'; $env:QT_QPA_FONTDIR='C:\Windows\Fonts'
 .venv\Scripts\python.exe -m ruff format --check src tests
 .venv\Scripts\python.exe -m mypy src/owl_vault
 
-# exe (roda a suíte antes; gera dist\OwlVault.exe, .sha256 e VERSAO.txt)
+# exe e instalador (roda a suíte antes; gera dist\OwlVault.exe, dist\OwlVault-Setup.exe,
+# os .sha256 e VERSAO.txt; o instalador exige Inno Setup 6 — sem ele, só o exe)
 powershell -ExecutionPolicy Bypass -File packaging\build.ps1
 dist\OwlVault.exe --selftest   # deve devolver 0
 ```
