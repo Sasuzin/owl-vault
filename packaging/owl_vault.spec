@@ -61,6 +61,27 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+
+# Sem TLS do Qt: o Owl Vault não usa rede (o QtNetwork serve só ao canal local da instância
+# única). Sem este filtro, o gancho do PySide6 levava os plugins de TLS e as libssl/libcrypto
+# "-x64" que achasse no PATH da máquina do build (na 0.4.0: as do Git for Windows, de versão
+# desconhecida). A libcrypto-3.dll do próprio Python (hashlib/ssl) continua.
+_TLS_DLLS = {"libssl-3-x64.dll", "libcrypto-3-x64.dll"}
+
+
+def _sem_tls(toc):
+    out = []
+    for entry in toc:
+        dest = entry[0].replace("/", "\\").lower()
+        if dest.startswith("pyside6\\plugins\\tls\\") or dest.rsplit("\\", 1)[-1] in _TLS_DLLS:
+            continue
+        out.append(entry)
+    return out
+
+
+a.binaries = _sem_tls(a.binaries)
+a.datas = _sem_tls(a.datas)
+
 pyz = PYZ(a.pure)
 
 exe = EXE(

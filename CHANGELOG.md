@@ -10,6 +10,13 @@ O executável também mostra o **build** (número de commits do projeto, sobe so
 ajuste) e o commit, em ☰ → Sobre, no rodapé e nas propriedades do `OwlVault.exe`
 (Versão do arquivo `<versão>.<build>`, por exemplo `0.3.1.8`).
 
+## 0.4.3 — 2026-11-23
+
+* O `OwlVault.exe` não leva mais uma cópia do OpenSSL tirada da máquina onde foi gerado
+  (`libssl-3-x64.dll` e `libcrypto-3-x64.dll`, na 0.4.0 vindas do Git for Windows, de versão
+  desconhecida) nem os plugins de TLS do Qt: o Owl Vault não usa rede. O exe ficou 2,7 MB
+  menor. A criptografia não muda (o `cryptography` traz o próprio OpenSSL embutido).
+
 ## 0.4.2 — 2026-11-23
 
 * O programa é o mesmo da 0.4.1. Um teste da prática da senha mestra dependia da data do
