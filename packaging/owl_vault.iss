@@ -23,6 +23,8 @@
 #endif
 ; autoria: igual a AUTHOR em src/owl_vault/__init__.py (test_instalador.py confere)
 #define AppAuthor "Luís Felipe Galvão"
+; mutex que o Owl Vault mantém enquanto está aberto (APP_MUTEX em src/owl_vault/ui/app.py)
+#define AppMutex "OwlVaultApp"
 
 [Setup]
 AppId={{1EBD1724-39BD-4ADE-B5E3-AD125245BF3F}
@@ -53,8 +55,11 @@ UninstallDisplayName=Owl Vault
 WizardStyle=modern
 Compression=lzma2
 SolidCompression=yes
-CloseApplications=yes
-RestartApplications=no
+; Owl Vault aberto: o instalador e o desinstalador PEDEM para fechar (AppMutex) — nunca fecham à
+; força. O fechamento automático (Restart Manager) foi desligado: na 0.6.0 ele fechou a janela,
+; mas o lançador do PyInstaller (sem janela) ficou preso segurando o OwlVault.exe.
+AppMutex={#AppMutex}
+CloseApplications=no
 ShowLanguageDialog=no
 
 [Languages]
@@ -105,6 +110,51 @@ begin
   end;
 end;
 
+function CreateFile(lpFileName: String; dwDesiredAccess, dwShareMode, lpSecurityAttributes,
+  dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile: Integer): Integer;
+  external 'CreateFileW@kernel32.dll stdcall';
+function CloseHandle(hObject: Integer): Boolean;
+  external 'CloseHandle@kernel32.dll stdcall';
+
+{ O OwlVault.exe instalado está aberto por algum processo? Pega qualquer versão (as anteriores à
+  0.6.1 não têm o mutex) e o lançador do PyInstaller, que segura o exe sem ter janela. }
+function ExeInUse(): Boolean;
+var
+  Exe: String;
+  H: Integer;
+begin
+  Result := False;
+  Exe := ExpandConstant('{app}\OwlVault.exe');
+  if not FileExists(Exe) then
+    Exit;
+  H := CreateFile(Exe, $40000000 { GENERIC_WRITE }, 0 { sem compartilhar }, 0,
+    3 { OPEN_EXISTING }, $80 { NORMAL }, 0);
+  if H = -1 then
+    Result := DLLGetLastError() = 32  { ERROR_SHARING_VIOLATION: em uso }
+  else
+    CloseHandle(H);
+end;
+
+{ O AppMutex só é conferido ao abrir o instalador: logo antes de copiar, confere de novo (o Owl
+  Vault pode ter sido aberto no meio das telas, ou ser uma versão sem o mutex) e espera o exe
+  ficar livre. }
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  Result := '';
+  while CheckForMutexes('{#AppMutex}') or ExeInUse() do
+  begin
+    if SuppressibleMsgBox(
+      'O Owl Vault está aberto.' + #13#10#13#10 +
+      'Feche o Owl Vault (o X da janela) e clique em OK para continuar a instalação.',
+      mbInformation, MB_OKCANCEL, IDCANCEL) = IDCANCEL then
+    begin
+      Result := 'O Owl Vault continua aberto. Feche-o e rode o instalador de novo.';
+      Exit;
+    end;
+    Sleep(1000);  { o lançador do exe termina logo depois da janela }
+  end;
+end;
+
 function InitializeUninstall(): Boolean;
 begin
   Result := True;
@@ -112,7 +162,7 @@ begin
     Result := SuppressibleMsgBox(
       'Há um perfil do Owl Vault neste computador.' + #13#10#13#10 +
       'Pastas protegidas só abrem com o Owl Vault. Se você não vai instalá-lo de novo, ' +
-      'cancele, abra o Owl Vault e use "Remover proteção…" em cada pasta antes de desinstalar.' + #13#10#13#10 +
+      'clique em Não, abra o Owl Vault e use "Remover proteção…" em cada pasta antes de desinstalar.' + #13#10#13#10 +
       'A desinstalação NÃO apaga o perfil nem as pastas protegidas: instalando o Owl Vault ' +
       'de novo neste computador, elas voltam a abrir normalmente.' + #13#10#13#10 +
       'Desinstalar mesmo assim?',

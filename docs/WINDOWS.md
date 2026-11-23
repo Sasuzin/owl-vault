@@ -51,8 +51,16 @@ em cada pasta antes; instalando de novo, tudo volta a abrir. Desinstalação sil
 (`unins000.exe /VERYSILENT /SUPPRESSMSGBOXES`) segue em frente sem perguntar.
 
 O exe sozinho e o instalador podem ser usados um depois do outro (atualizar com qualquer um
-dos dois funciona). O instalador fecha o Owl Vault aberto antes de trocar o exe (pergunta
-antes). Sem o Inno Setup 6 instalado na máquina do build, o `build.ps1` avisa e gera só o exe.
+dos dois funciona). Com o Owl Vault aberto, o instalador e o desinstalador **pedem para fechá-lo**
+e clicar em OK: o programa mantém o mutex `OwlVaultApp` enquanto está aberto (`AppMutex` no
+script), e logo antes de copiar os arquivos o instalador confere de novo o mutex e se o
+`OwlVault.exe` instalado está em uso (pega versões anteriores sem o mutex e o lançador do
+PyInstaller), esperando o exe ficar livre. Ele nunca fecha o
+Owl Vault à força (não interrompe uma proteção no meio); o fechamento automático do Windows
+(Restart Manager) fica desligado — na 0.6.0 ele fechava a janela, mas o lançador do PyInstaller
+(processo sem janela que abre o programa) ficava preso segurando o `OwlVault.exe`. Em modo
+silencioso (`/VERYSILENT /SUPPRESSMSGBOXES`) com o Owl Vault aberto, a instalação é cancelada.
+Sem o Inno Setup 6 instalado na máquina do build, o `build.ps1` avisa e gera só o exe.
 
 ### SmartScreen
 

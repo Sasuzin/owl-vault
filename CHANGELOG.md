@@ -10,6 +10,17 @@ O executável também mostra o **build** (número de commits do projeto, sobe so
 ajuste) e o commit, em ☰ → Sobre, no rodapé e nas propriedades do `OwlVault.exe`
 (Versão do arquivo `<versão>.<build>`, por exemplo `0.3.1.8`).
 
+## 0.6.1 — 2026-11-23
+
+* Instalar ou atualizar com o Owl Vault aberto: o instalador agora **pede para você fechar o
+  Owl Vault** e clicar em OK (o desinstalador também). Na 0.6.0 ele tentava fechar o programa
+  sozinho, a janela fechava, mas uma parte do programa sem janela ficava presa e a instalação
+  parava no erro "O instalador foi incapaz de fechar automaticamente todos os aplicativos". O
+  instalador nunca fecha o Owl Vault à força, para não interromper uma proteção no meio. Logo
+  antes de copiar, ele também espera o `OwlVault.exe` ficar livre — o que vale para uma versão
+  anterior aberta (como a 0.6.0) na hora de atualizar.
+* Aviso da desinstalação: "clique em Não" no lugar de "cancele" (os botões são Sim/Não).
+
 ## 0.6.0 — 2026-11-23
 
 * Assinatura de autoria: "Desenvolvido por Luís Felipe Galvão" e "© 2026 Luís Felipe Galvão.

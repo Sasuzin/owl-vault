@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ctypes
 import sys
+from ctypes import wintypes
 
 from PySide6.QtCore import QLibraryInfo, QLocale, QTranslator
 from PySide6.QtWidgets import QApplication, QWidget
@@ -74,6 +75,30 @@ def use_owl_class_icon(window: QWidget) -> bool:
     return True
 
 
+#: mutex nomeado que existe enquanto o Owl Vault está aberto. O instalador e o desinstalador
+#: (``AppMutex`` em ``packaging/owl_vault.iss``) o procuram e pedem para fechar o programa antes
+#: de trocar o exe — em vez de fechá-lo à força: no teste da 0.6.0, o fechamento automático do
+#: Windows (Restart Manager) fechou a janela, mas o lançador do PyInstaller (processo sem
+#: janela) ficou preso segurando o OwlVault.exe e o instalador parou num erro.
+APP_MUTEX = "OwlVaultApp"
+_HELD_MUTEXES: list[int] = []
+
+
+def hold_app_mutex(name: str = APP_MUTEX) -> int | None:
+    """Cria (ou abre) o mutex ``name`` e o mantém até o processo terminar (o Windows o solta
+    sozinho quando o programa fecha). Devolve o handle, ou ``None`` se não deu."""
+    if sys.platform != "win32":
+        return None
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    handle = kernel32.CreateMutexW(None, False, name)
+    if not handle:
+        return None
+    _HELD_MUTEXES.append(int(handle))
+    return int(handle)
+
+
 def configure_app(app: QApplication) -> None:
     """Nome, versão e ícone do app.
 
@@ -92,6 +117,7 @@ def main() -> int:
         from owl_vault.selftest import run  # noqa: PLC0415 - só no modo de autoteste
 
         return run()
+    hold_app_mutex()  # "o Owl Vault está aberto", para o instalador pedir que feche
     app_id = explicit_app_user_model_id()
     if app_id is not None:
         try:

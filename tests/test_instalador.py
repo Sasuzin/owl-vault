@@ -117,6 +117,47 @@ def test_atalhos_iguais_aos_do_programa(iss: str) -> None:
     assert re.search(r"Tasks: desktopicon$", iss, re.M)  # o da Área de Trabalho é opcional
 
 
+def test_owl_vault_aberto_o_instalador_pede_para_fechar_nunca_fecha_a_forca(iss: str) -> None:
+    """0.6.0: o fechamento automático (Restart Manager) fechou a janela, mas o lançador do
+    PyInstaller ficou preso segurando o exe e o instalador parou num erro."""
+    from owl_vault.ui import app
+
+    m = re.search(r'^#define AppMutex "([^"]+)"$', iss, re.M)
+    assert m and m.group(1) == app.APP_MUTEX
+    assert _setup(iss, "AppMutex") == "{#AppMutex}"  # ao abrir o instalador e o desinstalador
+    assert _setup(iss, "CloseApplications") == "no"
+    assert "function PrepareToInstall" in iss
+    # logo antes de copiar: o mutex (0.6.1+) ou o exe em uso (versões sem o mutex e o lançador
+    # do PyInstaller, que segura o exe sem ter janela)
+    assert "while CheckForMutexes('{#AppMutex}') or ExeInUse() do" in iss
+    assert "DLLGetLastError() = 32" in iss  # só "em uso" (violação de compartilhamento)
+
+
+def test_programa_mantem_o_mutex_enquanto_aberto() -> None:
+    import ctypes
+    import secrets
+    from ctypes import wintypes
+
+    from owl_vault.ui import app
+
+    nome = f"OwlVaultTeste-{secrets.token_hex(8)}"  # nunca o nome real
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenMutexW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+    k32.OpenMutexW.restype = wintypes.HANDLE
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    assert not k32.OpenMutexW(0x00100000, False, nome)  # SYNCHRONIZE: ainda não existe
+    handle = app.hold_app_mutex(nome)
+    assert handle
+    try:
+        outro = k32.OpenMutexW(0x00100000, False, nome)  # como o CheckForMutexes do Inno
+        assert outro
+        k32.CloseHandle(outro)
+    finally:
+        app._HELD_MUTEXES.remove(handle)
+        k32.CloseHandle(handle)
+    assert not k32.OpenMutexW(0x00100000, False, nome)  # fechado o programa, some
+
+
 def test_autoria_igual_no_programa_no_exe_e_no_instalador(iss: str) -> None:
     import importlib.util
 
@@ -152,3 +193,4 @@ def test_desinstalacao_avisa_do_perfil_e_nao_apaga_dados(
     assert apagados and all(n.startswith("{app}") for n in apagados)
     assert "DelTree" not in iss and "DeleteFile" not in iss
     assert '"Remover proteção…"' in iss  # o nome do botão na interface
+    assert "clique em Não" in iss  # os botões do aviso são Sim/Não (era "cancele")

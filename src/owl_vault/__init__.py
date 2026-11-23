@@ -16,7 +16,7 @@ __all__ = [
 ]
 
 APP_NAME = "Owl Vault"
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 #: autoria — fonte única ("Sobre", propriedades do exe, instalador, pyproject)
 AUTHOR = "Luís Felipe Galvão"
 COPYRIGHT = f"© 2026 {AUTHOR}. Todos os direitos reservados."
