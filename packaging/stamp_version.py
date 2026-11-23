@@ -32,6 +32,14 @@ def read_version() -> str:
     return ".".join(m.groups())
 
 
+def read_author() -> str:
+    """``AUTHOR`` de ``src/owl_vault/__init__.py`` (autoria nas propriedades do exe)."""
+    m = re.search(r'^AUTHOR = "([^"]+)"$', INIT.read_text(encoding="utf-8"), re.M)
+    if not m:
+        raise SystemExit('AUTHOR = "..." não encontrado em src/owl_vault/__init__.py')
+    return m.group(1)
+
+
 def _git(*args: str) -> str:
     try:
         out = subprocess.run(  # noqa: S603 - comando fixo, sem shell
@@ -54,7 +62,8 @@ def build_info() -> tuple[int, str, bool]:
     return (int(count) if count.isdigit() else 0), commit, dirty
 
 
-def version_info_text(version: str, build: int, label: str) -> str:
+def version_info_text(version: str, build: int, label: str, author: str | None = None) -> str:
+    author = author or read_author()
     major, minor, patch = (int(x) for x in version.split("."))
     vers = f"({major}, {minor}, {patch}, {build})"
     return f"""# UTF-8 — GERADO por packaging/stamp_version.py (não editar à mão)
@@ -74,11 +83,11 @@ VSVersionInfo(
       [
       StringTable(
         u'041604B0',
-        [StringStruct(u'CompanyName', u'Owl Vault'),
+        [StringStruct(u'CompanyName', u'{author}'),
         StringStruct(u'FileDescription', u'Owl Vault - pastas protegidas por criptografia'),
         StringStruct(u'FileVersion', u'{version}.{build}'),
         StringStruct(u'InternalName', u'OwlVault'),
-        StringStruct(u'LegalCopyright', u''),
+        StringStruct(u'LegalCopyright', u'© 2026 {author}. Todos os direitos reservados.'),
         StringStruct(u'OriginalFilename', u'OwlVault.exe'),
         StringStruct(u'ProductName', u'Owl Vault'),
         StringStruct(u'ProductVersion', u'{label}')])

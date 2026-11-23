@@ -10,6 +10,13 @@ O executável também mostra o **build** (número de commits do projeto, sobe so
 ajuste) e o commit, em ☰ → Sobre, no rodapé e nas propriedades do `OwlVault.exe`
 (Versão do arquivo `<versão>.<build>`, por exemplo `0.3.1.8`).
 
+## 0.6.0 — 2026-11-23
+
+* Assinatura de autoria: "Desenvolvido por Luís Felipe Galvão" e "© 2026 Luís Felipe Galvão.
+  Todos os direitos reservados." em ☰ → Sobre o Owl Vault, nas propriedades do `OwlVault.exe`
+  (Detalhes → Empresa e Direitos autorais), no instalador (editor que aparece em
+  Configurações → Aplicativos instalados) e no README.
+
 ## 0.5.0 — 2026-11-23
 
 * **Instalador** `OwlVault-Setup.exe`, ao lado do `OwlVault.exe` de sempre: telas de

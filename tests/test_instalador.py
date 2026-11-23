@@ -117,6 +117,28 @@ def test_atalhos_iguais_aos_do_programa(iss: str) -> None:
     assert re.search(r"Tasks: desktopicon$", iss, re.M)  # o da Área de Trabalho é opcional
 
 
+def test_autoria_igual_no_programa_no_exe_e_no_instalador(iss: str) -> None:
+    import importlib.util
+
+    import owl_vault
+
+    m = re.search(r'^#define AppAuthor "([^"]+)"$', iss, re.M)
+    assert m and m.group(1) == owl_vault.AUTHOR == "Luís Felipe Galvão"
+    for chave in ("AppPublisher", "VersionInfoCompany"):
+        assert _setup(iss, chave) == "{#AppAuthor}"
+    copyright_iss = owl_vault.COPYRIGHT.replace(owl_vault.AUTHOR, "{#AppAuthor}")
+    assert _setup(iss, "AppCopyright") == _setup(iss, "VersionInfoCopyright") == copyright_iss
+    # propriedades do OwlVault.exe (packaging/stamp_version.py -> version_info.txt)
+    spec = importlib.util.spec_from_file_location("stamp_version", ISS.parent / "stamp_version.py")
+    assert spec and spec.loader
+    stamp = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(stamp)
+    assert stamp.read_author() == owl_vault.AUTHOR
+    texto = stamp.version_info_text("0.6.0", 17, "0.6.0 (build 17 · abc1234)")
+    assert f"StringStruct(u'CompanyName', u'{owl_vault.AUTHOR}')" in texto
+    assert f"StringStruct(u'LegalCopyright', u'{owl_vault.COPYRIGHT}')" in texto
+
+
 def test_desinstalacao_avisa_do_perfil_e_nao_apaga_dados(
     iss: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -5,10 +5,22 @@ O executável também carrega o número do build e o commit (``_build.py``, gera
 ``packaging/stamp_version.py``); rodando do código-fonte, o build aparece como "dev".
 """
 
-__all__ = ["APP_NAME", "__version__", "build_label", "version_label"]
+__all__ = [
+    "APP_NAME",
+    "AUTHOR",
+    "COPYRIGHT",
+    "__author__",
+    "__version__",
+    "build_label",
+    "version_label",
+]
 
 APP_NAME = "Owl Vault"
-__version__ = "0.5.0"
+__version__ = "0.6.0"
+#: autoria — fonte única ("Sobre", propriedades do exe, instalador, pyproject)
+AUTHOR = "Luís Felipe Galvão"
+COPYRIGHT = f"© 2026 {AUTHOR}. Todos os direitos reservados."
+__author__ = AUTHOR
 
 
 def _build_info() -> tuple[int | None, str, bool, str]:

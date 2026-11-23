@@ -12,6 +12,7 @@ Win+L, suspensão ou ☰ > Bloquear agora).
 from __future__ import annotations
 
 import ctypes
+import html
 import os
 import re
 import sys
@@ -37,7 +38,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from owl_vault import version_label
+from owl_vault import AUTHOR, COPYRIGHT, version_label
 from owl_vault.application.lockers import (
     ABERTA,
     ABERTURA_INCOMPLETA,
@@ -471,6 +472,8 @@ class OwlWindow(QMainWindow):
             "<br>Pastas protegidas por criptografia no seu computador.<br>"
             "AES-256-GCM e Argon2id. Sem nuvem, sem telemetria.<br>"
             "Não houve auditoria independente."
+            f"<br><br>Desenvolvido por <b>{html.escape(AUTHOR)}</b>"
+            f'<br><span style="font-size:small">{html.escape(COPYRIGHT)}</span>'
         )
         box.exec()
 

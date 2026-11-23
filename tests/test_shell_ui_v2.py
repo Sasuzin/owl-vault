@@ -1888,6 +1888,30 @@ def _vencer_pratica(store: ProfileStore) -> None:
     store.write_both(obj)
 
 
+def test_sobre_mostra_a_autoria(
+    abrir_tela: Callable[..., Tela], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from PySide6.QtWidgets import QMessageBox
+
+    from owl_vault import AUTHOR, COPYRIGHT, version_label
+
+    textos: list[str] = []
+
+    def exec_(box: QMessageBox) -> int:
+        textos.append(box.text())
+        return 0
+
+    monkeypatch.setattr(QMessageBox, "exec", exec_)
+    tela = abrir_tela()
+    tela.win._about()
+    [texto] = textos
+    assert AUTHOR == "Luís Felipe Galvão"
+    assert "Desenvolvido por <b>Luís Felipe Galvão</b>" in texto
+    assert COPYRIGHT == "© 2026 Luís Felipe Galvão. Todos os direitos reservados."
+    assert COPYRIGHT in texto
+    assert version_label() in texto
+
+
 def _menu_principal(win: OwlWindow) -> QMenu:
     menus = [
         m for m in win.findChildren(QMenu) if any(a.text() == "Bloquear agora" for a in m.actions())

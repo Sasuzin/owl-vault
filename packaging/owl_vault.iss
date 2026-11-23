@@ -21,14 +21,20 @@
 #ifndef AppLabel
   #define AppLabel AppVersion
 #endif
+; autoria: igual a AUTHOR em src/owl_vault/__init__.py (test_instalador.py confere)
+#define AppAuthor "Luís Felipe Galvão"
 
 [Setup]
 AppId={{1EBD1724-39BD-4ADE-B5E3-AD125245BF3F}
 AppName=Owl Vault
 AppVersion={#AppVersion}
 AppVerName=Owl Vault {#AppLabel}
-AppPublisher=Owl Vault
+AppPublisher={#AppAuthor}
+AppCopyright=© 2026 {#AppAuthor}. Todos os direitos reservados.
+AppComments=Desenvolvido por {#AppAuthor}
 VersionInfoVersion={#AppVersion}
+VersionInfoCompany={#AppAuthor}
+VersionInfoCopyright=© 2026 {#AppAuthor}. Todos os direitos reservados.
 VersionInfoProductName=Owl Vault
 VersionInfoDescription=Instalador do Owl Vault
 PrivilegesRequired=lowest

@@ -1,5 +1,8 @@
 # Owl Vault
 
+Desenvolvido por **Luís Felipe Galvão** · © 2026 Luís Felipe Galvão. Todos os direitos
+reservados.
+
 **Owl Vault** tranca pastas do seu computador com criptografia, no Windows 10/11. A pasta
 trancada continua no mesmo lugar, com o ícone da coruja, mas os arquivos dentro dela ficam
 criptografados: só abrem pelo Owl Vault, com o seu **PIN** (ou a **senha mestra**).
