@@ -1936,18 +1936,18 @@ def test_practice_due_no_dia_da_criacao_e_falso(store: ProfileStore, relogio: Re
     ],
 )
 def test_practice_due_manipulando_o_json(
-    created: ProfileStore, relogio: Relogio, valor: str | None, esperado: bool
+    relogio: Relogio, created: ProfileStore, valor: str | None, esperado: bool
 ) -> None:
     edit_copies(created, lambda o: o.__setitem__("practice_due", valor))
     assert created.practice_due() is esperado
 
 
-def test_practice_due_sem_o_campo(created: ProfileStore, relogio: Relogio) -> None:
+def test_practice_due_sem_o_campo(relogio: Relogio, created: ProfileStore) -> None:
     edit_copies(created, lambda o: o.pop("practice_due"))
     assert created.practice_due()
 
 
-def test_unlock_with_master_renova_a_pratica(created: ProfileStore, relogio: Relogio) -> None:
+def test_unlock_with_master_renova_a_pratica(relogio: Relogio, created: ProfileStore) -> None:
     edit_copies(created, lambda o: o.__setitem__("practice_due", (HOJE - UM_DIA).isoformat()))
     assert created.practice_due()
     created.unlock_with_master(MASTER).close()
@@ -1959,7 +1959,7 @@ def test_unlock_with_master_renova_a_pratica(created: ProfileStore, relogio: Rel
     assert created.practice_due()
 
 
-def test_unlock_with_pin_nao_renova_a_pratica(created: ProfileStore, relogio: Relogio) -> None:
+def test_unlock_with_pin_nao_renova_a_pratica(relogio: Relogio, created: ProfileStore) -> None:
     vencida = (HOJE - UM_DIA).isoformat()
     edit_copies(created, lambda o: o.__setitem__("practice_due", vencida))
     created.unlock_with_pin(PIN).close()
@@ -1967,7 +1967,10 @@ def test_unlock_with_pin_nao_renova_a_pratica(created: ProfileStore, relogio: Re
     assert _due(created) == vencida
 
 
-def test_senha_mestra_errada_nao_renova_a_pratica(created: ProfileStore, relogio: Relogio) -> None:
+def test_senha_mestra_errada_nao_renova_a_pratica(relogio: Relogio, created: ProfileStore) -> None:
+    """``relogio`` ANTES de ``created``: o pytest monta as fixtures na ordem da assinatura, e o
+    perfil criado com a data real (não HOJE) fazia este teste falhar a partir de 21/11/2026."""
+    assert _due(created) == (HOJE + PRACTICE_FIRST_DAYS * UM_DIA).isoformat()
     relogio.hoje = HOJE + 5 * UM_DIA
     assert created.practice_due()
     with pytest.raises(AuthenticationError):

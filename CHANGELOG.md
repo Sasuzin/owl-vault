@@ -10,6 +10,12 @@ O executável também mostra o **build** (número de commits do projeto, sobe so
 ajuste) e o commit, em ☰ → Sobre, no rodapé e nas propriedades do `OwlVault.exe`
 (Versão do arquivo `<versão>.<build>`, por exemplo `0.3.1.8`).
 
+## 0.4.2 — 2026-11-23
+
+* O programa é o mesmo da 0.4.1. Um teste da prática da senha mestra dependia da data do
+  computador e passou a falhar a partir de 21/11/2026, impedindo o build: agora ele cria o
+  perfil sempre na data simulada do teste.
+
 ## 0.4.1 — 2026-11-19
 
 * Ícone da coruja na barra de tarefas também na primeira vez, abrindo o arquivo baixado: no
